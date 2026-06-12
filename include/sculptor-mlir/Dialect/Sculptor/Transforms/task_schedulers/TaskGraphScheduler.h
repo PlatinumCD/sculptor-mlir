@@ -1,0 +1,89 @@
+#ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULER_H
+#define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULER_H
+
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Support/LLVM.h"
+#include "mlir/Support/LogicalResult.h"
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace mlir {
+namespace sculptor {
+namespace task_schedulers {
+
+struct HardwareBudget {
+  int64_t numCores = 0;
+  int64_t arraysPerCore = 0;
+  std::string topology;
+  int64_t meshRows = 0;
+  int64_t meshCols = 0;
+  int64_t numAnalogArrays = 0;
+  llvm::SmallVector<int64_t, 8> analogArrays;
+};
+
+struct TaskGraphNode {
+  sculptor::TaskCreateOp op;
+  unsigned index = 0;
+  llvm::SmallVector<unsigned, 4> predecessors;
+  llvm::SmallVector<unsigned, 4> successors;
+};
+
+struct LogicalArrayPlacement {
+  int64_t logicalArrayIndex = 0;
+  int64_t analogArrayIndex = 0;
+};
+
+struct TaskGraphDAG {
+  llvm::SmallVector<TaskGraphNode, 16> nodes;
+  llvm::SmallVector<Value, 8> logicalArrayResources;
+  llvm::DenseMap<Value, unsigned> nodeIndexByTaskResult;
+  unsigned dependencyCount = 0;
+};
+
+struct TaskGraphScheduleOptions {
+  llvm::SmallVector<int64_t, 8> placement;
+};
+
+FailureOr<TaskGraphDAG> parseTaskGraphDAG(func::FuncOp taskGraphFunc);
+
+class TaskGraphScheduler {
+public:
+  virtual ~TaskGraphScheduler() = default;
+
+  virtual StringRef getName() const = 0;
+
+  virtual LogicalResult
+  schedule(ModuleOp module, func::FuncOp taskGraphFunc,
+           const HardwareBudget &budget, const TaskGraphDAG &dag,
+           const TaskGraphScheduleOptions &options) const = 0;
+};
+
+using TaskGraphSchedulerRegistry =
+    llvm::StringMap<std::unique_ptr<TaskGraphScheduler>>;
+
+LogicalResult
+registerTaskGraphScheduler(TaskGraphSchedulerRegistry &registry,
+                           std::unique_ptr<TaskGraphScheduler> scheduler);
+
+const TaskGraphScheduler *
+lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
+                         StringRef name);
+
+void registerSimpleBudgetTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerLayerPlacementTaskScheduler(TaskGraphSchedulerRegistry &registry);
+
+} // namespace task_schedulers
+} // namespace sculptor
+} // namespace mlir
+
+#endif // SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULER_H

@@ -1,0 +1,30 @@
+add_mlir_library(MLIRSculptorConversion
+  EmitRuntimeGraph.cpp
+  FinalizeGolemIntrinsics.cpp
+  LowerGolemToLLVMShims.cpp
+  Passes.cpp
+  runtime/RuntimeGraphBuilder.cpp
+  runtime/RuntimeGraphEntryShims.cpp
+  runtime/RuntimeGraphLLVMUtils.cpp
+  runtime/RuntimeGraphModel.cpp
+  runtime/RuntimeGraphWrappers.cpp
+  golem/GolemUtils.cpp
+  golem/LowerExecute.cpp
+  golem/LowerMatrix.cpp
+  golem/LowerStore.cpp
+  golem/LowerVector.cpp
+
+  LINK_LIBS PUBLIC
+  SculptorIR
+  MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRFuncDialect
+  MLIRFuncTransforms
+  MLIRIR
+  MLIRLLVMDialect
+  MLIRMemRefDialect
+  MLIRPass
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRTransforms
+)

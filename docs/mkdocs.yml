@@ -1,0 +1,32 @@
+site_name: sculptor-mlir
+site_description: Documentation for the sculptor-mlir compiler.
+
+docs_dir: pages
+site_dir: ../site
+
+exclude_docs: |
+  *.log
+
+theme:
+  name: terminal
+
+extra_css:
+  - css/site.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      guess_lang: false
+      noclasses: true
+      pygments_style: friendly
+      use_pygments: true
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Design: design.md
+  - Walkthrough: walkthrough.md

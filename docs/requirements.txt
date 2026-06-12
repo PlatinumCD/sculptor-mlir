@@ -1,0 +1,5 @@
+mkdocs>=1.6
+mkdocs-terminal~=4.0
+pymdown-extensions>=10.0
+pygments>=2.17
+mlir-pygments>=1.0

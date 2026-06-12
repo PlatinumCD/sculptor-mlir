@@ -1,0 +1,34 @@
+# Documentation build output
+site/
+docs/site/
+docs/serve_locally.sh
+
+# Local agent/editor metadata
+.agents/
+.codex/
+
+# Local build and environment output
+build/
+cmake-build-*/
+install*/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Native build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# First public push excludes device/simulator-specific backends and examples.
+runtime/golem/
+runtime/golem-simulator/
+tools/golem-simulator/
+tools/task-graph-sim/
+tests/runtime/
+tests/ll_files/
