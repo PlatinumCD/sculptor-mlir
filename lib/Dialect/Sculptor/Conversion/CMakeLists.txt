@@ -15,6 +15,7 @@ add_mlir_library(MLIRSculptorConversion
   golem/LowerVector.cpp
 
   LINK_LIBS PUBLIC
+  MLIRSculptorTransforms
   SculptorIR
   MLIRArithDialect
   MLIRBufferizationDialect

@@ -5,6 +5,66 @@ operations represents a different level of intent: semantic neural-network
 layers, analog execution, accelerator-facing array operations, task boundaries,
 and task graph construction.
 
+## Passes And Pipelines
+
+The pass structure follows the same staged model as the IR. Early passes recover
+or preserve model meaning. Middle passes expose analog execution and task
+boundaries. Later passes assemble, schedule, and lower the task graph into
+runtime-facing code.
+
+### Pipelines
+
+Sculptor provides two named pipelines for the main lowering path.
+
+| Pipeline | Pass sequence | Role |
+|---|---|---|
+| `sculptor-lower-to-golem` | `sculptor-canonicalize-layers` -> `sculptor-extract-layers` -> `sculptor-convert-layers` -> `sculptor-expand-mvm-to-golem` -> `sculptor-materialize-tasks` | Lowers recognized model structure into callable Golem task functions. |
+| `sculptor-lower-golem-to-task-graph` | `sculptor-assemble-task-graph` -> `sculptor-schedule-task-graph` -> `sculptor-lower-golem-to-llvm-shims` | Builds the task graph, places/schedules it, and rewrites Golem array operations to runtime shim calls. |
+
+The pipelines are intentionally split at the Golem/task boundary. The first
+pipeline produces task-shaped Golem IR. The second pipeline consumes that shape
+and attaches the runtime execution plan.
+
+```bash
+sculptor-mlir-opt model.mlir \
+  --pass-pipeline='builtin.module(sculptor-lower-to-golem{array-rows=128 array-cols=128},sculptor-lower-golem-to-task-graph{cores=4 arrays-per-core=2 schedule=simple-budget})'
+```
+
+`sculptor-lower-to-golem` accepts `array-rows` and `array-cols`, which define the
+physical array tile size used when expanding `sculptor.mvm`.
+`sculptor-lower-golem-to-task-graph` accepts the scheduler options: `cores`,
+`arrays-per-core`, `topology`, `mesh-rows`, `mesh-cols`, `schedule`, and
+`placement`.
+
+### Main Lowering Passes
+
+| Pass | Input shape | Output shape |
+|---|---|---|
+| `sculptor-canonicalize-layers` | Torch-MLIR or `linalg`-style layer bodies in `forward`. | Inline `sculptor.nn.*` layer ops. |
+| `sculptor-extract-layers` | Inline recognized layer regions in `forward`. | Separate layer functions called by `forward`. |
+| `sculptor-convert-layers` | Extracted `sculptor.nn.*` layer functions. | `sculptor.mvm` plus standard tensor, linalg, math, or control-flow glue. |
+| `sculptor-expand-mvm-to-golem` | `sculptor.mvm` inside layer/helper functions. | Golem array setup, vector tiling, array execution, store, and recombine task regions. |
+| `sculptor-materialize-tasks` | `sculptor.task_region` boundaries. | Private task functions with task metadata, called from `forward`. |
+| `sculptor-assemble-task-graph` | A `forward` function that calls materialized task functions. | A `generate_task_graph` function with `sculptor.task_graph.*` resources and `sculptor.task.create` nodes. |
+| `sculptor-schedule-task-graph` | An assembled task graph. | Scheduled task graph metadata, including task order, core assignment, logical array placement, and resource layout. |
+| `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions containing Golem array operations. | Calls to LLVM-callable Golem runtime shims. |
+
+### Export And Runtime Passes
+
+These passes sit beside the main lowering path. They consume task-graph or
+runtime-shaped IR and produce external artifacts or final backend forms.
+
+| Pass | Role |
+|---|---|
+| `sculptor-export-task-graph-dot` | Writes an assembled task graph dependency view as Graphviz DOT. |
+| `sculptor-export-task-graph-vis` | Writes an assembled task graph visualization as DOT or GraphML. |
+| `sculptor-export-task-graph-sim-model` | Writes a scheduled task graph model for external placement or simulation tooling. |
+| `sculptor-finalize-golem-intrinsics` | Rewrites LLVM Golem shim calls into target Golem ISA intrinsics. |
+| `sculptor-emit-runtime-graph` | Emits generic runtime graph metadata and task-entry shims after the task graph has runtime layout metadata. |
+
+After the Sculptor-specific pipeline, normal MLIR passes handle bufferization,
+conversion to LLVM-compatible dialects, and final cleanup.
+
 ## Custom Types
 
 The shared custom types keep the IR explicit about when a value is still
