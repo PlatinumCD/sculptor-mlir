@@ -10,6 +10,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -362,7 +363,8 @@ materializeTaskFunctionBody(mlir::ModuleOp module,
   auto yield =
       llvm::dyn_cast<mlir::sculptor::YieldOp>(sourceBlock.getTerminator());
   if (!yield)
-    return region.emitOpError("expected region to terminate with sculptor.yield");
+    return region.emitOpError(
+        "expected region to terminate with sculptor.yield");
 
   mlir::Block *entryBlock = taskFunc.addEntryBlock();
   mlir::IRMapping mapping;
@@ -739,6 +741,48 @@ getResidualCandidateDefiningOp(mlir::Value value, mlir::Block *forwardBlock) {
   return forwardOp;
 }
 
+static bool isResidualCloneOnlyValue(mlir::Value value) {
+  mlir::Operation *definingOp = value.getDefiningOp();
+  return definingOp &&
+         llvm::isa<mlir::arith::ConstantOp, mlir::tensor::EmptyOp>(definingOp);
+}
+
+static bool isUseInsideResidualIsland(
+    mlir::OpOperand &use, mlir::Block *forwardBlock,
+    const llvm::SmallPtrSetImpl<mlir::Operation *> &islandOpSet) {
+  mlir::Operation *owner =
+      getEnclosingForwardBlockOp(use.getOwner(), forwardBlock);
+  return owner && islandOpSet.contains(owner);
+}
+
+static bool hasResidualIslandExternalUse(
+    mlir::Value value, mlir::Block *forwardBlock,
+    const llvm::SmallPtrSetImpl<mlir::Operation *> &islandOpSet) {
+  for (mlir::OpOperand &use : value.getUses())
+    if (!isUseInsideResidualIsland(use, forwardBlock, islandOpSet))
+      return true;
+  return false;
+}
+
+static void collectResidualIslandOutputs(
+    mlir::Value root, mlir::Block *forwardBlock, const ResidualIsland &island,
+    const llvm::SmallPtrSetImpl<mlir::Operation *> &islandOpSet,
+    llvm::SmallVectorImpl<mlir::Value> &outputs) {
+  llvm::SetVector<mlir::Value> liveOuts;
+  for (mlir::Operation *op : island.ops) {
+    for (mlir::Value result : op->getResults()) {
+      if (isResidualCloneOnlyValue(result))
+        continue;
+
+      if (hasResidualIslandExternalUse(result, forwardBlock, islandOpSet))
+        liveOuts.insert(result);
+    }
+  }
+
+  liveOuts.insert(root);
+  outputs.assign(liveOuts.begin(), liveOuts.end());
+}
+
 static mlir::LogicalResult
 collectResidualProducerSlice(mlir::Value root, mlir::Block *forwardBlock,
                              ResidualIsland &island) {
@@ -809,7 +853,8 @@ collectResidualProducerSlice(mlir::Value root, mlir::Block *forwardBlock,
   }
 
   island.inputs.assign(inputs.begin(), inputs.end());
-  island.outputs.push_back(root);
+  collectResidualIslandOutputs(root, forwardBlock, island, islandOpSet,
+                               island.outputs);
   return mlir::success();
 }
 
@@ -978,13 +1023,15 @@ eraseResidualIslandOps(const ResidualIsland &island) {
 static void replaceResidualIslandBoundaryUses(const ResidualIsland &island,
                                               mlir::Block *forwardBlock,
                                               mlir::func::CallOp call) {
+  llvm::SmallPtrSet<mlir::Operation *, 16> islandOpSet;
+  for (mlir::Operation *op : island.ops)
+    islandOpSet.insert(op);
+
   for (auto [output, replacement] :
        llvm::zip_equal(island.outputs, call->getResults())) {
     llvm::SmallVector<mlir::OpOperand *> usesToReplace;
     for (mlir::OpOperand &use : output.getUses()) {
-      mlir::Operation *owner =
-          getEnclosingForwardBlockOp(use.getOwner(), forwardBlock);
-      if (owner == island.insertionPoint)
+      if (!isUseInsideResidualIsland(use, forwardBlock, islandOpSet))
         usesToReplace.push_back(&use);
     }
 

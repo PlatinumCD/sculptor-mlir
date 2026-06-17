@@ -3,7 +3,6 @@ add_mlir_library(MLIRSculptorTransforms
   AssembleTaskGraph.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
-  ExportTaskGraphDot.cpp
   ExportTaskGraphSimModel.cpp
   ExportTaskGraphVis.cpp
   ExtractLayers.cpp
@@ -14,9 +13,6 @@ add_mlir_library(MLIRSculptorTransforms
   assemblers/TaskGraphGeneratorAssembler.cpp
   assemblers/TaskGraphResourceAssembler.cpp
   assemblers/TaskGraphTaskAssembler.cpp
-  task_schedulers/LayerPlacementTaskScheduler.cpp
-  task_schedulers/SimpleBudgetTaskScheduler.cpp
-  task_schedulers/TaskGraphScheduleHelpers.cpp
   canonicalizers/Conv1DCanonicalizer.cpp
   canonicalizers/Conv2DCanonicalizer.cpp
   canonicalizers/Conv2DGroupedCanonicalizer.cpp

@@ -79,9 +79,6 @@ const TaskGraphScheduler *
 lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
                          StringRef name);
 
-void registerSimpleBudgetTaskScheduler(TaskGraphSchedulerRegistry &registry);
-void registerLayerPlacementTaskScheduler(TaskGraphSchedulerRegistry &registry);
-
 } // namespace task_schedulers
 } // namespace sculptor
 } // namespace mlir

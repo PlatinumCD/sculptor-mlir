@@ -8,7 +8,9 @@ compute-in-memory execution model.
 LLVM/MLIR build tree and focuses on the Sculptor dialect, compiler passes,
 runtime lowering path, and simulator-facing support code.
 
-## Build Requirements
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Build Requirements</summary>
+
 
 The `sculptor-mlir` build needs these host tools available in `PATH`:
 
@@ -27,7 +29,12 @@ build tree:
 <llvm-project-build>/lib/cmake/mlir
 ```
 
-## Source Layout
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Source Layout</summary>
+
 
 The actual checkout path uses `src/`, not `source/`. This tree shows the main
 source-bearing directories and omits generated output such as `site/` and hidden
@@ -79,6 +86,7 @@ src/
         └── pages/
 ```
 
+
 ### `include/`
 
 `include/` contains the public headers and TableGen files for the Sculptor
@@ -111,7 +119,13 @@ conversion, scheduling, and runtime-graph emission behavior.
 
 `docs/` contains this MkDocs site: configuration and Markdown source pages.
 
-## Next
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Next</summary>
+
 
 Read [Design](design.md) for the compiler pipeline, IR boundaries, pass
 responsibilities, runtime model, and current limits.
+
+</details>

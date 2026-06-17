@@ -5,7 +5,9 @@ operations represents a different level of intent: semantic neural-network
 layers, analog execution, accelerator-facing array operations, task boundaries,
 and task graph construction.
 
-## Passes And Pipelines
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Passes And Pipelines</summary>
+
 
 The pass structure follows the same staged model as the IR. Early passes recover
 or preserve model meaning. Middle passes expose analog execution and task
@@ -16,10 +18,10 @@ runtime-facing code.
 
 Sculptor provides two named pipelines for the main lowering path.
 
-| Pipeline | Pass sequence | Role |
-|---|---|---|
-| `sculptor-lower-to-golem` | `sculptor-canonicalize-layers` -> `sculptor-extract-layers` -> `sculptor-convert-layers` -> `sculptor-expand-mvm-to-golem` -> `sculptor-materialize-tasks` | Lowers recognized model structure into callable Golem task functions. |
-| `sculptor-lower-golem-to-task-graph` | `sculptor-assemble-task-graph` -> `sculptor-schedule-task-graph` -> `sculptor-lower-golem-to-llvm-shims` | Builds the task graph, places/schedules it, and rewrites Golem array operations to runtime shim calls. |
+| Pipeline | Role |
+|---|---|
+| `sculptor-lower-to-golem` | Lowers recognized model structure into callable Golem task functions. |
+| `sculptor-lower-golem-to-task-graph` | Builds the task graph, places/schedules it, and rewrites Golem array operations to runtime shim calls. |
 
 The pipelines are intentionally split at the Golem/task boundary. The first
 pipeline produces task-shaped Golem IR. The second pipeline consumes that shape
@@ -27,14 +29,50 @@ and attaches the runtime execution plan.
 
 ```bash
 sculptor-mlir-opt model.mlir \
-  --pass-pipeline='builtin.module(sculptor-lower-to-golem{array-rows=128 array-cols=128},sculptor-lower-golem-to-task-graph{cores=4 arrays-per-core=2 schedule=simple-budget})'
+  --sculptor-lower-to-golem="array-rows=128 array-cols=128" \
+  --sculptor-lower-golem-to-task-graph="cores=4 arrays-per-core=2 schedule=simple-budget"
 ```
+
 
 `sculptor-lower-to-golem` accepts `array-rows` and `array-cols`, which define the
 physical array tile size used when expanding `sculptor.mvm`.
 `sculptor-lower-golem-to-task-graph` accepts the scheduler options: `cores`,
 `arrays-per-core`, `topology`, `mesh-rows`, `mesh-cols`, `schedule`, and
 `placement`.
+
+### `sculptor-lower-to-golem`
+
+This pipeline turns model-level IR into task-shaped Golem IR.
+
+1. `sculptor-canonicalize-layers`
+   Recovers supported layer structure from Torch-MLIR or `linalg`-style IR and
+   rewrites it as inline `sculptor.nn.*` operations.
+2. `sculptor-extract-layers`
+   Outlines recognized layer regions from `forward` into separate layer
+   functions.
+3. `sculptor-convert-layers`
+   Lowers extracted `sculptor.nn.*` layer functions to `sculptor.mvm` plus
+   standard tensor, linalg, math, or control-flow glue.
+4. `sculptor-expand-mvm-to-golem`
+   Expands each `sculptor.mvm` into Golem array setup, vector tiling, array
+   execution, store, and recombine task regions.
+5. `sculptor-materialize-tasks`
+   Turns `sculptor.task_region` boundaries into private task functions with task
+   metadata, then rewrites `forward` to call those tasks.
+
+### `sculptor-lower-golem-to-task-graph`
+
+This pipeline turns materialized Golem tasks into a scheduled runtime graph.
+
+1. `sculptor-assemble-task-graph`
+   Builds `generate_task_graph` with `sculptor.task_graph.*` resources and
+   `sculptor.task.create` nodes.
+2. `sculptor-schedule-task-graph`
+   Attaches task order, core assignment, logical array placement, transfer
+   metadata, and runtime resource layout.
+3. `sculptor-lower-golem-to-llvm-shims`
+   Rewrites scheduled Golem array operations into LLVM-callable runtime shim
+   calls.
 
 ### Main Lowering Passes
 
@@ -56,7 +94,6 @@ runtime-shaped IR and produce external artifacts or final backend forms.
 
 | Pass | Role |
 |---|---|
-| `sculptor-export-task-graph-dot` | Writes an assembled task graph dependency view as Graphviz DOT. |
 | `sculptor-export-task-graph-vis` | Writes an assembled task graph visualization as DOT or GraphML. |
 | `sculptor-export-task-graph-sim-model` | Writes a scheduled task graph model for external placement or simulation tooling. |
 | `sculptor-finalize-golem-intrinsics` | Rewrites LLVM Golem shim calls into target Golem ISA intrinsics. |
@@ -65,7 +102,11 @@ runtime-shaped IR and produce external artifacts or final backend forms.
 After the Sculptor-specific pipeline, normal MLIR passes handle bufferization,
 conversion to LLVM-compatible dialects, and final cleanup.
 
-## Custom Types
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Custom Types</summary>
+
 
 The shared custom types keep the IR explicit about when a value is still
 tensor-shaped data, when it has become an analog container, and when it is a
@@ -79,7 +120,11 @@ task graph handle.
 | Task graph handles | `!sculptor.task_graph`, `!sculptor.task` | Symbolic task graph and task node handles. |
 | Runtime/resource handles | `!sculptor.runtime_handle`, `!sculptor.task_resource<T>` | Runtime-owned state and graph resource slots carrying typed payloads. |
 
-## Operation Groups
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Operation Groups</summary>
+
 
 The dialect currently has five operation groups.
 
@@ -157,7 +202,11 @@ The task graph IR makes dependencies and resources explicit. Each task records
 its callee, domain, task kind, task name, source layer, ordinal, inputs, outputs,
 and dependencies.
 
-## Lowering Shape
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Lowering Shape</summary>
+
 
 The operation groups line up with the compiler's lowering path:
 
@@ -171,7 +220,10 @@ Torch/Linalg IR
 -> runtime graph emission
 ```
 
+
 This staging keeps each level focused. Semantic layer recognition can reason
 about model structure, MVM conversion can reason about analog compute units,
 Golem expansion can reason about arrays and placement, and task graph assembly
 can reason about resources and execution dependencies.
+
+</details>

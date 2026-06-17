@@ -16,7 +16,10 @@ linear_example.py
 -> backend/runtime integration
 ```
 
-## Python Program
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Python Program</summary>
+
 
 The starting point is a single biased linear layer. This is the full Python
 file used throughout the walkthrough:
@@ -80,6 +83,7 @@ if __name__ == "__main__":
     main()
 ```
 
+
 The model is intentionally small and deterministic:
 
 - Input tensor: `x`, shape `1x4`.
@@ -93,7 +97,12 @@ With the fixed weights and bias, the expected result is:
 31.000000 69.000000 112.000000
 ```
 
-## Torch-MLIR Export
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Torch-MLIR Export</summary>
+
 
 Torch-MLIR needs three things from this example:
 
@@ -114,6 +123,7 @@ mlir_module = fx.export_and_import(
 )
 print(mlir_module)
 ```
+
 
 `output_type="torch"` asks Torch-MLIR to emit Torch dialect IR. `func_name`
 sets the exported function name to `forward`, which is the entry point consumed
@@ -145,10 +155,15 @@ module {
 #-}
 ```
 
+
 At this point, the model is no longer Python code. It is an MLIR module that
 represents the linear layer as Torch dialect operations.
 
-## Linalg-On-Tensors IR
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Linalg-On-Tensors IR</summary>
+
 
 The next stage is Torch-MLIR's backend pipeline. It lowers the Torch dialect
 program into tensor and `linalg` operations for `sculptor-mlir`.
@@ -160,6 +175,7 @@ linalg-on-tensors backend pipeline:
 python3 linear_example.py --mode mlir |
   torch-mlir-opt --torch-backend-to-linalg-on-tensors-backend-pipeline
 ```
+
 
 After that pipeline, the IR looks like this:
 
@@ -195,6 +211,7 @@ module {
 #-}
 ```
 
+
 The important change is that the high-level Torch ops have been converted into
 standard tensor and `linalg` operations:
 
@@ -206,7 +223,11 @@ standard tensor and `linalg` operations:
 This tensor/`linalg` form is the input shape that the `sculptor-mlir` passes use
 for layer recognition.
 
-## Canonicalize Layers
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Canonicalize Layers</summary>
+
 
 The next pass is `--sculptor-canonicalize-layers`. It recognizes layer-shaped
 tensor/`linalg` patterns and rewrites them into explicit Sculptor dialect layer
@@ -227,6 +248,7 @@ python3 linear_example.py --mode mlir |
   torch-mlir-opt --torch-backend-to-linalg-on-tensors-backend-pipeline |
   sculptor-mlir-opt --sculptor-canonicalize-layers
 ```
+
 
 The real output is:
 
@@ -250,11 +272,16 @@ module {
 #-}
 ```
 
+
 This is the first point where the program contains Sculptor dialect IR. The
 linear layer is now a named semantic operation instead of a collection of
 generic tensor operations.
 
-## Extract Layers
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Extract Layers</summary>
+
 
 The next pass is `--sculptor-extract-layers`. It outlines recognized Sculptor layer
 operations into their own functions and leaves `forward` as the top-level model
@@ -270,6 +297,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-canonicalize-layers \
     --sculptor-extract-layers
 ```
+
 
 The real output is:
 
@@ -297,12 +325,17 @@ module {
 #-}
 ```
 
+
 This creates an explicit layer boundary so the compiler can prepare the program
 for a task graph-based model. The main `forward` function now describes
 model-level control flow, while the extracted layer function owns the Analog
 layer operation that later passes can lower into task-sized work.
 
-## Convert Layers
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Convert Layers</summary>
+
 
 The next pass is `--sculptor-convert-layers`. It lowers semantic Sculptor layer
 operations into lower-level Analog work.
@@ -320,6 +353,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-extract-layers \
     --sculptor-convert-layers
 ```
+
 
 The real output is:
 
@@ -354,11 +388,16 @@ module {
 #-}
 ```
 
+
 This pass moves the program from named neural-network layers to backend-neutral
 Analog compute. The matrix-vector multiply is now explicit as `sculptor.mvm`,
 while the bias add remains digital work that can become its own task.
 
-## Expand MVM To Golem
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Expand MVM To Golem</summary>
+
 
 The next pass is `--sculptor-expand-mvm-to-golem`. It takes backend-neutral
 `sculptor.mvm` work and expands it into Golem-oriented Analog array operations.
@@ -374,6 +413,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-convert-layers \
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4"
 ```
+
 
 The real output is:
 
@@ -428,6 +468,7 @@ module {
 #-}
 ```
 
+
 The single `sculptor.mvm` has become a sequence of task regions. These regions
 are important because they mark the compiler's future task boundaries before a
 task graph exists. Each region names a unit of work, declares the values it
@@ -465,7 +506,11 @@ addition remains digital work in this lowering.
 This is the point where the compiler has moved from a backend-neutral MVM to
 explicit Golem-facing array setup, execution, and digital cleanup work.
 
-## Materialize Tasks
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Materialize Tasks</summary>
+
 
 The next pass is `--sculptor-materialize-tasks`. It turns each inline
 `sculptor.task_region` into a private task function and replaces the regions with
@@ -481,6 +526,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks
 ```
+
 
 The real output is:
 
@@ -532,6 +578,7 @@ module {
 #-}
 ```
 
+
 After this pass, `forward` no longer contains inline task regions. It calls a
 sequence of private task functions instead. Each task function carries metadata
 such as `sculptor.task_domain`, `sculptor.task_kind`, `sculptor.task_name`, and
@@ -540,7 +587,11 @@ such as `sculptor.task_domain`, `sculptor.task_kind`, `sculptor.task_name`, and
 This prepares the program for task graph assembly: the compiler now has named
 callable units of work that can become task graph nodes.
 
-## Assemble Task Graph
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Assemble Task Graph</summary>
+
 
 The next pass is `--sculptor-assemble-task-graph`. It keeps the materialized task
 functions and builds a symbolic task graph that records resources, task nodes,
@@ -557,6 +608,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph
 ```
+
 
 The real output is:
 
@@ -623,6 +675,7 @@ module {
 #-}
 ```
 
+
 The bottom of the IR is centered on `@generate_task_graph`. This function is
 where the compiler starts describing the program as graph resources and graph
 nodes instead of only as normal function calls.
@@ -665,7 +718,11 @@ Tile recombine depends on the MVM task, and bias add depends on tile recombine.
 This is still symbolic graph IR. The next pass schedules this graph for the
 runtime model.
 
-## Schedule Task Graph
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Schedule Task Graph</summary>
+
 
 The next pass is `--sculptor-schedule-task-graph`. It takes the symbolic task
 graph and attaches scheduling information for a target hardware budget.
@@ -698,6 +755,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-assemble-task-graph \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=simple-budget"
 ```
+
 
 The real output is:
 
@@ -764,6 +822,7 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
 #-}
 ```
 
+
 The schedule appears as metadata on several parts of the IR:
 
 - The module records the hardware budget: one core, one array per core, one
@@ -790,7 +849,11 @@ at different cores, and transfer summaries can report communication between
 those cores. In other words, the task graph is no longer only a dependency graph;
 it is now a placed execution plan for the target runtime model.
 
-## Lower Golem To LLVM Shims
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Lower Golem To LLVM Shims</summary>
+
 
 The next pass is `--sculptor-lower-golem-to-llvm-shims`. It lowers the scheduled
 Golem-facing analog operations into stable runtime shim calls.
@@ -818,6 +881,7 @@ python3 linear_example.py --mode mlir |
     --canonicalize \
     --cse
 ```
+
 
 The real output is:
 
@@ -902,6 +966,7 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
 #-}
 ```
 
+
 The main change is that the `sculptor.array.*` operations are gone from the task
 bodies. They have been replaced by four shim calls:
 
@@ -915,7 +980,11 @@ For this example, that value is `0` because the schedule placed the only logical
 array on the only physical array. The task graph remains in the module so later
 passes can still emit runtime graph metadata.
 
-## Standard MLIR Lowering
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Standard MLIR Lowering</summary>
+
 
 After shim lowering, the runtime build runs a standard MLIR lowering sequence.
 This stage is not specific to `sculptor-mlir`. Its job is to lower tensors,
@@ -958,6 +1027,7 @@ python3 linear_example.py --mode mlir |
     --reconcile-unrealized-casts
 ```
 
+
 The full output is much larger than the previous stage because memref
 descriptors, allocation logic, loops, constants, and C interface wrappers are
 expanded into LLVM dialect. The important shape is visible in these real output
@@ -977,6 +1047,7 @@ llvm.func @golem_analog_mvm_load(!llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64, 
 llvm.func @golem_analog_mvm_set(!llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64, i32) attributes {sym_visibility = "private"}
 ```
 
+
 The model entry point is also converted to an LLVM-style ABI. The tensor result
 is now represented as a lowered memref descriptor:
 
@@ -984,12 +1055,14 @@ is now represented as a lowered memref descriptor:
 llvm.func @forward(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64, %arg3: i64, %arg4: i64, %arg5: i64, %arg6: i64) -> !llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)>
 ```
 
+
 Task functions get matching LLVM-compatible forms and C interface wrappers:
 
 ```mlir
 llvm.func @task_linearwbias_0_vector_tile_0_1(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64, %arg3: i64, %arg4: i64, %arg5: i64, %arg6: i64) -> !llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)> attributes {sculptor.runtime.core_id = 0 : i64, sculptor.source_layer = "linearwbias_0", sculptor.source_task_ordinal = 1 : i64, sculptor.task_domain = "digital", sculptor.task_kind = "digital.vector_tile", sculptor.task_name = "linearwbias_0_vector_tile_0", llvm.emit_c_interface, sym_visibility = "private"}
 llvm.func @_mlir_ciface_task_linearwbias_0_vector_tile_0_1(%arg0: !llvm.ptr, %arg1: !llvm.ptr) attributes {sculptor.runtime.core_id = 0 : i64, sculptor.source_layer = "linearwbias_0", sculptor.source_task_ordinal = 1 : i64, sculptor.task_domain = "digital", sculptor.task_kind = "digital.vector_tile", sculptor.task_name = "linearwbias_0_vector_tile_0", llvm.emit_c_interface, sym_visibility = "private"}
 ```
+
 
 The task graph itself is still present. Its resources and task nodes have not
 yet been emitted as runtime graph construction code:
@@ -1001,11 +1074,16 @@ yet been emitted as runtime graph construction code:
 %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
 ```
 
+
 After this stage, the compute side is close to LLVM, but the task graph is still
 declarative IR. The next `sculptor-mlir` specific pass consumes that graph and
 emits the runtime graph construction logic.
 
-## Emit Runtime Graph
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Emit Runtime Graph</summary>
+
 
 The next pass is `--sculptor-emit-runtime-graph`. It consumes the symbolic task
 graph and emits LLVM functions that build and run the runtime graph.
@@ -1047,6 +1125,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-emit-runtime-graph
 ```
 
+
 The emitted module gains declarations for the runtime graph API:
 
 ```mlir
@@ -1066,6 +1145,7 @@ llvm.func @sculptor_runtime_graph_set_resource(!llvm.ptr, i32, i32, i32, i32, i6
 llvm.func @sculptor_runtime_graph_create(i32, i32, i32, i32, i32, i32, i32, i64) -> !llvm.ptr
 ```
 
+
 It also emits one runtime entry shim per task:
 
 ```mlir
@@ -1075,6 +1155,7 @@ llvm.func @__analog_rt_entry_task_linearwbias_0_mvm_0_0_2(%arg0: !llvm.ptr) -> i
 llvm.func @__analog_rt_entry_task_linearwbias_0_tile_recombine_3(%arg0: !llvm.ptr) -> i32 attributes {sym_visibility = "private"}
 llvm.func @__analog_rt_entry_task_linearwbias_0_linear_bias_add_4(%arg0: !llvm.ptr) -> i32 attributes {sym_visibility = "private"}
 ```
+
 
 For this example, the generated graph image has `6` resources, `5` callables,
 `5` tasks, `8` bindings, `4` dependencies, and a `32` byte workspace:
@@ -1092,6 +1173,7 @@ llvm.func @__analog_rt_build_graph_image() -> !llvm.ptr attributes {sym_visibili
   %8 = llvm.call @sculptor_runtime_graph_create(%0, %1, %2, %3, %4, %5, %6, %7) : (i32, i32, i32, i32, i32, i32, i32, i64) -> !llvm.ptr
 ```
 
+
 The graph image builder then fills in each graph table. These are representative
 real calls from the emitted output:
 
@@ -1103,6 +1185,7 @@ llvm.call @sculptor_runtime_graph_set_binding(%8, %110, %111, %112, %113, %114, 
 llvm.call @sculptor_runtime_graph_set_dep(%8, %166, %167) : (!llvm.ptr, i32, i32) -> ()
 llvm.return %8 : !llvm.ptr
 ```
+
 
 Finally, the pass emits public wrappers that the host program can call:
 
@@ -1122,11 +1205,16 @@ llvm.func @runtime_destroy(%arg0: !llvm.ptr) {
 }
 ```
 
+
 After this pass, the runtime has an LLVM-callable graph image builder, task entry
 points, and public lifecycle functions. The remaining build step is translating
 the LLVM dialect module to LLVM IR and linking it with the runtime library.
 
-## Runtime Connection
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Runtime Connection</summary>
+
 
 After `--sculptor-emit-runtime-graph`, the generated module and the runtime library
 meet at the public lifecycle functions:
@@ -1139,6 +1227,7 @@ std::int32_t runtime_execute(void *runtime, const void *const *inputs,
 void runtime_destroy(void *runtime);
 }
 ```
+
 
 Those symbols are emitted by the compiled model. The runtime library provides the
 lower-level `sculptor_runtime_*` functions that those generated wrappers call.
@@ -1158,6 +1247,7 @@ $(RUNNER): $(MAIN_SRC) $(GENERATED_OBJ) $(RUNTIME_LIB)
 		$< $(GENERATED_OBJ) $(RUNTIME_LIB) $(PYTHON_LDFLAGS) \
 		-o $@
 ```
+
 
 The generated LLVM IR becomes an object file. That object file is linked with the
 test `main.cpp` and `libMLIRSculptorRuntime.a`. The test runner only needs the
@@ -1179,6 +1269,7 @@ const std::int32_t rc = runtime_execute(runtime, inputs, outputs);
 runtime_destroy(runtime);
 ```
 
+
 `runtime_init` is generated code. It builds the graph image and passes it to the
 runtime library:
 
@@ -1189,6 +1280,7 @@ llvm.func @runtime_init() -> !llvm.ptr {
   llvm.return %1 : !llvm.ptr
 }
 ```
+
 
 Inside the runtime library, `sculptor_runtime_init` validates the graph,
 allocates the workspace and resource slots, and binds each task descriptor to
@@ -1204,6 +1296,7 @@ llvm.func @runtime_execute(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr)
 }
 ```
 
+
 The runtime assigns input resources to `inputs`, output resources to `outputs`,
 then walks the scheduled task list and calls each task's generated entry shim.
 Backend runtimes can interpret scheduling metadata such as `core_id` to place
@@ -1218,6 +1311,7 @@ void sculptor_runtime_copy_to_buffer(void *dst, const void *src, uint64_t size);
 void sculptor_runtime_free_result_buffer(void *opaque, void *ptr);
 ```
 
+
 For analog MVM work, shim lowering emits backend-facing Golem-style calls:
 
 ```c++
@@ -1226,6 +1320,7 @@ void golem_analog_mvm_load(..., std::int32_t arrayId);
 void golem_analog_mvm_compute(std::int32_t arrayId);
 void golem_analog_mvm_store(..., std::int32_t arrayId);
 ```
+
 
 Those declarations are the boundary between the compiler output and a concrete
 backend runtime. The first public tree includes `runtime/common/`, which provides
@@ -1246,8 +1341,11 @@ main.cpp
 -> host output buffers
 ```
 
+
 For the linear example, the host output buffer receives:
 
 ```text
 31.000000 69.000000 112.000000
 ```
+
+</details>

@@ -64,7 +64,7 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
   PassOptions::Option<std::string> schedule{
       *this, "schedule",
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
-      llvm::cl::init("simple-budget")};
+      llvm::cl::init("")};
 
   PassOptions::Option<std::string> placement{
       *this, "placement",

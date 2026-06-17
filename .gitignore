@@ -2,6 +2,7 @@
 site/
 docs/site/
 docs/serve_locally.sh
+docs/*.log
 
 # Local agent/editor metadata
 .agents/

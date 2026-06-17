@@ -1,4 +1,4 @@
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=5 schedule=simple-budget" --sculptor-lower-golem-to-llvm-shims | FileCheck %s --implicit-check-not=sculptor.array.
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims | FileCheck %s --implicit-check-not=sculptor.array.
 
 module {
   // CHECK: func.func private @golem_analog_mvm_store(memref<1x1x2xf32>, i32)
@@ -22,7 +22,7 @@ module {
   // CHECK-SAME: sculptor.runtime.core_id = 1 : i64
   // CHECK-SAME: sculptor.runtime.local_array_id = 2 : i64
   // CHECK-SAME: sculptor.runtime.physical_array_id = 7 : i64
-  func.func private @task_matrix7() -> !sculptor.logical.array {
+  func.func private @task_matrix7() -> !sculptor.logical.array attributes {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.local_array_id = 2 : i64, sculptor.runtime.physical_array_id = 7 : i64} {
     %matrix = arith.constant dense<1.000000e+00> : tensor<2x2xf32>
     // CHECK: %[[SET_ID:.*]] = arith.constant 2 : i32
     // CHECK: call @golem_analog_mvm_set({{.*}}, %[[SET_ID]]) : (memref<2x2xf32>, i32) -> ()
@@ -37,7 +37,7 @@ module {
   // CHECK-SAME: sculptor.runtime.core_id = 1 : i64
   // CHECK-SAME: sculptor.runtime.local_array_id = 2 : i64
   // CHECK-SAME: sculptor.runtime.physical_array_id = 7 : i64
-  func.func private @task_mvm7(%arg0: tensor<1x2xf32>, %arg1: !sculptor.logical.array) -> tensor<1x2xf32> {
+  func.func private @task_mvm7(%arg0: tensor<1x2xf32>, %arg1: !sculptor.logical.array) -> tensor<1x2xf32> attributes {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.local_array_id = 2 : i64, sculptor.runtime.physical_array_id = 7 : i64} {
     // CHECK: %[[LOAD_ID:.*]] = arith.constant 2 : i32
     // CHECK: call @golem_analog_mvm_load({{.*}}, %[[LOAD_ID]]) : (memref<1x2xf32>, i32) -> ()
     sculptor.array.load %arg0, %arg1 : tensor<1x2xf32>, !sculptor.logical.array

@@ -14,8 +14,7 @@
 namespace mlir {
 namespace sculptor {
 
-// Records the hardware budget that later task-graph scheduling and placement
-// decisions must obey.
+// Attaches the hardware budget and runs the selected task-graph scheduler.
 struct ScheduleTaskGraphPass
     : public mlir::PassWrapper<ScheduleTaskGraphPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -49,7 +48,7 @@ struct ScheduleTaskGraphPass
   Option<std::string> schedule{
       *this, "schedule",
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
-      llvm::cl::init("simple-budget")};
+      llvm::cl::init("")};
 
   Option<std::string> placement{
       *this, "placement",
@@ -83,7 +82,7 @@ struct ScheduleTaskGraphPass
         schedule(
             *this, "schedule",
             llvm::cl::desc("Registered task graph scheduling algorithm to run"),
-            llvm::cl::init("simple-budget")),
+            llvm::cl::init("")),
         placement(*this, "placement",
                   llvm::cl::desc("Boundary-to-core placement vector for "
                                  "explicit placement schedulers"),
@@ -102,7 +101,7 @@ struct ScheduleTaskGraphPass
   }
 
   mlir::StringRef getDescription() const final {
-    return "Attach a hardware budget for analog task graph scheduling";
+    return "Schedule Sculptor task graphs onto a hardware budget";
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {

@@ -37,14 +37,14 @@ include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/runtime/common/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 
+# Put all executables in <build>/bin and libraries in <build>/lib.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
 add_subdirectory(include)
 if(SCULPTOR_MLIR_BUILD_RUNTIME)
   add_subdirectory(runtime)
 endif()
 add_subdirectory(lib)
 add_subdirectory(tools)
-
-# Put all executables in <build>/bin
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)

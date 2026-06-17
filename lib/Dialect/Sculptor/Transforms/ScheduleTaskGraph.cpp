@@ -1,8 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
 
-// ScheduleTaskGraph starts the scheduling pipeline by making the target
-// hardware budget explicit in IR. Later revisions will consume this budget
-// while assigning task start times, cores, and physical arrays.
+// ScheduleTaskGraph makes the target hardware budget explicit in IR and runs
+// the selected task scheduler to assign task indices, cores, and arrays.
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
@@ -37,19 +36,20 @@ buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
                     int64_t arraysPerCore, llvm::StringRef topology,
                     int64_t meshRows, int64_t meshCols) {
   if (numCores <= 0) {
-    module.emitError("expected analog scheduling budget to have at least one "
+    module.emitError("expected Sculptor scheduling budget to have at least one "
                      "core");
     return mlir::failure();
   }
 
   if (arraysPerCore <= 0) {
-    module.emitError("expected analog scheduling budget to have at least one "
+    module.emitError("expected Sculptor scheduling budget to have at least one "
                      "array per core");
     return mlir::failure();
   }
 
   if (topology != "mesh") {
-    module.emitError("unknown analog scheduling topology '") << topology << "'";
+    module.emitError("unknown Sculptor scheduling topology '")
+        << topology << "'";
     return mlir::failure();
   }
 
@@ -78,7 +78,7 @@ buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
   }
 
   if (meshRows > std::numeric_limits<int64_t>::max() / meshCols) {
-    module.emitError("analog scheduling mesh topology overflows core count");
+    module.emitError("Sculptor scheduling mesh topology overflows core count");
     return mlir::failure();
   }
 
@@ -89,7 +89,7 @@ buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
   }
 
   if (numCores > std::numeric_limits<int64_t>::max() / arraysPerCore) {
-    module.emitError("analog scheduling budget overflows total array count");
+    module.emitError("Sculptor scheduling budget overflows total array count");
     return mlir::failure();
   }
 
@@ -276,12 +276,16 @@ void ScheduleTaskGraphPass::runOnOperation() {
   scheduleOptions.placement = std::move(*parsedPlacement);
 
   task_schedulers::TaskGraphSchedulerRegistry registry;
-  task_schedulers::registerSimpleBudgetTaskScheduler(registry);
-  task_schedulers::registerLayerPlacementTaskScheduler(registry);
   const task_schedulers::TaskGraphScheduler *selectedScheduler =
       task_schedulers::lookupTaskGraphScheduler(registry, schedule);
   if (!selectedScheduler) {
-    module.emitError("unknown task graph schedule '") << schedule << "'";
+    if (registry.empty()) {
+      module.emitError("no task graph schedulers are registered");
+    } else if (schedule.empty()) {
+      module.emitError("expected task graph schedule name");
+    } else {
+      module.emitError("unknown task graph schedule '") << schedule << "'";
+    }
     signalPassFailure();
     return;
   }

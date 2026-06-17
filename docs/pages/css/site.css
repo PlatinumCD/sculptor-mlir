@@ -68,6 +68,41 @@ body {
   padding-bottom: calc(var(--global-space) * 2);
 }
 
+#mkdocs-terminal-content .doc-section {
+  margin: calc(var(--global-space) * 2.5) 0;
+}
+
+#mkdocs-terminal-content .doc-section > summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: calc(var(--global-space) * 0.75);
+  list-style: none;
+  margin-bottom: calc(var(--global-space) * 1.5);
+}
+
+#mkdocs-terminal-content .doc-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+#mkdocs-terminal-content .doc-section > summary::before {
+  content: ">";
+  display: inline-block;
+  flex: 0 0 auto;
+  font-weight: 700;
+  line-height: 1;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+#mkdocs-terminal-content .doc-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+#mkdocs-terminal-content .doc-section > summary h2 {
+  margin: 0;
+}
+
 @media only screen and (max-width: 45em) {
   .container {
     width: calc(100% - 24px);

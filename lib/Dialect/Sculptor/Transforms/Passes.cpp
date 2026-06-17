@@ -2,7 +2,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphDot.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphSimModel.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphVis.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
@@ -18,7 +17,6 @@ void registerSculptorPasses() {
   registerAssembleTaskGraphPass();
   registerCanonicalizeLayersPass();
   registerConvertLayersPass();
-  registerExportTaskGraphDotPass();
   registerExportTaskGraphSimModelPass();
   registerExportTaskGraphVisPass();
   registerExpandMVMToGolemPass();
