@@ -43,6 +43,12 @@ struct LogicalArrayPlacement {
   int64_t analogArrayIndex = 0;
 };
 
+struct PhysicalArrayPlacement {
+  int64_t physicalArrayId = 0;
+  int64_t coreId = 0;
+  int64_t localArrayId = 0;
+};
+
 struct TaskGraphDAG {
   llvm::SmallVector<TaskGraphNode, 16> nodes;
   llvm::SmallVector<Value, 8> logicalArrayResources;
@@ -50,11 +56,35 @@ struct TaskGraphDAG {
   unsigned dependencyCount = 0;
 };
 
-struct TaskGraphScheduleOptions {
-  llvm::SmallVector<int64_t, 8> placement;
-};
-
 FailureOr<TaskGraphDAG> parseTaskGraphDAG(func::FuncOp taskGraphFunc);
+
+FailureOr<PhysicalArrayPlacement>
+resolvePhysicalArrayPlacement(Operation *diagnosticOp,
+                              const HardwareBudget &budget,
+                              int64_t physicalArrayId);
+
+LogicalResult attachTaskCorePlacement(ModuleOp module,
+                                      sculptor::TaskCreateOp taskOp,
+                                      const HardwareBudget &budget,
+                                      int64_t coreId);
+
+LogicalResult attachTaskAnalogArrayPlacement(ModuleOp module,
+                                             sculptor::TaskCreateOp taskOp,
+                                             const HardwareBudget &budget,
+                                             int64_t physicalArrayId);
+
+FailureOr<sculptor::TaskCreateOp> fuseTasks(ModuleOp module,
+                                            sculptor::TaskCreateOp parentTask,
+                                            sculptor::TaskCreateOp childTask);
+
+LogicalResult fuseTaskGraphRoutines(ModuleOp module, func::FuncOp taskGraphFunc,
+                                    const HardwareBudget &budget,
+                                    const TaskGraphDAG &dag);
+
+LogicalResult finalizeTaskGraphScheduleMetadata(ModuleOp module,
+                                                func::FuncOp taskGraphFunc,
+                                                const HardwareBudget &budget,
+                                                const TaskGraphDAG &dag);
 
 class TaskGraphScheduler {
 public:
@@ -62,10 +92,9 @@ public:
 
   virtual StringRef getName() const = 0;
 
-  virtual LogicalResult
-  schedule(ModuleOp module, func::FuncOp taskGraphFunc,
-           const HardwareBudget &budget, const TaskGraphDAG &dag,
-           const TaskGraphScheduleOptions &options) const = 0;
+  virtual LogicalResult schedule(ModuleOp module, func::FuncOp taskGraphFunc,
+                                 const HardwareBudget &budget,
+                                 const TaskGraphDAG &dag) const = 0;
 };
 
 using TaskGraphSchedulerRegistry =
@@ -78,6 +107,8 @@ registerTaskGraphScheduler(TaskGraphSchedulerRegistry &registry,
 const TaskGraphScheduler *
 lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
                          StringRef name);
+
+void registerRandomTaskScheduler(TaskGraphSchedulerRegistry &registry);
 
 } // namespace task_schedulers
 } // namespace sculptor

@@ -753,22 +753,16 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
-    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=simple-budget"
+    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random"
 ```
 
 
-The real output is:
+The scheduled output no longer keeps the materialized `@forward` function once
+the task graph is present. The live IR is the scheduled task graph plus the
+private task functions referenced by `sculptor.task.create`:
 
 ```mlir
 module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arrays_per_core = 1 : i64, sculptor.schedule.mesh_cols = 1 : i64, sculptor.schedule.mesh_rows = 1 : i64, sculptor.schedule.num_analog_arrays = 1 : i64, sculptor.schedule.num_cores = 1 : i64, sculptor.schedule.topology = "mesh"} {
-  func.func @forward(%arg0: tensor<1x4xf32>) -> tensor<1x3xf32> {
-    %0 = call @task_linearwbias_0_matrix_tile_0_0_0() : () -> !sculptor.logical.array
-    %1 = call @task_linearwbias_0_vector_tile_0_1(%arg0) : (tensor<1x4xf32>) -> tensor<1x4xf32>
-    %2 = call @task_linearwbias_0_mvm_0_0_2(%1, %0) : (tensor<1x4xf32>, !sculptor.logical.array) -> tensor<1x4xf32>
-    %3 = call @task_linearwbias_0_tile_recombine_3(%2) : (tensor<1x4xf32>) -> tensor<1x3xf32>
-    %4 = call @task_linearwbias_0_linear_bias_add_4(%3) : (tensor<1x3xf32>) -> tensor<1x3xf32>
-    return %4 : tensor<1x3xf32>
-  }
   func.func private @task_linearwbias_0_matrix_tile_0_0_0() -> !sculptor.logical.array attributes {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.source_layer = "linearwbias_0", sculptor.source_task_ordinal = 0 : i64, sculptor.task_domain = "analog", sculptor.task_kind = "sculptor.matrix_setup", sculptor.task_name = "linearwbias_0_matrix_tile_0_0", llvm.emit_c_interface} {
     %cst = arith.constant dense_resource<torch_tensor_3_4_torch.float32__tile_0_0> : tensor<4x4xf32>
     %0 = sculptor.array.set %cst : tensor<4x4xf32> -> !sculptor.logical.array
@@ -876,14 +870,16 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
-    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=simple-budget" \
+    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \
     --cse
 ```
 
 
-The real output is:
+The shim-lowered output keeps the same scheduled graph shape. `@forward` is
+still absent; the task graph is now backed by task functions whose Golem array
+operations have been rewritten to runtime shim calls:
 
 ```mlir
 module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arrays_per_core = 1 : i64, sculptor.schedule.mesh_cols = 1 : i64, sculptor.schedule.mesh_rows = 1 : i64, sculptor.schedule.num_analog_arrays = 1 : i64, sculptor.schedule.num_cores = 1 : i64, sculptor.schedule.topology = "mesh"} {
@@ -891,14 +887,6 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
   func.func private @golem_analog_mvm_compute(i32)
   func.func private @golem_analog_mvm_load(memref<1x4xf32>, i32)
   func.func private @golem_analog_mvm_set(memref<4x4xf32>, i32)
-  func.func @forward(%arg0: tensor<1x4xf32>) -> tensor<1x3xf32> {
-    call @task_linearwbias_0_matrix_tile_0_0_0() : () -> ()
-    %0 = call @task_linearwbias_0_vector_tile_0_1(%arg0) : (tensor<1x4xf32>) -> tensor<1x4xf32>
-    %1 = call @task_linearwbias_0_mvm_0_0_2(%0) : (tensor<1x4xf32>) -> tensor<1x4xf32>
-    %2 = call @task_linearwbias_0_tile_recombine_3(%1) : (tensor<1x4xf32>) -> tensor<1x3xf32>
-    %3 = call @task_linearwbias_0_linear_bias_add_4(%2) : (tensor<1x3xf32>) -> tensor<1x3xf32>
-    return %3 : tensor<1x3xf32>
-  }
   func.func private @task_linearwbias_0_matrix_tile_0_0_0() attributes {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.source_layer = "linearwbias_0", sculptor.source_task_ordinal = 0 : i64, sculptor.task_domain = "analog", sculptor.task_kind = "sculptor.matrix_setup", sculptor.task_name = "linearwbias_0_matrix_tile_0_0", llvm.emit_c_interface} {
     %cst = arith.constant dense_resource<torch_tensor_3_4_torch.float32__tile_0_0> : tensor<4x4xf32>
     %c0_i32 = arith.constant 0 : i32
@@ -1006,7 +994,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
-    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=simple-budget" \
+    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \
     --cse \
@@ -1048,15 +1036,8 @@ llvm.func @golem_analog_mvm_set(!llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64, i
 ```
 
 
-The model entry point is also converted to an LLVM-style ABI. The tensor result
-is now represented as a lowered memref descriptor:
-
-```mlir
-llvm.func @forward(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64, %arg3: i64, %arg4: i64, %arg5: i64, %arg6: i64) -> !llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)>
-```
-
-
-Task functions get matching LLVM-compatible forms and C interface wrappers:
+The materialized `@forward` entry point has already been removed by this stage.
+Task functions get LLVM-compatible forms and C interface wrappers:
 
 ```mlir
 llvm.func @task_linearwbias_0_vector_tile_0_1(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64, %arg3: i64, %arg4: i64, %arg5: i64, %arg6: i64) -> !llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)> attributes {sculptor.runtime.core_id = 0 : i64, sculptor.source_layer = "linearwbias_0", sculptor.source_task_ordinal = 1 : i64, sculptor.task_domain = "digital", sculptor.task_kind = "digital.vector_tile", sculptor.task_name = "linearwbias_0_vector_tile_0", llvm.emit_c_interface, sym_visibility = "private"}
@@ -1103,7 +1084,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
-    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=simple-budget" \
+    --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \
     --cse \

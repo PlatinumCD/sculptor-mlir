@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphExecutionPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 
@@ -525,9 +526,7 @@ public:
       return mlir::failure();
     }
 
-    auto executablePlan = buildExecutablePlan(taskGraphFunc);
-    if (failed(executablePlan) || failed(annotateTaskGraphWithExecutablePlan(
-                                      taskGraphFunc, *executablePlan))) {
+    if (failed(mlir::sculptor::rebuildTaskGraphExecutionPlan(taskGraphFunc))) {
       return mlir::failure();
     }
 
@@ -540,6 +539,17 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult rebuildTaskGraphExecutionPlan(func::FuncOp taskGraphFunc) {
+  auto executablePlan = buildExecutablePlan(taskGraphFunc);
+  if (failed(executablePlan) ||
+      failed(annotateTaskGraphWithExecutablePlan(taskGraphFunc,
+                                                *executablePlan))) {
+    return failure();
+  }
+
+  return success();
+}
 
 void registerTaskGraphExecutionPlanAssembler(TaskGraphAssemblySteps &steps) {
   steps.push_back(std::make_unique<TaskGraphExecutionPlanAssembler>());

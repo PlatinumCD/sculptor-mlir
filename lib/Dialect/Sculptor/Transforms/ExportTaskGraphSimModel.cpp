@@ -31,6 +31,11 @@ namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 
+bool isAnalogArrayOp(mlir::Operation *op) {
+  llvm::StringRef opName = op->getName().getStringRef();
+  return opName.starts_with("sculptor.array.") || opName.starts_with("analog.");
+}
+
 struct HardwareModel {
   int64_t numCores = 0;
   int64_t arraysPerCore = 0;
@@ -271,7 +276,8 @@ getTaskGraphResource(mlir::Operation &op) {
     return std::make_pair(input.getResult(), llvm::StringRef("input"));
   if (auto output = llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op))
     return std::make_pair(output.getResult(), llvm::StringRef("output"));
-  if (auto temporary = llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
+  if (auto temporary =
+          llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
     return std::make_pair(temporary.getResult(), llvm::StringRef("temporary"));
   if (auto persistent =
           llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op))
@@ -283,8 +289,8 @@ getTaskGraphResource(mlir::Operation &op) {
 bool isLogicalArrayResource(mlir::Value resource) {
   auto resourceType =
       llvm::dyn_cast<mlir::sculptor::TaskResourceType>(resource.getType());
-  return resourceType &&
-         llvm::isa<mlir::sculptor::LogicalArrayType>(resourceType.getValueType());
+  return resourceType && llvm::isa<mlir::sculptor::LogicalArrayType>(
+                             resourceType.getValueType());
 }
 
 std::string getResourceValueTypeString(mlir::Value resource) {
@@ -408,7 +414,7 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
     if (!callee.isDeclaration()) {
       int64_t analogOpIndex = 0;
       callee.walk([&](mlir::Operation *nestedOp) {
-        if (nestedOp->getName().getDialectNamespace() != "analog")
+        if (!isAnalogArrayOp(nestedOp))
           return;
         task.analogOps.push_back(AnalogOpModel{
             analogOpIndex++, nestedOp->getName().getStringRef().str()});
@@ -652,7 +658,7 @@ void emitTaskResourceIds(llvm::json::OStream &json, llvm::StringRef key,
 }
 
 void emitSculptorOps(llvm::json::OStream &json,
-                   llvm::ArrayRef<AnalogOpModel> analogOps) {
+                     llvm::ArrayRef<AnalogOpModel> analogOps) {
   json.attributeArray("analog_ops", [&] {
     for (const AnalogOpModel &op : analogOps) {
       json.object([&] {

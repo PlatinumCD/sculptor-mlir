@@ -2,25 +2,23 @@
 
 Placement is the step that decides where an assembled task graph should run.
 The input is already expressed as `sculptor.task.create` operations, task graph
-resources, explicit dependencies, and logical analog arrays. The scheduler turns
+resources, explicit dependencies, and logical analog arrays. A scheduler turns
 that symbolic graph into runtime-facing metadata: task order, core assignment,
 array assignment, and transfer summaries.
 
-Placement is controlled by `sculptor-schedule-task-graph`, which is included in
-the `sculptor-lower-golem-to-task-graph` pipeline.
-
-```bash
-sculptor-mlir-opt model.mlir \
-  --sculptor-lower-golem-to-task-graph="cores=4 arrays-per-core=2 schedule=simple-budget"
-```
+The compiler keeps placement as an extension point. The
+`sculptor-schedule-task-graph` pass builds the hardware budget, parses the task
+graph, and dispatches through the scheduler interface. This tree registers a
+`random` scheduler that assigns matrix setup/MVM groups to physical arrays,
+places related digital tasks on cores, fuses recognized task routines, and
+rebuilds the runtime resource layout.
 
 
 <details class="doc-section" open markdown="1">
 <summary markdown="block">## Placement Parameters</summary>
 
 
-The placement pass receives a hardware budget and a strategy selection through
-pass parameters.
+The placement pass receives a hardware budget through pass parameters.
 
 | Parameter | Role |
 |---|---|
@@ -29,8 +27,7 @@ pass parameters.
 | `topology` | Interconnect topology used for transfer-cost summaries. The current implementation supports `mesh`. |
 | `mesh-rows` | Number of rows in the mesh topology. |
 | `mesh-cols` | Number of columns in the mesh topology. If set to `0`, it is inferred from `cores` and `mesh-rows`. |
-| `schedule` | Placement strategy to run. Current strategies are `simple-budget` and `layer-placement`. |
-| `placement` | Optional strategy-specific placement vector. It is currently used by `layer-placement`. |
+| `schedule` | Name of a registered placement strategy, currently `random`. |
 
 The total analog array budget is:
 
@@ -39,17 +36,62 @@ cores * arrays-per-core
 ```
 
 
-For example, this asks for four cores, two arrays per core, and explicit
-boundary placement:
+For example, this provides a four-core hardware budget:
 
 ```bash
 sculptor-mlir-opt model.mlir \
-  --sculptor-lower-golem-to-task-graph="cores=4 arrays-per-core=2 schedule=layer-placement placement=0,2,1,3"
+  --sculptor-schedule-task-graph="cores=4 arrays-per-core=2 schedule=random"
+```
+
+If `schedule` is omitted, the pass reports that a task graph schedule name is
+required.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Random Schedule</summary>
+
+
+`random` is the current built-in scheduler. It uses a deterministic random seed
+so test output is stable, but the placement policy is intentionally simple.
+
+The scheduler first finds each `sculptor.matrix_setup` task and the
+`sculptor.mvm` tasks that depend on it. Each setup group is assigned to one
+physical analog array from the hardware budget. The owning core and local array
+id are derived from that physical array id:
+
+```text
+core = physical-array-id / arrays-per-core
+local-array = physical-array-id % arrays-per-core
 ```
 
 
-In that example, `placement=0,2,1,3` is interpreted by the selected strategy.
-For `layer-placement`, each entry maps one placement boundary to one core.
+The matrix setup and all of its associated MVM tasks receive the same physical
+array placement. Digital tasks from the same unambiguous source layer are placed
+on that source layer's core. Remaining core-only tasks are placed by looking at
+already placed neighboring tasks:
+
+- Prefer the most recent placed producer.
+- Otherwise use the earliest placed consumer.
+
+After placement, the pass runs task-routine fusion. The main implemented fusion
+pattern recognizes:
+
+```text
+digital.conv_patch
+-> digital.vector_tile
+-> sculptor.mvm
+-> digital.tile_recombine
+-> digital.bias_add
+```
+
+
+That chain becomes a single `sculptor.conv_tile_mvm` task whose external ABI
+keeps only the original activation input, the logical array input, and the final
+bias-add output. Temporary task-graph resources that only represented internal
+fused boundaries are erased, and the runtime execution plan is recomputed so
+slots, temporary offsets, workspace size, and task indices match the compacted
+graph.
 
 </details>
 
@@ -94,8 +136,7 @@ public:
 
   virtual LogicalResult
   schedule(ModuleOp module, func::FuncOp taskGraphFunc,
-           const HardwareBudget &budget, const TaskGraphDAG &dag,
-           const TaskGraphScheduleOptions &options) const = 0;
+           const HardwareBudget &budget, const TaskGraphDAG &dag) const = 0;
 };
 ```
 
@@ -104,9 +145,7 @@ A new strategy derives from this interface, gives itself a name, and implements
 `schedule`. Once registered, it can be selected with the `schedule` parameter.
 
 ```text
-schedule=simple-budget
-schedule=layer-placement
-schedule=my-new-strategy
+schedule=<registered-strategy-name>
 ```
 
 
@@ -127,91 +166,11 @@ Every placement strategy receives the same core inputs.
 | `func::FuncOp taskGraphFunc` | The task graph function being scheduled. This is where graph-level schedule metadata is attached. |
 | `HardwareBudget budget` | The validated hardware budget: cores, arrays per core, topology, mesh dimensions, and physical analog array ids. |
 | `TaskGraphDAG dag` | Parsed task nodes, dependencies, successors, predecessors, task result mapping, and logical array resources. |
-| `TaskGraphScheduleOptions options` | Strategy-specific options. Currently this carries the parsed `placement` vector. |
 
 These inputs are enough for a strategy to compute task placement without having
 to rediscover the graph from raw IR. The pass has already parsed the task graph
 into a DAG and validated the hardware budget before calling the selected
 strategy.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Available Strategies</summary>
-
-
-`simple-budget` is the default strategy. It maps logical arrays to physical
-arrays in order and derives the owning core from the physical array id.
-
-```text
-logical array 0 -> physical array 0
-logical array 1 -> physical array 1
-logical array 2 -> physical array 2
-```
-
-
-```text
-core = physical-array-id / arrays-per-core
-```
-
-
-This is deterministic and useful as a baseline. It is not intended to be a
-cost optimizer.
-
-`layer-placement` uses the same hardware budget, but requires an explicit
-placement vector. It forms placement boundaries from logical analog arrays and
-maps each boundary to a requested core.
-
-```text
-placement=0,2,1,3
-
-boundary 0 -> core 0
-boundary 1 -> core 2
-boundary 2 -> core 1
-boundary 3 -> core 3
-```
-
-
-The current implementation uses one-boundary-per-core mode. Each core must
-appear exactly once, and each boundary's logical array is mapped to the first
-physical array on that core.
-
-```text
-physical array = core * arrays-per-core
-```
-
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Boundary Formation</summary>
-
-
-`layer-placement` creates boundaries from logical analog arrays.
-
-1. A `sculptor.matrix_setup` task creates a boundary for its output logical
-   array.
-2. A `sculptor.mvm` task joins the boundary for the logical array that it
-   consumes.
-3. Remaining tasks are attached by walking task graph dependencies.
-
-For remaining tasks, the scheduler looks at already-attached neighbors:
-
-- If predecessors already belong to boundaries, the task joins the highest
-  predecessor boundary.
-- Otherwise, if successors already belong to boundaries, the task joins the
-  lowest successor boundary.
-- If the task cannot attach to any boundary, scheduling fails.
-
-The resulting model is:
-
-```text
-logical array -> placement boundary
-matrix setup -> creates boundary
-MVM -> joins logical-array boundary
-other tasks -> attach through dependency neighbors
-```
-
 
 </details>
 
@@ -230,6 +189,7 @@ metadata.
 | Logical array placement | Mapping from logical arrays to physical arrays. |
 | Transfer summary | Inter-core byte movement and mesh-distance transfer cost. |
 | Digital op count | Static estimate of digital work attached to scheduled tasks. |
+| Runtime resource layout | Resource slots, temporary indices, temporary offsets, and workspace size after any task fusion. |
 
 This metadata is consumed by later runtime lowering and graph emission passes.
 

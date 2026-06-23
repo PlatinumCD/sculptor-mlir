@@ -1,5 +1,5 @@
-#ifndef SCULPTOR_RUNTIME_UTILS_H
-#define SCULPTOR_RUNTIME_UTILS_H
+#ifndef SCULPTOR_TASK_GRAPH_RUNTIME_UTILS_H
+#define SCULPTOR_TASK_GRAPH_RUNTIME_UTILS_H
 
 #include <cstdint>
 
@@ -17,4 +17,4 @@ using MemRef3D = StridedMemRefType<float, 3>;
 using MemRef4D = StridedMemRefType<float, 4>;
 using MemRef5D = StridedMemRefType<float, 5>;
 
-#endif // SCULPTOR_RUNTIME_UTILS_H
+#endif // SCULPTOR_TASK_GRAPH_RUNTIME_UTILS_H

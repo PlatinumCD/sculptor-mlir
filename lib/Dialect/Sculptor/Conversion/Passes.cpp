@@ -65,12 +65,6 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
       *this, "schedule",
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
       llvm::cl::init("")};
-
-  PassOptions::Option<std::string> placement{
-      *this, "placement",
-      llvm::cl::desc("Boundary-to-core placement vector for explicit "
-                     "placement schedulers"),
-      llvm::cl::init("")};
 };
 
 void buildSculptorLowerToGolemPipeline(
@@ -99,7 +93,6 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   scheduleTaskGraphPass->meshRows = options.meshRows;
   scheduleTaskGraphPass->meshCols = options.meshCols;
   scheduleTaskGraphPass->schedule = options.schedule;
-  scheduleTaskGraphPass->placement = options.placement;
   pm.addPass(std::move(scheduleTaskGraphPass));
 
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());

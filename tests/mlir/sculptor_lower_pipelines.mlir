@@ -15,7 +15,7 @@ module {
   }
 }
 
-// CHECK: no task graph schedulers are registered
+// CHECK: expected task graph schedule name
 
 {-#
   dialect_resources: {

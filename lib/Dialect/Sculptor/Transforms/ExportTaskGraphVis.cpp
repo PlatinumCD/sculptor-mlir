@@ -97,8 +97,8 @@ getOptionalI64ArrayAttr(mlir::Operation *op, llvm::StringRef attrName) {
   for (mlir::Attribute element : attr) {
     auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(element);
     if (!intAttr) {
-      op->emitError("expected attr '") << attrName
-                                       << "' to contain only integer attrs";
+      op->emitError("expected attr '")
+          << attrName << "' to contain only integer attrs";
       return mlir::failure();
     }
     values.push_back(intAttr.getInt());
@@ -112,9 +112,9 @@ getTaskGraphResource(mlir::Operation &op) {
     return std::make_pair(input.getResult(), llvm::StringRef("input"));
   if (auto output = llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op))
     return std::make_pair(output.getResult(), llvm::StringRef("output"));
-  if (auto temporary = llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
-    return std::make_pair(temporary.getResult(),
-                          llvm::StringRef("temporary"));
+  if (auto temporary =
+          llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
+    return std::make_pair(temporary.getResult(), llvm::StringRef("temporary"));
   if (auto persistent =
           llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op))
     return std::make_pair(persistent.getResult(),
@@ -125,9 +125,8 @@ getTaskGraphResource(mlir::Operation &op) {
 bool isLogicalArrayResource(mlir::Value resource) {
   auto resourceType =
       llvm::dyn_cast<mlir::sculptor::TaskResourceType>(resource.getType());
-  return resourceType &&
-         llvm::isa<mlir::sculptor::LogicalArrayType>(
-             resourceType.getValueType());
+  return resourceType && llvm::isa<mlir::sculptor::LogicalArrayType>(
+                             resourceType.getValueType());
 }
 
 std::string sanitizeId(llvm::StringRef value) {
@@ -226,7 +225,8 @@ void getNodeColors(const TaskModel &task, llvm::StringRef &fillColor,
 std::optional<int64_t> getMeshDistance(std::optional<int64_t> sourceCore,
                                        std::optional<int64_t> destinationCore,
                                        const GraphModel &graph) {
-  if (!sourceCore || !destinationCore || !graph.meshCols || *graph.meshCols <= 0)
+  if (!sourceCore || !destinationCore || !graph.meshCols ||
+      *graph.meshCols <= 0)
     return std::nullopt;
 
   int64_t sourceRow = *sourceCore / *graph.meshCols;
@@ -237,6 +237,11 @@ std::optional<int64_t> getMeshDistance(std::optional<int64_t> sourceCore,
          std::llabs(sourceCol - destinationCol);
 }
 
+bool isAnalogArrayOp(mlir::Operation *op) {
+  llvm::StringRef opName = op->getName().getStringRef();
+  return opName.starts_with("sculptor.array.") || opName.starts_with("analog.");
+}
+
 const TaskModel *lookupTaskByOrder(const GraphModel &graph, unsigned order) {
   if (order >= graph.tasks.size())
     return nullptr;
@@ -245,7 +250,8 @@ const TaskModel *lookupTaskByOrder(const GraphModel &graph, unsigned order) {
 
 const ResourceModel *lookupResourceById(const GraphModel &graph,
                                         int64_t resourceId) {
-  if (resourceId < 0 || resourceId >= static_cast<int64_t>(graph.resources.size()))
+  if (resourceId < 0 ||
+      resourceId >= static_cast<int64_t>(graph.resources.size()))
     return nullptr;
   return &graph.resources[static_cast<size_t>(resourceId)];
 }
@@ -254,7 +260,8 @@ int64_t getTaskIndexForExport(const TaskModel &task) {
   return task.taskIndex.value_or(task.order);
 }
 
-bool isLogicalArrayDependency(const GraphModel &graph, const TaskModel &consumer,
+bool isLogicalArrayDependency(const GraphModel &graph,
+                              const TaskModel &consumer,
                               const TaskModel &producer) {
   for (int64_t resourceId : consumer.inputResourceIds) {
     const ResourceModel *resource = lookupResourceById(graph, resourceId);
@@ -270,16 +277,15 @@ bool isLogicalArrayDependency(const GraphModel &graph, const TaskModel &consumer
 }
 
 int64_t countSculptorOps(mlir::ModuleOp module,
-                       mlir::sculptor::TaskCreateOp taskOp) {
-  auto callee =
-      module.lookupSymbol<mlir::func::FuncOp>(
-          taskOp.getCalleeAttr().getValue());
+                         mlir::sculptor::TaskCreateOp taskOp) {
+  auto callee = module.lookupSymbol<mlir::func::FuncOp>(
+      taskOp.getCalleeAttr().getValue());
   if (!callee || callee.isDeclaration())
     return 0;
 
   int64_t count = 0;
   callee.walk([&](mlir::Operation *nestedOp) {
-    if (nestedOp->getName().getDialectNamespace() == "analog")
+    if (isAnalogArrayOp(nestedOp))
       ++count;
   });
   return count;
@@ -342,14 +348,16 @@ mlir::LogicalResult collectTasks(mlir::ModuleOp module, GraphModel &graph) {
     task.id = "task_" + std::to_string(graph.graphIndex) + "_" +
               std::to_string(taskOrder);
     task.order = static_cast<int64_t>(taskOrder);
-    task.taskIndex = getOptionalI64Attr(taskOp, runtime_attrs::kTaskIndexAttrName);
+    task.taskIndex =
+        getOptionalI64Attr(taskOp, runtime_attrs::kTaskIndexAttrName);
     task.callee = taskOp.getCallee().str();
     task.domain = taskOp.getDomain().str();
     task.kind = taskOp.getTaskKind().str();
     task.name = taskOp.getTaskName().str();
     task.sourceLayer = taskOp.getSourceLayer().str();
     task.sourceTaskOrdinal = taskOp.getSourceTaskOrdinal();
-    task.coreId = getOptionalI64Attr(taskOp, runtime_attrs::kTaskCoreIdAttrName);
+    task.coreId =
+        getOptionalI64Attr(taskOp, runtime_attrs::kTaskCoreIdAttrName);
     task.physicalArrayId =
         getOptionalI64Attr(taskOp, runtime_attrs::kTaskPhysicalArrayIdAttrName);
     task.digitalOps =
@@ -376,7 +384,8 @@ mlir::LogicalResult collectTasks(mlir::ModuleOp module, GraphModel &graph) {
         return mlir::failure();
       }
       task.outputResourceIds.push_back(resourceIt->second);
-      if (!graph.producerOrderByResource.try_emplace(output, taskOrder).second) {
+      if (!graph.producerOrderByResource.try_emplace(output, taskOrder)
+               .second) {
         taskOp.emitError("expected task graph resource to have one producer");
         return mlir::failure();
       }
@@ -404,9 +413,8 @@ mlir::FailureOr<GraphModel> buildGraphModel(mlir::ModuleOp module,
   graph.arraysPerCore =
       getOptionalI64Attr(func, schedule_attrs::kArraysPerCoreAttrName);
   graph.meshCols = getOptionalI64Attr(func, schedule_attrs::kMeshColsAttrName);
-  auto logicalArrayMap =
-      getOptionalI64ArrayAttr(func,
-                              schedule_attrs::kLogicalArrayToAnalogArrayAttrName);
+  auto logicalArrayMap = getOptionalI64ArrayAttr(
+      func, schedule_attrs::kLogicalArrayToAnalogArrayAttrName);
   if (mlir::failed(logicalArrayMap))
     return mlir::failure();
   graph.logicalArrayToAnalogArray = std::move(*logicalArrayMap);
@@ -476,7 +484,8 @@ void emitDotGraphFunc(llvm::raw_ostream &os, const GraphModel &graph) {
       if (!producer)
         continue;
 
-      bool logicalArrayEdge = isLogicalArrayDependency(graph, consumer, *producer);
+      bool logicalArrayEdge =
+          isLogicalArrayDependency(graph, consumer, *producer);
       os << "  " << producer->id << " -> " << consumer.id;
       if (logicalArrayEdge)
         os << " [style=\"dotted\", color=\"#b45309\"]";
@@ -582,9 +591,9 @@ void emitGraphMLDataEdge(llvm::raw_ostream &os, const GraphModel &graph,
   emitGraphMLI64Data(os, "destination_core", consumer.coreId);
   emitGraphMLI64Data(os, "mesh_distance", meshDistance);
   emitGraphMLI64Data(os, "transfer_cost", transferCost);
-  emitGraphMLBoolData(
-      os, "inter_core",
-      producer.coreId && consumer.coreId && *producer.coreId != *consumer.coreId);
+  emitGraphMLBoolData(os, "inter_core",
+                      producer.coreId && consumer.coreId &&
+                          *producer.coreId != *consumer.coreId);
   os << "    </edge>\n";
 }
 
@@ -621,7 +630,8 @@ void emitGraphMLGraph(llvm::raw_ostream &os, const GraphModel &graph) {
       const TaskModel *producer = lookupTaskByOrder(graph, producerIt->second);
       if (!producer)
         continue;
-      emitGraphMLDataEdge(os, graph, dataEdgeId, *producer, consumer, *resource);
+      emitGraphMLDataEdge(os, graph, dataEdgeId, *producer, consumer,
+                          *resource);
     }
   }
 
@@ -641,8 +651,7 @@ void emitGraphML(llvm::raw_ostream &os, llvm::ArrayRef<GraphModel> graphs) {
   emitGraphMLKey(os, "source_task_ordinal", "node", "source_task_ordinal",
                  "long");
   emitGraphMLKey(os, "core_id", "node", "core_id", "long");
-  emitGraphMLKey(os, "physical_array_id", "node", "physical_array_id",
-                 "long");
+  emitGraphMLKey(os, "physical_array_id", "node", "physical_array_id", "long");
   emitGraphMLKey(os, "local_array_id", "node", "local_array_id", "long");
   emitGraphMLKey(os, "digital_ops", "node", "digital_ops", "long");
   emitGraphMLKey(os, "analog_ops", "node", "analog_ops", "long");
@@ -680,8 +689,9 @@ void ExportTaskGraphVisPass::runOnOperation() {
   }
 
   if (format != "dot" && format != "graphml") {
-    getOperation().emitError("expected sculptor-export-task-graph-vis format to "
-                             "be 'dot' or 'graphml', got '")
+    getOperation().emitError(
+        "expected sculptor-export-task-graph-vis format to "
+        "be 'dot' or 'graphml', got '")
         << format << "'";
     signalPassFailure();
     return;

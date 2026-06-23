@@ -50,12 +50,6 @@ struct ScheduleTaskGraphPass
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
       llvm::cl::init("")};
 
-  Option<std::string> placement{
-      *this, "placement",
-      llvm::cl::desc("Boundary-to-core placement vector for explicit "
-                     "placement schedulers"),
-      llvm::cl::init("")};
-
   ScheduleTaskGraphPass() = default;
 
   ScheduleTaskGraphPass(const ScheduleTaskGraphPass &pass)
@@ -82,18 +76,13 @@ struct ScheduleTaskGraphPass
         schedule(
             *this, "schedule",
             llvm::cl::desc("Registered task graph scheduling algorithm to run"),
-            llvm::cl::init("")),
-        placement(*this, "placement",
-                  llvm::cl::desc("Boundary-to-core placement vector for "
-                                 "explicit placement schedulers"),
-                  llvm::cl::init("")) {
+            llvm::cl::init("")) {
     cores = pass.cores;
     arraysPerCore = pass.arraysPerCore;
     topology = pass.topology;
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     schedule = pass.schedule;
-    placement = pass.placement;
   }
 
   mlir::StringRef getArgument() const final {

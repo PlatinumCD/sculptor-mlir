@@ -13,6 +13,8 @@ add_mlir_library(MLIRSculptorTransforms
   assemblers/TaskGraphGeneratorAssembler.cpp
   assemblers/TaskGraphResourceAssembler.cpp
   assemblers/TaskGraphTaskAssembler.cpp
+  task_schedulers/TaskGraphRoutineFuser.cpp
+  task_schedulers/RandomTaskScheduler.cpp
   canonicalizers/Conv1DCanonicalizer.cpp
   canonicalizers/Conv2DCanonicalizer.cpp
   canonicalizers/Conv2DGroupedCanonicalizer.cpp
