@@ -38,10 +38,12 @@ sculptor-mlir-opt model.mlir \
 physical array tile size used when expanding `sculptor.mvm`.
 `sculptor-lower-golem-to-task-graph` accepts hardware budget options such as
 `cores`, `arrays-per-core`, `topology`, `mesh-rows`, and `mesh-cols`, plus a
-registered scheduler name. The current tree provides `schedule=random`, which
-places matrix setup/MVM groups on physical arrays, places related digital work
-on cores, fuses recognized task routines, scores the graph on the configured
-mesh, and recomputes the runtime resource layout.
+registered scheduler name. The current tree provides several placement
+strategies, including `random`, `snake`, `greedy-heavy-edge`, `manhattan-cut`,
+`boundary-aware-cut`, and `boundary-aware-cut-optimized`. After the selected
+strategy places matrix setup/MVM groups and related digital work, the pass fuses
+recognized task routines, scores the graph on the configured mesh, and
+recomputes the runtime resource layout.
 
 ### `sculptor-lower-to-golem`
 
