@@ -10,6 +10,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScorer.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -46,7 +47,7 @@ bool returnsTaskGraph(mlir::func::FuncOp func) {
 mlir::FailureOr<task_schedulers::HardwareBudget>
 buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
                     int64_t arraysPerCore, llvm::StringRef topology,
-                    int64_t meshRows, int64_t meshCols) {
+                    int64_t meshRows, int64_t meshCols, int64_t randomSeed) {
   if (numCores <= 0) {
     module.emitError("expected Sculptor scheduling budget to have at least one "
                      "core");
@@ -56,6 +57,12 @@ buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
   if (arraysPerCore <= 0) {
     module.emitError("expected Sculptor scheduling budget to have at least one "
                      "array per core");
+    return mlir::failure();
+  }
+
+  if (randomSeed < 0) {
+    module.emitError("expected Sculptor random scheduling seed to be "
+                     "non-negative");
     return mlir::failure();
   }
 
@@ -112,6 +119,7 @@ buildHardwareBudget(mlir::ModuleOp module, int64_t numCores,
   budget.meshRows = meshRows;
   budget.meshCols = meshCols;
   budget.numAnalogArrays = numCores * arraysPerCore;
+  budget.randomSeed = randomSeed;
   budget.analogArrays.reserve(static_cast<size_t>(budget.numAnalogArrays));
 
   for (int64_t analogArray = 0; analogArray < budget.numAnalogArrays;
@@ -365,15 +373,10 @@ static LogicalResult appendSelectedValues(ArrayRef<Value> values,
   return success();
 }
 
-static LogicalResult cloneChildBodyIntoParent(func::FuncOp parentFunc,
-                                              func::FuncOp childFunc,
-                                              func::ReturnOp childReturn,
-                                              IRMapping &mapping,
-                                              ArrayRef<unsigned>
-                                                  keptParentReturnIndices,
-                                              ArrayRef<unsigned>
-                                                  keptChildReturnIndices,
-                                              OpBuilder &builder) {
+static LogicalResult cloneChildBodyIntoParent(
+    func::FuncOp parentFunc, func::FuncOp childFunc, func::ReturnOp childReturn,
+    IRMapping &mapping, ArrayRef<unsigned> keptParentReturnIndices,
+    ArrayRef<unsigned> keptChildReturnIndices, OpBuilder &builder) {
   Block &childBlock = childFunc.getBody().front();
   builder.setInsertionPoint(parentFunc.getBody().front().getTerminator());
   for (Operation &op : childBlock.without_terminator()) {
@@ -504,11 +507,11 @@ static LogicalResult setSelectedOutputSlotsAttr(
   SmallVector<int64_t> values;
   values.reserve(keptParentOutputIndices.size() +
                  keptChildOutputIndices.size());
-  if (failed(appendSelectedI64ArrayElements(
-          parentOp, parentAttr, attrName, keptParentOutputIndices, values)))
+  if (failed(appendSelectedI64ArrayElements(parentOp, parentAttr, attrName,
+                                            keptParentOutputIndices, values)))
     return failure();
-  if (failed(appendSelectedI64ArrayElements(
-          childOp, childAttr, attrName, keptChildOutputIndices, values)))
+  if (failed(appendSelectedI64ArrayElements(childOp, childAttr, attrName,
+                                            keptChildOutputIndices, values)))
     return failure();
 
   parentOp->setAttr(attrName, builder.getI64ArrayAttr(values));
@@ -541,10 +544,10 @@ static void setSequentialTaskResultIndicesAttr(sculptor::TaskCreateOp taskOp,
                   builder.getI64ArrayAttr(values));
 }
 
-static void setSelectedTaskOutputs(
-    sculptor::TaskCreateOp parentTask, sculptor::TaskCreateOp childTask,
-    ArrayRef<unsigned> keptParentOutputIndices,
-    ArrayRef<unsigned> keptChildOutputIndices) {
+static void setSelectedTaskOutputs(sculptor::TaskCreateOp parentTask,
+                                   sculptor::TaskCreateOp childTask,
+                                   ArrayRef<unsigned> keptParentOutputIndices,
+                                   ArrayRef<unsigned> keptChildOutputIndices) {
   SmallVector<Value> fusedOutputs;
   fusedOutputs.reserve(keptParentOutputIndices.size() +
                        keptChildOutputIndices.size());
@@ -722,7 +725,8 @@ static void eraseUnusedTaskCallees(ModuleOp module) {
   llvm::SmallPtrSet<Operation *, 4> staleEntryPointOps;
   if (hasTaskGraph) {
     for (func::FuncOp func : module.getOps<func::FuncOp>()) {
-      if (func.getName() != "forward" || !callsGeneratedTaskCallee(module, func))
+      if (func.getName() != "forward" ||
+          !callsGeneratedTaskCallee(module, func))
         continue;
 
       staleEntryPoints.push_back(func);
@@ -893,19 +897,6 @@ static bool isAnalogTask(sculptor::TaskCreateOp taskOp) {
 static bool shouldInferDigitalOpsFromCallee(sculptor::TaskCreateOp taskOp) {
   return !isAnalogTask(taskOp) ||
          taskOp.getTaskKind() == task_graph_names::kConvTileMVMTaskKind;
-}
-
-static int64_t getMeshDistance(int64_t sourceCore, int64_t destinationCore,
-                               const HardwareBudget &budget) {
-  int64_t sourceRow = sourceCore / budget.meshCols;
-  int64_t sourceCol = sourceCore % budget.meshCols;
-  int64_t destinationRow = destinationCore / budget.meshCols;
-  int64_t destinationCol = destinationCore % budget.meshCols;
-  int64_t rowDistance = sourceRow > destinationRow ? sourceRow - destinationRow
-                                                   : destinationRow - sourceRow;
-  int64_t colDistance = sourceCol > destinationCol ? sourceCol - destinationCol
-                                                   : destinationCol - sourceCol;
-  return rowDistance + colDistance;
 }
 
 static LogicalResult collectResourceProducers(
@@ -1079,18 +1070,6 @@ static FailureOr<int64_t> computeTotalDigitalOps(ModuleOp module,
   return totalDigitalOps;
 }
 
-static int64_t getResourceByteSize(Value resource) {
-  Operation *resourceOp = resource.getDefiningOp();
-  if (!resourceOp)
-    return 0;
-
-  auto byteSizeAttr = resourceOp->getAttrOfType<IntegerAttr>(
-      runtime_attrs::kResourceByteSizeAttrName);
-  if (!byteSizeAttr)
-    return 0;
-  return byteSizeAttr.getInt();
-}
-
 static LogicalResult attachLogicalArrayScheduleMetadata(
     func::FuncOp taskGraphFunc, const HardwareBudget &budget,
     const TaskGraphDAG &dag,
@@ -1139,61 +1118,42 @@ static LogicalResult attachLogicalArrayScheduleMetadata(
   return success();
 }
 
-static LogicalResult attachTransferScheduleMetadata(
-    func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag,
-    const llvm::DenseMap<Value, const TaskGraphNode *> &producerByResource,
-    Builder &builder) {
-  int64_t coreTransferEntryCount = budget.numCores * budget.numCores;
-  SmallVector<int64_t, 16> coreTransferBytes(
-      static_cast<size_t>(coreTransferEntryCount), 0);
-  SmallVector<int64_t, 16> coreTransferCost(
-      static_cast<size_t>(coreTransferEntryCount), 0);
-  int64_t interCoreTransferBytes = 0;
-  int64_t totalTransferCost = 0;
-
-  for (const TaskGraphNode &consumer : dag.nodes) {
-    sculptor::TaskCreateOp consumerOp = consumer.op;
-    auto destinationCore =
-        getRequiredI64Attr(consumerOp, runtime_attrs::kTaskCoreIdAttrName);
-    if (failed(destinationCore))
-      return failure();
-
-    for (Value input : consumerOp.getInputs()) {
-      auto producerIt = producerByResource.find(input);
-      if (producerIt == producerByResource.end())
-        continue;
-
-      auto sourceCore = getRequiredI64Attr(producerIt->second->op,
-                                           runtime_attrs::kTaskCoreIdAttrName);
-      if (failed(sourceCore))
-        return failure();
-
-      if (*sourceCore == *destinationCore)
-        continue;
-
-      int64_t byteSize = getResourceByteSize(input);
-      int64_t meshDistance =
-          getMeshDistance(*sourceCore, *destinationCore, budget);
-      int64_t transferCost = byteSize * meshDistance;
-      size_t transferIndex =
-          static_cast<size_t>(*sourceCore * budget.numCores + *destinationCore);
-
-      coreTransferBytes[transferIndex] += byteSize;
-      coreTransferCost[transferIndex] += transferCost;
-      interCoreTransferBytes += byteSize;
-      totalTransferCost += transferCost;
-    }
-  }
-
+static void attachGraphScoreMetadata(func::FuncOp taskGraphFunc,
+                                     const TaskGraphScore &score,
+                                     Builder &builder) {
+  taskGraphFunc->setAttr(schedule_attrs::kGraphScoreAttrName,
+                         builder.getI64IntegerAttr(score.score));
+  taskGraphFunc->setAttr(schedule_attrs::kBoundaryPenaltyAttrName,
+                         builder.getI64IntegerAttr(score.boundaryPenalty));
   taskGraphFunc->setAttr(schedule_attrs::kCoreTransferBytesAttrName,
-                         builder.getI64ArrayAttr(coreTransferBytes));
-  taskGraphFunc->setAttr(schedule_attrs::kInterCoreTransferBytesAttrName,
-                         builder.getI64IntegerAttr(interCoreTransferBytes));
+                         builder.getI64ArrayAttr(score.coreTransferBytes));
+  taskGraphFunc->setAttr(
+      schedule_attrs::kInterCoreTransferBytesAttrName,
+      builder.getI64IntegerAttr(score.interCoreTransferBytes));
   taskGraphFunc->setAttr(schedule_attrs::kCoreTransferCostAttrName,
-                         builder.getI64ArrayAttr(coreTransferCost));
+                         builder.getI64ArrayAttr(score.coreTransferCost));
   taskGraphFunc->setAttr(schedule_attrs::kTotalTransferCostAttrName,
-                         builder.getI64IntegerAttr(totalTransferCost));
+                         builder.getI64IntegerAttr(score.totalTransferCost));
+}
+
+static FailureOr<TaskGraphScore> scoreTaskGraph(ModuleOp module,
+                                                func::FuncOp taskGraphFunc,
+                                                const HardwareBudget &budget,
+                                                const TaskGraphDAG &dag) {
+  MeshTaskGraphScorer scorer;
+  return scorer.score(module, taskGraphFunc, budget, dag);
+}
+
+static LogicalResult
+attachTransferScheduleMetadata(ModuleOp module, func::FuncOp taskGraphFunc,
+                               const HardwareBudget &budget,
+                               const TaskGraphDAG &dag, Builder &builder) {
+  FailureOr<TaskGraphScore> score =
+      scoreTaskGraph(module, taskGraphFunc, budget, dag);
+  if (failed(score))
+    return failure();
+
+  attachGraphScoreMetadata(taskGraphFunc, *score, builder);
   return success();
 }
 
@@ -1219,8 +1179,8 @@ LogicalResult finalizeTaskGraphScheduleMetadata(ModuleOp module,
                                                 producerByResource, builder)))
     return failure();
 
-  if (failed(attachTransferScheduleMetadata(taskGraphFunc, budget, dag,
-                                            producerByResource, builder)))
+  if (failed(attachTransferScheduleMetadata(module, taskGraphFunc, budget, dag,
+                                            builder)))
     return failure();
 
   taskGraphFunc->setAttr(
@@ -1377,7 +1337,7 @@ lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
 void ScheduleTaskGraphPass::runOnOperation() {
   mlir::ModuleOp module = getOperation();
   auto budget = buildHardwareBudget(module, cores, arraysPerCore, topology,
-                                    meshRows, meshCols);
+                                    meshRows, meshCols, randomSeed);
   if (failed(budget)) {
     signalPassFailure();
     return;
@@ -1385,6 +1345,11 @@ void ScheduleTaskGraphPass::runOnOperation() {
 
   task_schedulers::TaskGraphSchedulerRegistry registry;
   task_schedulers::registerRandomTaskScheduler(registry);
+  task_schedulers::registerSnakeTaskScheduler(registry);
+  task_schedulers::registerGreedyHeavyEdgeTaskScheduler(registry);
+  task_schedulers::registerManhattanCutTaskScheduler(registry);
+  task_schedulers::registerBoundaryAwareCutTaskScheduler(registry);
+  task_schedulers::registerBoundaryAwareCutOptimizedTaskScheduler(registry);
   const task_schedulers::TaskGraphScheduler *selectedScheduler =
       task_schedulers::lookupTaskGraphScheduler(registry, schedule);
   if (!selectedScheduler) {

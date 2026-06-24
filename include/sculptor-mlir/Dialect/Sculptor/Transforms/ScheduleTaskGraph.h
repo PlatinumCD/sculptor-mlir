@@ -50,6 +50,11 @@ struct ScheduleTaskGraphPass
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
       llvm::cl::init("")};
 
+  Option<int64_t> randomSeed{
+      *this, "random-seed",
+      llvm::cl::desc("Seed used by randomized task graph schedulers"),
+      llvm::cl::init(0)};
+
   ScheduleTaskGraphPass() = default;
 
   ScheduleTaskGraphPass(const ScheduleTaskGraphPass &pass)
@@ -76,13 +81,18 @@ struct ScheduleTaskGraphPass
         schedule(
             *this, "schedule",
             llvm::cl::desc("Registered task graph scheduling algorithm to run"),
-            llvm::cl::init("")) {
+            llvm::cl::init("")),
+        randomSeed(*this, "random-seed",
+                   llvm::cl::desc(
+                       "Seed used by randomized task graph schedulers"),
+                   llvm::cl::init(0)) {
     cores = pass.cores;
     arraysPerCore = pass.arraysPerCore;
     topology = pass.topology;
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     schedule = pass.schedule;
+    randomSeed = pass.randomSeed;
   }
 
   mlir::StringRef getArgument() const final {

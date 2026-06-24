@@ -40,8 +40,8 @@ physical array tile size used when expanding `sculptor.mvm`.
 `cores`, `arrays-per-core`, `topology`, `mesh-rows`, and `mesh-cols`, plus a
 registered scheduler name. The current tree provides `schedule=random`, which
 places matrix setup/MVM groups on physical arrays, places related digital work
-on cores, fuses recognized task routines, and recomputes the runtime resource
-layout.
+on cores, fuses recognized task routines, scores the graph on the configured
+mesh, and recomputes the runtime resource layout.
 
 ### `sculptor-lower-to-golem`
 
@@ -73,9 +73,9 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
    be present at this point as a direct call form of the same tasks.
 2. `sculptor-schedule-task-graph`
    Attaches task order, core assignment, logical array placement, transfer
-   metadata, routine fusion, and runtime resource layout. Once the task graph
-   is the live representation, the pass removes the stale materialized
-   `forward` entry point and unused generated task callees.
+   metadata, a graph score, routine fusion, and runtime resource layout. Once
+   the task graph is the live representation, the pass removes the stale
+   materialized `forward` entry point and unused generated task callees.
 3. `sculptor-lower-golem-to-llvm-shims`
    Rewrites scheduled Golem array operations into LLVM-callable runtime shim
    calls.
@@ -90,7 +90,7 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
 | `sculptor-expand-mvm-to-golem` | `sculptor.mvm` inside layer/helper functions. | Golem array setup, vector tiling, array execution, store, and recombine task regions. |
 | `sculptor-materialize-tasks` | `sculptor.task_region` boundaries. | Private task functions with task metadata, called from `forward`. |
 | `sculptor-assemble-task-graph` | A `forward` function that calls materialized task functions. | Materialized task functions plus `generate_task_graph` with `sculptor.task_graph.*` resources and `sculptor.task.create` nodes. |
-| `sculptor-schedule-task-graph` | An assembled task graph. | Scheduled task graph metadata, live private task functions, and no stale materialized `forward` entry point. |
+| `sculptor-schedule-task-graph` | An assembled task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
 | `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions containing Golem array operations. | Calls to LLVM-callable Golem runtime shims. |
 
 ### Export And Runtime Passes

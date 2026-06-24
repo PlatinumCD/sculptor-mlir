@@ -34,6 +34,10 @@ inline constexpr llvm::StringLiteral kCoreTransferCostAttrName(
 inline constexpr llvm::StringLiteral
     kTotalTransferCostAttrName("sculptor.schedule.total_transfer_cost");
 inline constexpr llvm::StringLiteral
+    kGraphScoreAttrName("sculptor.schedule.graph_score");
+inline constexpr llvm::StringLiteral
+    kBoundaryPenaltyAttrName("sculptor.schedule.boundary_penalty");
+inline constexpr llvm::StringLiteral
     kTotalDigitalOpsAttrName("sculptor.schedule.total_digital_ops");
 inline constexpr llvm::StringLiteral
     kNumLogicalArraysAttrName("sculptor.schedule.num_logical_arrays");

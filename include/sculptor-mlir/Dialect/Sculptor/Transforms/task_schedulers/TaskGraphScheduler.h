@@ -8,6 +8,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -28,6 +29,7 @@ struct HardwareBudget {
   int64_t meshRows = 0;
   int64_t meshCols = 0;
   int64_t numAnalogArrays = 0;
+  int64_t randomSeed = 0;
   llvm::SmallVector<int64_t, 8> analogArrays;
 };
 
@@ -47,6 +49,11 @@ struct PhysicalArrayPlacement {
   int64_t physicalArrayId = 0;
   int64_t coreId = 0;
   int64_t localArrayId = 0;
+};
+
+struct MatrixSetupGroupPlacement {
+  unsigned matrixSetupTaskIndex = 0;
+  int64_t physicalArrayId = 0;
 };
 
 struct TaskGraphDAG {
@@ -72,6 +79,15 @@ LogicalResult attachTaskAnalogArrayPlacement(ModuleOp module,
                                              sculptor::TaskCreateOp taskOp,
                                              const HardwareBudget &budget,
                                              int64_t physicalArrayId);
+
+LogicalResult placeMatrixSetupGroupsAndSurroundingTasks(
+    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
+    const TaskGraphDAG &dag, llvm::ArrayRef<int64_t> physicalArrayOrder);
+
+LogicalResult placeMatrixSetupGroupsAndSurroundingTasks(
+    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
+    const TaskGraphDAG &dag,
+    llvm::ArrayRef<MatrixSetupGroupPlacement> groupPlacements);
 
 FailureOr<sculptor::TaskCreateOp> fuseTasks(ModuleOp module,
                                             sculptor::TaskCreateOp parentTask,
@@ -109,6 +125,13 @@ lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
                          StringRef name);
 
 void registerRandomTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerSnakeTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerGreedyHeavyEdgeTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerManhattanCutTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerBoundaryAwareCutTaskScheduler(
+    TaskGraphSchedulerRegistry &registry);
+void registerBoundaryAwareCutOptimizedTaskScheduler(
+    TaskGraphSchedulerRegistry &registry);
 
 } // namespace task_schedulers
 } // namespace sculptor

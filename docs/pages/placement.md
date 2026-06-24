@@ -4,14 +4,25 @@ Placement is the step that decides where an assembled task graph should run.
 The input is already expressed as `sculptor.task.create` operations, task graph
 resources, explicit dependencies, and logical analog arrays. A scheduler turns
 that symbolic graph into runtime-facing metadata: task order, core assignment,
-array assignment, and transfer summaries.
+array assignment, a mesh-based graph score, and transfer summaries.
 
 The compiler keeps placement as an extension point. The
 `sculptor-schedule-task-graph` pass builds the hardware budget, parses the task
-graph, and dispatches through the scheduler interface. This tree registers a
-`random` scheduler that assigns matrix setup/MVM groups to physical arrays,
-places related digital tasks on cores, fuses recognized task routines, and
-rebuilds the runtime resource layout.
+graph, and dispatches through the scheduler interface. This tree registers
+`random`, `snake`, `greedy-heavy-edge`, `manhattan-cut`,
+`boundary-aware-cut`, and `boundary-aware-cut-optimized` schedulers.
+`random` assigns matrix setup/MVM groups to a shuffled physical-array order.
+`snake` assigns those same setup groups by walking the mesh in a deterministic
+snake order. `greedy-heavy-edge` builds a weighted communication graph between
+setup groups and places the heaviest communicating groups first.
+`manhattan-cut` builds deterministic cut coordinates, projects the group graph
+onto rows and columns, and keeps the lower-cost projection.
+`boundary-aware-cut` recursively partitions setup groups onto rectangular mesh
+regions with explicit region capacity. `boundary-aware-cut-optimized` starts
+from that recursive strategy and then applies local communication-cost
+refinements. All registered schedulers use the shared matrix-setup-group
+placement helper, so associated MVMs and surrounding same-source-layer digital
+tasks stay with their setup group.
 
 
 <details class="doc-section" open markdown="1">
@@ -27,7 +38,8 @@ The placement pass receives a hardware budget through pass parameters.
 | `topology` | Interconnect topology used for transfer-cost summaries. The current implementation supports `mesh`. |
 | `mesh-rows` | Number of rows in the mesh topology. |
 | `mesh-cols` | Number of columns in the mesh topology. If set to `0`, it is inferred from `cores` and `mesh-rows`. |
-| `schedule` | Name of a registered placement strategy, currently `random`. |
+| `schedule` | Name of a registered placement strategy, currently `random`, `snake`, `greedy-heavy-edge`, `manhattan-cut`, `boundary-aware-cut`, or `boundary-aware-cut-optimized`. |
+| `random-seed` | Seed used by randomized schedulers. The default is `0` for reproducible output. |
 
 The total analog array budget is:
 
@@ -92,6 +104,144 @@ bias-add output. Temporary task-graph resources that only represented internal
 fused boundaries are erased, and the runtime execution plan is recomputed so
 slots, temporary offsets, workspace size, and task indices match the compacted
 graph.
+
+Final schedule metadata also scores the graph for the configured mesh. The base
+score is the total inter-core transfer cost: each produced resource consumed on
+a different core contributes `resource-bytes * Manhattan mesh distance`. The
+scorer also adds a boundary penalty when the first and last tasks do not share a
+mesh boundary edge. The penalty is a 20% surcharge on the total transfer cost.
+The final result is recorded as
+`sculptor.schedule.graph_score`, alongside `boundary_penalty`,
+`core_transfer_bytes`, `core_transfer_cost`, `inter_core_transfer_bytes`, and
+`total_transfer_cost`.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Snake Schedule</summary>
+
+
+`snake` is a deterministic mesh traversal scheduler. It assigns matrix setup
+groups by walking the mesh from the top-left core across each row, reversing
+direction on alternating rows. For a `2x3` mesh, the core order is:
+
+```text
+0 -> 1 -> 2
+          |
+5 <- 4 <- 3
+```
+
+For each core on the path, `snake` uses every local physical array before moving
+to the next core. With `arrays-per-core=2` on a `2x2` mesh, the physical array
+order is:
+
+```text
+core path:      0, 1, 3, 2
+physical arrays [0, 1], [2, 3], [6, 7], [4, 5]
+```
+
+As with `random`, each matrix setup's associated MVM tasks are placed on the
+same physical array, same-source-layer digital tasks are placed on the owning
+core, and remaining core-only tasks are placed from already mapped graph
+neighbors.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Greedy Heavy-Edge Schedule</summary>
+
+
+`greedy-heavy-edge` places matrix setup groups by first building a reduced
+weighted graph. Each matrix setup group is one node, and each task-resource flow
+between groups contributes its byte size to an undirected weighted edge. The
+scheduler keeps the heaviest edges until they cover 80% of total group
+communication, places those heavy components first, and then attaches the
+remaining groups with a frontier priority rule.
+
+Placement is still physical-array based. With multiple arrays per core, each
+local array is a separate candidate slot:
+
+```text
+physicalArrayId = coreId * arraysPerCore + localArrayId
+```
+
+Candidate cost uses the candidate slot's core:
+
+```text
+edgeBytes * ManhattanDistance(candidateCore, placedNeighborCore)
+```
+
+So heavily communicating groups can land on different local arrays of the same
+core with zero mesh-transfer cost before the algorithm spills to nearby cores.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Manhattan Cut Schedule</summary>
+
+
+`manhattan-cut` uses the same matrix setup group graph as
+`greedy-heavy-edge`, but it chooses placements by projection instead of frontier
+growth. The scheduler computes two deterministic graph coordinates from weighted
+communication distances, sorts groups into `x` and `y` orderings, and evaluates
+both projection directions:
+
+```text
+x-first: slice by x ordering, sort each slice by y
+y-first: slice by y ordering, sort each slice by x
+```
+
+For each projection, the scheduler also tries orientation flips. Each candidate
+is scored with exact weighted group transfer cost over the mesh cores, with the
+same soft boundary surcharge used by the graph scorer. The best candidate is
+then materialized through the shared matrix setup placement helper.
+
+Multiple arrays per core are handled as physical array capacity inside each
+row or column slice. The placement remains physical-array based, while
+projection and scoring use the slot's owning core.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Boundary-Aware Cut Schedule</summary>
+
+
+`boundary-aware-cut` is the first recursive region scheduler. It represents the
+mesh as rectangular regions and gives each region capacity equal to:
+
+```text
+region cores * arrays-per-core
+```
+
+Each split is a real mesh cut. The scheduler evaluates candidate horizontal and
+vertical splits near the region midpoint, partitions matrix setup groups into
+the child regions with capacity constraints, and chooses the feasible split with
+the lowest weighted cut traffic. Recursion continues until a region is a single
+core or its groups fit within one core's local-array capacity.
+
+At the leaves, groups are assigned to physical array slots inside the region:
+
+```text
+physicalArrayId = coreId * arraysPerCore + localArrayId
+```
+
+This implementation is intentionally the first operational version of the
+multilevel idea. It has real region capacity and recursive cut placement, but
+does not include graph coarsening, FM refinement, or uncoarsening repair.
+`boundary-aware-cut-optimized` is registered separately so refinements can be
+developed and compared without replacing the baseline. It currently adds:
+
+- explicit endpoint corridor placement: top, bottom, left, and right boundary
+  corridors are evaluated independently, and the first and last task groups must
+  stay on the chosen corridor;
+- cost-aware assignment inside leaf regions, using already placed neighboring
+  groups to choose lower-cost physical array slots;
+- bounded exact pair-swap refinement over placed setup groups;
+- bounded hot-edge endpoint moves into unused physical array slots when extra
+  local-array capacity is available.
+- bounded compact-chain path repacking, which tries connected snake paths over
+  compact mesh rectangles and repacks ordered setup groups onto those paths
+  without increasing exact transfer cost.
 
 </details>
 
