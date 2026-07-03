@@ -22,6 +22,10 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral
     kAnalogArraysAttrName("sculptor.schedule.analog_arrays");
 inline constexpr llvm::StringLiteral
+    kGreedyLookaheadAttrName("sculptor.schedule.greedy_lookahead");
+inline constexpr llvm::StringLiteral kGreedyCandidateScopeAttrName(
+    "sculptor.schedule.greedy_candidate_scope");
+inline constexpr llvm::StringLiteral
     kTaskCountAttrName("sculptor.schedule.task_count");
 inline constexpr llvm::StringLiteral
     kDependencyCountAttrName("sculptor.schedule.dependency_count");
@@ -33,6 +37,8 @@ inline constexpr llvm::StringLiteral kCoreTransferCostAttrName(
     "sculptor.schedule.core_transfer_cost");
 inline constexpr llvm::StringLiteral
     kTotalTransferCostAttrName("sculptor.schedule.total_transfer_cost");
+inline constexpr llvm::StringLiteral kTransferCostPerInterCoreByteAttrName(
+    "sculptor.schedule.transfer_cost_per_inter_core_byte");
 inline constexpr llvm::StringLiteral
     kGraphScoreAttrName("sculptor.schedule.graph_score");
 inline constexpr llvm::StringLiteral
@@ -45,6 +51,8 @@ inline constexpr llvm::StringLiteral
     kLogicalArrayIndexAttrName("sculptor.schedule.logical_array_index");
 inline constexpr llvm::StringLiteral kLogicalArrayToAnalogArrayAttrName(
     "sculptor.schedule.logical_array_to_analog_array");
+inline constexpr llvm::StringLiteral
+    kIslandIndexAttrName("sculptor.schedule.island");
 
 } // namespace schedule_attrs
 } // namespace sculptor

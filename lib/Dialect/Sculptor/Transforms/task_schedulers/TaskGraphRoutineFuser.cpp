@@ -1,4 +1,6 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphRoutineFuser.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphDAG.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
@@ -6,9 +8,12 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -26,6 +31,9 @@ namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace task_attrs = mlir::sculptor::task_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 
+static constexpr llvm::StringLiteral kFusedMixedTaskDomain("digital");
+static constexpr llvm::StringLiteral kFusedMixedTaskKind("mixed.fused");
+
 using TaskFusionPatternFn = LogicalResult (*)(ModuleOp module,
                                               func::FuncOp taskGraphFunc,
                                               const HardwareBudget &budget,
@@ -37,18 +45,20 @@ struct TaskFusionPattern {
   TaskFusionPatternFn apply;
 };
 
-struct ConvTileMVMChain {
-  const TaskGraphNode *convPatch = nullptr;
-  const TaskGraphNode *vectorTile = nullptr;
-  const TaskGraphNode *mvm = nullptr;
-  const TaskGraphNode *tileRecombine = nullptr;
-  const TaskGraphNode *biasAdd = nullptr;
+struct SameCoreFusibleComponent {
+  llvm::SmallVector<const TaskGraphNode *, 8> nodes;
+  int64_t coreId = 0;
+  std::string fusedTaskName;
+  std::optional<int64_t> physicalArrayId;
 };
 
-static bool hasTaskKind(mlir::sculptor::TaskCreateOp taskOp,
-                        StringRef taskKind) {
-  return taskOp.getTaskKind() == taskKind;
-}
+struct ComponentBoundary {
+  llvm::SmallVector<Value, 8> inputs;
+  llvm::SmallVector<Value, 8> outputs;
+  llvm::SmallVector<Value, 8> dependencies;
+  Operation *latestDependency = nullptr;
+  Operation *earliestExternalUser = nullptr;
+};
 
 static bool hasDependency(mlir::sculptor::TaskCreateOp taskOp,
                           Value dependency) {
@@ -66,119 +76,10 @@ static std::optional<int64_t> getOptionalI64Attr(Operation *op,
   return std::nullopt;
 }
 
-static bool getCompatibleMVMPhysicalArray(const ConvTileMVMChain &chain,
-                                          int64_t &physicalArrayId) {
-  mlir::sculptor::TaskCreateOp mvmTask = chain.mvm->op;
-  auto mvmCore = getOptionalI64Attr(mvmTask.getOperation(),
-                                    runtime_attrs::kTaskCoreIdAttrName);
-  auto mvmPhysicalArray = getOptionalI64Attr(
-      mvmTask.getOperation(), runtime_attrs::kTaskPhysicalArrayIdAttrName);
-  if (!mvmCore || !mvmPhysicalArray)
-    return false;
-
-  for (const TaskGraphNode *node : {chain.convPatch, chain.vectorTile,
-                                    chain.tileRecombine, chain.biasAdd}) {
-    mlir::sculptor::TaskCreateOp taskOp = node->op;
-    auto coreId = getOptionalI64Attr(taskOp.getOperation(),
-                                     runtime_attrs::kTaskCoreIdAttrName);
-    if (!coreId || *coreId != *mvmCore)
-      return false;
-  }
-
-  physicalArrayId = *mvmPhysicalArray;
-  return true;
-}
-
-static const TaskGraphNode *
-getSingleSuccessorWithKind(const TaskGraphNode &node, const TaskGraphDAG &dag,
-                           StringRef taskKind) {
-  if (node.successors.size() != 1)
-    return nullptr;
-
-  const TaskGraphNode &successor = dag.nodes[node.successors.front()];
-  if (!hasTaskKind(successor.op, taskKind))
-    return nullptr;
-
-  return &successor;
-}
-
-static bool allSameSourceLayer(const ConvTileMVMChain &chain) {
-  mlir::sculptor::TaskCreateOp convPatch = chain.convPatch->op;
-  mlir::sculptor::TaskCreateOp vectorTile = chain.vectorTile->op;
-  mlir::sculptor::TaskCreateOp mvm = chain.mvm->op;
-  mlir::sculptor::TaskCreateOp tileRecombine = chain.tileRecombine->op;
-  mlir::sculptor::TaskCreateOp biasAdd = chain.biasAdd->op;
-  StringRef sourceLayer = convPatch.getSourceLayer();
-  return vectorTile.getSourceLayer() == sourceLayer &&
-         mvm.getSourceLayer() == sourceLayer &&
-         tileRecombine.getSourceLayer() == sourceLayer &&
-         biasAdd.getSourceLayer() == sourceLayer;
-}
-
-static bool hasSingleDependencyOn(mlir::sculptor::TaskCreateOp taskOp,
-                                  mlir::sculptor::TaskCreateOp dependency) {
-  return taskOp.getDependencies().size() == 1 &&
-         hasDependency(taskOp, dependency.getResult());
-}
-
-static bool
-hasExpectedMVMDependencies(mlir::sculptor::TaskCreateOp mvmTask,
-                           mlir::sculptor::TaskCreateOp vectorTile) {
-  if (mvmTask.getDependencies().size() != 2 ||
-      !hasDependency(mvmTask, vectorTile.getResult()))
-    return false;
-
-  for (Value dependency : mvmTask.getDependencies()) {
-    if (dependency == vectorTile.getResult())
-      continue;
-    auto dependencyTask =
-        dependency.getDefiningOp<mlir::sculptor::TaskCreateOp>();
-    if (dependencyTask &&
-        hasTaskKind(dependencyTask, task_graph_names::kMatrixSetupTaskKind))
-      return true;
-  }
-
-  return false;
-}
-
-static bool isExactConvTileMVMChain(const ConvTileMVMChain &chain) {
-  return allSameSourceLayer(chain) &&
-         hasSingleDependencyOn(chain.vectorTile->op, chain.convPatch->op) &&
-         hasExpectedMVMDependencies(chain.mvm->op, chain.vectorTile->op) &&
-         hasSingleDependencyOn(chain.tileRecombine->op, chain.mvm->op) &&
-         hasSingleDependencyOn(chain.biasAdd->op, chain.tileRecombine->op);
-}
-
-static std::optional<ConvTileMVMChain>
-matchConvTileMVMChainFrom(const TaskGraphNode &node, const TaskGraphDAG &dag) {
-  if (!hasTaskKind(node.op, task_graph_names::kConvPatchTaskKind))
-    return std::nullopt;
-
-  const TaskGraphNode *vectorTile = getSingleSuccessorWithKind(
-      node, dag, task_graph_names::kVectorTileTaskKind);
-  if (!vectorTile)
-    return std::nullopt;
-
-  const TaskGraphNode *mvm = getSingleSuccessorWithKind(
-      *vectorTile, dag, task_graph_names::kMVMTaskKind);
-  if (!mvm)
-    return std::nullopt;
-
-  const TaskGraphNode *tileRecombine = getSingleSuccessorWithKind(
-      *mvm, dag, task_graph_names::kTileRecombineTaskKind);
-  if (!tileRecombine)
-    return std::nullopt;
-
-  const TaskGraphNode *biasAdd = getSingleSuccessorWithKind(
-      *tileRecombine, dag, task_graph_names::kBiasAddTaskKind);
-  if (!biasAdd)
-    return std::nullopt;
-
-  ConvTileMVMChain chain{&node, vectorTile, mvm, tileRecombine, biasAdd};
-  if (!isExactConvTileMVMChain(chain))
-    return std::nullopt;
-
-  return chain;
+static std::optional<int64_t>
+getOptionalScheduledCore(mlir::sculptor::TaskCreateOp taskOp) {
+  return getOptionalI64Attr(taskOp.getOperation(),
+                            runtime_attrs::kTaskCoreIdAttrName);
 }
 
 static std::string sanitizeSymbolComponent(StringRef value) {
@@ -209,58 +110,26 @@ static std::string sanitizeSymbolComponent(StringRef value) {
   return result;
 }
 
-static std::string getConvTileSuffix(StringRef convPatchTaskName) {
-  StringRef prefix = "conv2d_";
-  if (convPatchTaskName.starts_with(prefix))
-    convPatchTaskName = convPatchTaskName.drop_front(prefix.size());
-  return sanitizeSymbolComponent(convPatchTaskName);
-}
-
-static std::string buildFusedConvTileMVMTaskName(const ConvTileMVMChain &chain,
-                                                 const TaskGraphDAG &dag) {
+static llvm::StringSet<> collectTaskNames(const TaskGraphDAG &dag) {
   llvm::StringSet<> usedTaskNames;
   for (const TaskGraphNode &node : dag.nodes) {
     mlir::sculptor::TaskCreateOp taskOp = node.op;
     usedTaskNames.insert(taskOp.getTaskName());
   }
-
-  mlir::sculptor::TaskCreateOp convPatch = chain.convPatch->op;
-  mlir::sculptor::TaskCreateOp mvm = chain.mvm->op;
-  std::string baseName = convPatch.getSourceLayer().str();
-  baseName += "_conv_tile_mvm_";
-  baseName += getConvTileSuffix(convPatch.getTaskName());
-
-  if (usedTaskNames.insert(baseName).second)
-    return baseName;
-
-  std::string fallback = baseName;
-  fallback += "_";
-  fallback += std::to_string(mvm.getSourceTaskOrdinal());
-  return fallback;
+  return usedTaskNames;
 }
 
-static std::string buildUniqueTaskFunctionName(ModuleOp module,
-                                               func::FuncOp currentCallee,
-                                               StringRef fusedTaskName,
-                                               uint64_t sourceTaskOrdinal) {
-  std::string baseName = "task_";
-  baseName += sanitizeSymbolComponent(fusedTaskName);
-  baseName += "_";
-  baseName += std::to_string(sourceTaskOrdinal);
-
-  auto isAvailable = [&](StringRef name) {
-    auto existing = module.lookupSymbol<func::FuncOp>(name);
-    return !existing || existing == currentCallee;
-  };
-
-  if (isAvailable(baseName))
-    return baseName;
+static std::string buildUniqueFusedTaskName(StringRef baseName,
+                                            llvm::StringSet<> &usedTaskNames) {
+  std::string sanitizedBase = sanitizeSymbolComponent(baseName);
+  if (usedTaskNames.insert(sanitizedBase).second)
+    return sanitizedBase;
 
   unsigned index = 0;
-  std::string candidate = baseName + "_" + std::to_string(index);
-  while (!isAvailable(candidate)) {
+  std::string candidate = sanitizedBase + "_" + std::to_string(index);
+  while (!usedTaskNames.insert(candidate).second) {
     ++index;
-    candidate = baseName + "_" + std::to_string(index);
+    candidate = sanitizedBase + "_" + std::to_string(index);
   }
   return candidate;
 }
@@ -277,82 +146,572 @@ lookupTaskCallee(ModuleOp module, mlir::sculptor::TaskCreateOp taskOp) {
   return callee;
 }
 
-static LogicalResult
-renameFusedConvTileMVMTask(ModuleOp module,
-                           mlir::sculptor::TaskCreateOp fusedTask,
-                           StringRef fusedTaskName) {
-  auto callee = lookupTaskCallee(module, fusedTask);
-  if (failed(callee))
+static bool containsValue(ArrayRef<Value> values, Value value) {
+  return llvm::is_contained(values, value);
+}
+
+static void appendUniqueValue(SmallVectorImpl<Value> &values, Value value) {
+  if (!containsValue(values, value))
+    values.push_back(value);
+}
+
+static bool isMatrixSetupTask(mlir::sculptor::TaskCreateOp taskOp) {
+  return taskOp.getTaskKind() == task_graph_names::kMatrixSetupTaskKind;
+}
+
+static bool isComponentFusibleTask(mlir::sculptor::TaskCreateOp taskOp) {
+  // Matrix setup produces logical-array resources used by schedule metadata.
+  // Keep it explicit and let fused MVM/digital components depend on it.
+  return !isMatrixSetupTask(taskOp) && getOptionalScheduledCore(taskOp);
+}
+
+static std::optional<int64_t>
+getOptionalPhysicalArray(mlir::sculptor::TaskCreateOp taskOp) {
+  return getOptionalI64Attr(taskOp.getOperation(),
+                            runtime_attrs::kTaskPhysicalArrayIdAttrName);
+}
+
+static std::optional<int64_t> getSingleComponentPhysicalArray(
+    ArrayRef<const TaskGraphNode *> componentNodes) {
+  std::optional<int64_t> physicalArrayId;
+  for (const TaskGraphNode *node : componentNodes) {
+    std::optional<int64_t> taskPhysicalArray =
+        getOptionalPhysicalArray(node->op);
+    if (!taskPhysicalArray)
+      continue;
+    if (physicalArrayId && *physicalArrayId != *taskPhysicalArray)
+      return std::nullopt;
+    physicalArrayId = *taskPhysicalArray;
+  }
+  return physicalArrayId;
+}
+
+static std::string
+buildFusedSameCoreComponentTaskName(ArrayRef<const TaskGraphNode *> nodes,
+                                    llvm::StringSet<> &usedTaskNames) {
+  if (nodes.empty())
+    return buildUniqueFusedTaskName("same_core_component", usedTaskNames);
+
+  mlir::sculptor::TaskCreateOp firstTask = nodes.front()->op;
+  mlir::sculptor::TaskCreateOp lastTask = nodes.back()->op;
+  std::string baseName = firstTask.getSourceLayer().str();
+  baseName += "_same_core_component_core_";
+  std::optional<int64_t> coreId = getOptionalScheduledCore(firstTask);
+  baseName += std::to_string(coreId.value_or(0));
+  baseName += "_";
+  baseName += std::to_string(firstTask.getSourceTaskOrdinal());
+  baseName += "_";
+  baseName += std::to_string(lastTask.getSourceTaskOrdinal());
+  return buildUniqueFusedTaskName(baseName, usedTaskNames);
+}
+
+static bool isBeforeInSameBlock(Operation *lhs, Operation *rhs) {
+  return lhs && rhs && lhs->getBlock() == rhs->getBlock() &&
+         lhs->isBeforeInBlock(rhs);
+}
+
+static Operation *getLaterOperation(Operation *current, Operation *candidate) {
+  if (!current)
+    return candidate;
+  if (!candidate)
+    return current;
+  return current->isBeforeInBlock(candidate) ? candidate : current;
+}
+
+static Operation *getEarlierOperation(Operation *current,
+                                      Operation *candidate) {
+  if (!current)
+    return candidate;
+  if (!candidate)
+    return current;
+  return candidate->isBeforeInBlock(current) ? candidate : current;
+}
+
+static void collectTaskConsumers(
+    const TaskGraphDAG &dag,
+    llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+        &consumersByTaskResult) {
+  for (const TaskGraphNode &node : dag.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node.op;
+    for (Value dependency : taskOp.getDependencies()) {
+      auto producer = dependency.getDefiningOp<mlir::sculptor::TaskCreateOp>();
+      if (!producer)
+        continue;
+      consumersByTaskResult[dependency].push_back(&node);
+    }
+  }
+}
+
+static void collectResourceConsumers(
+    const TaskGraphDAG &dag,
+    llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+        &consumersByResource) {
+  for (const TaskGraphNode &node : dag.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node.op;
+    for (Value input : taskOp.getInputs())
+      consumersByResource[input].push_back(&node);
+  }
+}
+
+static bool allComponentNodesHaveCore(ArrayRef<const TaskGraphNode *> nodes,
+                                      int64_t coreId) {
+  for (const TaskGraphNode *node : nodes) {
+    std::optional<int64_t> taskCore = getOptionalScheduledCore(node->op);
+    if (!taskCore || *taskCore != coreId)
+      return false;
+  }
+  return true;
+}
+
+static llvm::SmallVector<SameCoreFusibleComponent, 16>
+collectSameCoreFusibleComponents(const TaskGraphDAG &dag) {
+  llvm::SmallVector<SameCoreFusibleComponent, 16> components;
+  llvm::SmallVector<bool, 64> eligible(dag.nodes.size(), false);
+  llvm::SmallVector<bool, 64> visited(dag.nodes.size(), false);
+  llvm::StringSet<> usedTaskNames = collectTaskNames(dag);
+
+  for (const TaskGraphNode &node : dag.nodes)
+    eligible[node.index] = isComponentFusibleTask(node.op);
+
+  for (const TaskGraphNode &seed : dag.nodes) {
+    if (!eligible[seed.index] || visited[seed.index])
+      continue;
+
+    std::optional<int64_t> coreId = getOptionalScheduledCore(seed.op);
+    if (!coreId)
+      continue;
+
+    llvm::SmallVector<unsigned, 16> stack;
+    llvm::SmallVector<const TaskGraphNode *, 8> nodes;
+    stack.push_back(seed.index);
+    visited[seed.index] = true;
+
+    while (!stack.empty()) {
+      unsigned index = stack.pop_back_val();
+      const TaskGraphNode &node = dag.nodes[index];
+      nodes.push_back(&node);
+
+      auto maybePushNeighbor = [&](unsigned neighborIndex) {
+        if (!eligible[neighborIndex] || visited[neighborIndex])
+          return;
+        const TaskGraphNode &neighbor = dag.nodes[neighborIndex];
+        std::optional<int64_t> neighborCore =
+            getOptionalScheduledCore(neighbor.op);
+        if (!neighborCore || *neighborCore != *coreId)
+          return;
+        visited[neighborIndex] = true;
+        stack.push_back(neighborIndex);
+      };
+
+      for (unsigned predecessor : node.predecessors)
+        maybePushNeighbor(predecessor);
+      for (unsigned successor : node.successors)
+        maybePushNeighbor(successor);
+    }
+
+    if (nodes.size() <= 1)
+      continue;
+
+    llvm::sort(nodes, [](const TaskGraphNode *lhs, const TaskGraphNode *rhs) {
+      return lhs->index < rhs->index;
+    });
+
+    if (!allComponentNodesHaveCore(nodes, *coreId))
+      continue;
+
+    SameCoreFusibleComponent component;
+    component.nodes = std::move(nodes);
+    component.coreId = *coreId;
+    component.physicalArrayId =
+        getSingleComponentPhysicalArray(component.nodes);
+    component.fusedTaskName =
+        buildFusedSameCoreComponentTaskName(component.nodes, usedTaskNames);
+    components.push_back(std::move(component));
+  }
+
+  return components;
+}
+
+static bool isNodeInComponent(const llvm::SmallPtrSetImpl<Operation *> &ops,
+                              const TaskGraphNode *node) {
+  if (!node)
+    return false;
+  mlir::sculptor::TaskCreateOp taskOp = node->op;
+  return ops.contains(taskOp.getOperation());
+}
+
+static bool isComponentOutputResource(
+    Value resource, const llvm::SmallPtrSetImpl<Operation *> &componentOps,
+    const llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+        &consumersByResource) {
+  if (resource.getDefiningOp<mlir::sculptor::TaskGraphOutputOp>())
+    return true;
+
+  auto consumerIt = consumersByResource.find(resource);
+  if (consumerIt == consumersByResource.end())
+    return false;
+
+  for (const TaskGraphNode *consumer : consumerIt->second)
+    if (!isNodeInComponent(componentOps, consumer))
+      return true;
+  return false;
+}
+
+static FailureOr<ComponentBoundary> computeComponentBoundary(
+    const SameCoreFusibleComponent &component, const TaskGraphDAG &dag,
+    const llvm::DenseMap<Value, const TaskGraphNode *> &producerByResource,
+    const llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+        &consumersByResource,
+    const llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+        &consumersByTaskResult) {
+  ComponentBoundary boundary;
+  llvm::SmallPtrSet<Operation *, 16> componentOps;
+  for (const TaskGraphNode *node : component.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node->op;
+    componentOps.insert(taskOp.getOperation());
+  }
+
+  for (const TaskGraphNode *node : component.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node->op;
+    for (Value input : taskOp.getInputs()) {
+      auto producerIt = producerByResource.find(input);
+      if (producerIt != producerByResource.end() &&
+          isNodeInComponent(componentOps, producerIt->second))
+        continue;
+      appendUniqueValue(boundary.inputs, input);
+    }
+
+    for (Value dependency : taskOp.getDependencies()) {
+      auto dependencyTask =
+          dependency.getDefiningOp<mlir::sculptor::TaskCreateOp>();
+      if (!dependencyTask)
+        return taskOp.emitError("expected component task dependency to be "
+                                "produced by a task");
+      if (componentOps.contains(dependencyTask.getOperation()))
+        continue;
+      appendUniqueValue(boundary.dependencies, dependency);
+      boundary.latestDependency = getLaterOperation(
+          boundary.latestDependency, dependencyTask.getOperation());
+    }
+
+    for (Value output : taskOp.getOutputs()) {
+      if (isComponentOutputResource(output, componentOps, consumersByResource))
+        appendUniqueValue(boundary.outputs, output);
+    }
+
+    auto consumersIt = consumersByTaskResult.find(taskOp.getResult());
+    if (consumersIt == consumersByTaskResult.end())
+      continue;
+    for (const TaskGraphNode *consumer : consumersIt->second) {
+      if (isNodeInComponent(componentOps, consumer))
+        continue;
+      mlir::sculptor::TaskCreateOp consumerTask = consumer->op;
+      boundary.earliestExternalUser = getEarlierOperation(
+          boundary.earliestExternalUser, consumerTask.getOperation());
+    }
+  }
+
+  return boundary;
+}
+
+static bool
+hasLegalComponentInsertionWindow(const ComponentBoundary &boundary) {
+  return !boundary.latestDependency || !boundary.earliestExternalUser ||
+         isBeforeInSameBlock(boundary.latestDependency,
+                             boundary.earliestExternalUser);
+}
+
+static FailureOr<Type> getTaskResourceValueType(Value resource) {
+  auto resourceType =
+      dyn_cast<mlir::sculptor::TaskResourceType>(resource.getType());
+  if (!resourceType) {
+    if (Operation *op = resource.getDefiningOp())
+      return op->emitError("expected fused task boundary value to be a task "
+                           "resource");
     return failure();
+  }
+  return resourceType.getValueType();
+}
 
-  func::FuncOp calleeFunc = *callee;
-  std::string functionName = buildUniqueTaskFunctionName(
-      module, calleeFunc, fusedTaskName, fusedTask.getSourceTaskOrdinal());
-  Builder builder(module.getContext());
-  auto functionNameAttr = builder.getStringAttr(functionName);
-  if (failed(SymbolTable::replaceAllSymbolUses(calleeFunc, functionNameAttr,
-                                               module.getOperation())))
-    return failure();
-  calleeFunc.setSymName(functionName);
-
-  auto domain = builder.getStringAttr(task_graph_names::kAnalogDomain);
-  auto kind = builder.getStringAttr(task_graph_names::kConvTileMVMTaskKind);
-  auto name = builder.getStringAttr(fusedTaskName);
-
-  fusedTask.setCalleeAttr(
-      FlatSymbolRefAttr::get(builder.getContext(), functionName));
-  fusedTask.setDomainAttr(domain);
-  fusedTask.setTaskKindAttr(kind);
-  fusedTask.setTaskNameAttr(name);
-
-  calleeFunc->setAttr(task_attrs::kTaskDomainAttrName, domain);
-  calleeFunc->setAttr(task_attrs::kTaskKindAttrName, kind);
-  calleeFunc->setAttr(task_attrs::kTaskNameAttrName, name);
+static LogicalResult collectComponentMappedReturnValues(
+    func::FuncOp childFunc, func::ReturnOp childReturn,
+    const IRMapping &mapping, SmallVectorImpl<Value> &mappedReturns) {
+  for (Value returnValue : childReturn.getOperands()) {
+    Value mapped = mapping.lookupOrNull(returnValue);
+    if (!mapped) {
+      childFunc.emitError("expected component return operand to be mapped");
+      return failure();
+    }
+    mappedReturns.push_back(mapped);
+  }
   return success();
 }
 
-static LogicalResult fuseConvTileMVMChains(ModuleOp module,
-                                           func::FuncOp taskGraphFunc,
-                                           const HardwareBudget &budget,
-                                           const TaskGraphDAG &dag,
-                                           bool &changed) {
-  (void)taskGraphFunc;
+static FailureOr<func::FuncOp>
+buildSameCoreComponentCallee(ModuleOp module,
+                             const SameCoreFusibleComponent &component,
+                             const ComponentBoundary &boundary) {
+  MLIRContext *context = module.getContext();
+  Builder builder(context);
+
+  SmallVector<Type, 8> inputTypes;
+  inputTypes.reserve(boundary.inputs.size());
+  for (Value input : boundary.inputs) {
+    FailureOr<Type> valueType = getTaskResourceValueType(input);
+    if (failed(valueType))
+      return failure();
+    inputTypes.push_back(*valueType);
+  }
+
+  SmallVector<Type, 8> resultTypes;
+  resultTypes.reserve(boundary.outputs.size());
+  for (Value output : boundary.outputs) {
+    FailureOr<Type> valueType = getTaskResourceValueType(output);
+    if (failed(valueType))
+      return failure();
+    resultTypes.push_back(*valueType);
+  }
+
+  std::string functionName = "task_";
+  functionName += sanitizeSymbolComponent(component.fusedTaskName);
+  functionName += "_";
+  mlir::sculptor::TaskCreateOp firstTask = component.nodes.front()->op;
+  functionName += std::to_string(firstTask.getSourceTaskOrdinal());
+  unsigned suffix = 0;
+  std::string candidate = functionName;
+  while (module.lookupSymbol<func::FuncOp>(candidate)) {
+    candidate = functionName + "_" + std::to_string(suffix++);
+  }
+  functionName = candidate;
+
+  auto functionType = builder.getFunctionType(inputTypes, resultTypes);
+  func::FuncOp fusedFunc =
+      func::FuncOp::create(firstTask.getLoc(), functionName, functionType);
+  fusedFunc.setPrivate();
+
+  auto domain = builder.getStringAttr(kFusedMixedTaskDomain);
+  auto kind = builder.getStringAttr(kFusedMixedTaskKind);
+  auto name = builder.getStringAttr(component.fusedTaskName);
+  fusedFunc->setAttr(task_attrs::kTaskDomainAttrName, domain);
+  fusedFunc->setAttr(task_attrs::kTaskKindAttrName, kind);
+  fusedFunc->setAttr(task_attrs::kTaskNameAttrName, name);
+  fusedFunc->setAttr(task_attrs::kSourceLayerAttrName,
+                     builder.getStringAttr(firstTask.getSourceLayer()));
+  fusedFunc->setAttr(
+      task_attrs::kSourceTaskOrdinalAttrName,
+      builder.getI64IntegerAttr(firstTask.getSourceTaskOrdinal()));
+
+  OpBuilder moduleBuilder(context);
+  moduleBuilder.setInsertionPointToEnd(module.getBody());
+  moduleBuilder.insert(fusedFunc);
+
+  Block *entryBlock = fusedFunc.addEntryBlock();
+  OpBuilder bodyBuilder(entryBlock, entryBlock->begin());
+
+  llvm::DenseMap<Value, Value> resourceValueByResource;
+  for (auto indexedInput : llvm::enumerate(boundary.inputs))
+    resourceValueByResource.try_emplace(
+        indexedInput.value(), entryBlock->getArgument(indexedInput.index()));
+
+  for (const TaskGraphNode *node : component.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node->op;
+    auto callee = lookupTaskCallee(module, taskOp);
+    if (failed(callee))
+      return failure();
+
+    func::FuncOp calleeFunc = *callee;
+    auto returnOp = dyn_cast_or_null<func::ReturnOp>(
+        calleeFunc.getBody().front().getTerminator());
+    if (!returnOp) {
+      taskOp.emitError("expected component task callee to terminate with "
+                       "func.return");
+      return failure();
+    }
+
+    Block &calleeBlock = calleeFunc.getBody().front();
+    if (calleeBlock.getNumArguments() != taskOp.getInputs().size() ||
+        returnOp.getNumOperands() != taskOp.getOutputs().size()) {
+      taskOp.emitError("expected component task callee signature to match "
+                       "task inputs and outputs");
+      return failure();
+    }
+
+    IRMapping mapping;
+    for (auto indexedInput : llvm::enumerate(taskOp.getInputs())) {
+      auto mappedInput = resourceValueByResource.find(indexedInput.value());
+      if (mappedInput == resourceValueByResource.end()) {
+        taskOp.emitError("expected component task input to be available in "
+                         "fused component");
+        return failure();
+      }
+      mapping.map(calleeBlock.getArgument(indexedInput.index()),
+                  mappedInput->second);
+    }
+
+    bodyBuilder.setInsertionPointToEnd(entryBlock);
+    for (Operation &op : calleeBlock.without_terminator()) {
+      for (Value operand : op.getOperands()) {
+        if (!mapping.contains(operand)) {
+          taskOp.emitError("expected component task operation operands to be "
+                           "mapped in fused component");
+          return failure();
+        }
+      }
+      bodyBuilder.clone(op, mapping);
+    }
+
+    SmallVector<Value, 4> mappedReturns;
+    if (failed(collectComponentMappedReturnValues(calleeFunc, returnOp, mapping,
+                                                  mappedReturns)))
+      return failure();
+
+    for (auto indexedOutput : llvm::enumerate(taskOp.getOutputs()))
+      resourceValueByResource[indexedOutput.value()] =
+          mappedReturns[indexedOutput.index()];
+  }
+
+  SmallVector<Value, 8> fusedReturns;
+  fusedReturns.reserve(boundary.outputs.size());
+  for (Value output : boundary.outputs) {
+    auto mappedOutput = resourceValueByResource.find(output);
+    if (mappedOutput == resourceValueByResource.end()) {
+      firstTask.emitError(
+          "expected fused component output resource to be produced");
+      return failure();
+    }
+    fusedReturns.push_back(mappedOutput->second);
+  }
+  bodyBuilder.setInsertionPointToEnd(entryBlock);
+  bodyBuilder.create<func::ReturnOp>(fusedFunc.getLoc(), fusedReturns);
+
+  return fusedFunc;
+}
+
+static void replaceComponentDependenciesWithFusedTask(
+    mlir::sculptor::TaskCreateOp fusedTask,
+    const llvm::SmallPtrSetImpl<Operation *> &componentOps,
+    func::FuncOp taskGraphFunc) {
+  Value fusedResult = fusedTask.getResult();
+  for (Operation &op : taskGraphFunc.getBody().front()) {
+    auto taskOp = dyn_cast<mlir::sculptor::TaskCreateOp>(&op);
+    if (!taskOp || componentOps.contains(taskOp.getOperation()) ||
+        taskOp == fusedTask)
+      continue;
+
+    bool changed = false;
+    bool hasFusedDependency = hasDependency(taskOp, fusedResult);
+    SmallVector<Value, 8> dependencies;
+    dependencies.reserve(taskOp.getDependencies().size());
+    for (Value dependency : taskOp.getDependencies()) {
+      auto dependencyTask =
+          dependency.getDefiningOp<mlir::sculptor::TaskCreateOp>();
+      if (!dependencyTask ||
+          !componentOps.contains(dependencyTask.getOperation())) {
+        dependencies.push_back(dependency);
+        continue;
+      }
+
+      changed = true;
+      if (!hasFusedDependency) {
+        dependencies.push_back(fusedResult);
+        hasFusedDependency = true;
+      }
+    }
+
+    if (changed)
+      taskOp.getDependenciesMutable().assign(dependencies);
+  }
+}
+
+static FailureOr<mlir::sculptor::TaskCreateOp>
+fuseSameCoreComponent(ModuleOp module, func::FuncOp taskGraphFunc,
+                      const SameCoreFusibleComponent &component,
+                      const ComponentBoundary &boundary,
+                      const HardwareBudget &budget) {
+  (void)budget;
+
+  FailureOr<func::FuncOp> fusedFunc =
+      buildSameCoreComponentCallee(module, component, boundary);
+  if (failed(fusedFunc))
+    return failure();
+
+  OpBuilder builder(module.getContext());
+  if (boundary.latestDependency)
+    builder.setInsertionPointAfter(boundary.latestDependency);
+  else
+    builder.setInsertionPoint(component.nodes.front()->op);
+
+  mlir::sculptor::TaskCreateOp firstTask = component.nodes.front()->op;
+  auto fusedTask = builder.create<mlir::sculptor::TaskCreateOp>(
+      firstTask.getLoc(), firstTask.getResult().getType(), firstTask.getGraph(),
+      FlatSymbolRefAttr::get(builder.getContext(), fusedFunc->getSymName()),
+      builder.getStringAttr(kFusedMixedTaskDomain),
+      builder.getStringAttr(kFusedMixedTaskKind),
+      builder.getStringAttr(component.fusedTaskName),
+      builder.getStringAttr(firstTask.getSourceLayer()),
+      builder.getI64IntegerAttr(firstTask.getSourceTaskOrdinal()),
+      boundary.inputs, boundary.outputs, boundary.dependencies);
+
+  fusedTask->setAttr(runtime_attrs::kTaskCoreIdAttrName,
+                     builder.getI64IntegerAttr(component.coreId));
+  if (component.physicalArrayId)
+    fusedTask->setAttr(runtime_attrs::kTaskPhysicalArrayIdAttrName,
+                       builder.getI64IntegerAttr(*component.physicalArrayId));
+
+  llvm::SmallPtrSet<Operation *, 16> componentOps;
+  for (const TaskGraphNode *node : component.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node->op;
+    componentOps.insert(taskOp.getOperation());
+  }
+  replaceComponentDependenciesWithFusedTask(fusedTask, componentOps,
+                                            taskGraphFunc);
+
+  for (const TaskGraphNode *node : llvm::reverse(component.nodes)) {
+    mlir::sculptor::TaskCreateOp taskOp = node->op;
+    if (!taskOp.getResult().use_empty()) {
+      taskOp.emitError("expected fused component task result to have no "
+                       "remaining users");
+      return failure();
+    }
+    taskOp.erase();
+  }
+
+  return fusedTask;
+}
+
+static LogicalResult fuseSameCoreFusibleComponents(ModuleOp module,
+                                                   func::FuncOp taskGraphFunc,
+                                                   const HardwareBudget &budget,
+                                                   const TaskGraphDAG &dag,
+                                                   bool &changed) {
   changed = false;
 
-  for (const TaskGraphNode &node : dag.nodes) {
-    std::optional<ConvTileMVMChain> chain =
-        matchConvTileMVMChainFrom(node, dag);
-    if (!chain)
+  llvm::SmallVector<SameCoreFusibleComponent, 16> components =
+      collectSameCoreFusibleComponents(dag);
+  if (components.empty())
+    return success();
+
+  llvm::DenseMap<Value, const TaskGraphNode *> producerByResource;
+  llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+      consumersByResource;
+  llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
+      consumersByTaskResult;
+  if (failed(collectResourceProducers(dag, producerByResource)))
+    return failure();
+  collectResourceConsumers(dag, consumersByResource);
+  collectTaskConsumers(dag, consumersByTaskResult);
+
+  for (const SameCoreFusibleComponent &component : components) {
+    FailureOr<ComponentBoundary> boundary =
+        computeComponentBoundary(component, dag, producerByResource,
+                                 consumersByResource, consumersByTaskResult);
+    if (failed(boundary))
+      return failure();
+    if (!hasLegalComponentInsertionWindow(*boundary))
       continue;
 
-    int64_t physicalArrayId = 0;
-    if (!getCompatibleMVMPhysicalArray(*chain, physicalArrayId))
-      continue;
-
-    std::string fusedTaskName = buildFusedConvTileMVMTaskName(*chain, dag);
-
-    auto fusedTask =
-        fuseTasks(module, chain->convPatch->op, chain->vectorTile->op);
-    if (failed(fusedTask))
-      return failure();
-
-    fusedTask = fuseTasks(module, *fusedTask, chain->mvm->op);
-    if (failed(fusedTask))
-      return failure();
-
-    fusedTask = fuseTasks(module, *fusedTask, chain->tileRecombine->op);
-    if (failed(fusedTask))
-      return failure();
-
-    fusedTask = fuseTasks(module, *fusedTask, chain->biasAdd->op);
-    if (failed(fusedTask))
-      return failure();
-
-    if (failed(attachTaskAnalogArrayPlacement(module, *fusedTask, budget,
-                                              physicalArrayId)))
-      return failure();
-
-    if (failed(renameFusedConvTileMVMTask(module, *fusedTask, fusedTaskName)))
+    if (failed(fuseSameCoreComponent(module, taskGraphFunc, component,
+                                     *boundary, budget)))
       return failure();
 
     changed = true;
@@ -362,35 +721,9 @@ static LogicalResult fuseConvTileMVMChains(ModuleOp module,
   return success();
 }
 
-static LogicalResult
-fuseTileRecombineBiasAddChains(ModuleOp module, func::FuncOp taskGraphFunc,
-                               const HardwareBudget &budget,
-                               const TaskGraphDAG &dag, bool &changed) {
-  (void)module;
-  (void)taskGraphFunc;
-  (void)budget;
-  (void)dag;
-  changed = false;
-  return success();
-}
-
-static LogicalResult fuseSameCoreDigitalProducerConsumerChains(
-    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag, bool &changed) {
-  (void)module;
-  (void)taskGraphFunc;
-  (void)budget;
-  (void)dag;
-  changed = false;
-  return success();
-}
-
 static llvm::ArrayRef<TaskFusionPattern> getDefaultTaskFusionPatterns() {
   static const TaskFusionPattern patterns[] = {
-      {"conv-tile-mvm-bias", fuseConvTileMVMChains},
-      {"tile-recombine-bias-add", fuseTileRecombineBiasAddChains},
-      {"same-core-digital-producer-consumer",
-       fuseSameCoreDigitalProducerConsumerChains},
+      {"same-core-fusible-component", fuseSameCoreFusibleComponents},
   };
   return patterns;
 }

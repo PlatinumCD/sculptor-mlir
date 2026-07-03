@@ -91,6 +91,10 @@ void registerLSTMCanonicalizer(LayerCanonicalizers &canonicalizers,
 void registerGRUCanonicalizer(LayerCanonicalizers &canonicalizers,
                               MLIRContext *context);
 
+// Installs the canonicalizer that rewrites full Transformers.
+void registerTransformerCanonicalizer(LayerCanonicalizers &canonicalizers,
+                                      MLIRContext *context);
+
 // Installs the canonicalizer that rewrites simple RNN cell layers.
 void registerRNNCellCanonicalizer(LayerCanonicalizers &canonicalizers,
                                   MLIRContext *context);

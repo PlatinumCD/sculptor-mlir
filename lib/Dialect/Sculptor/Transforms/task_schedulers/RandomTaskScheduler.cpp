@@ -1,3 +1,4 @@
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
 
 #include <algorithm>
@@ -29,7 +30,7 @@ public:
     std::shuffle(shuffledAnalogArrays.begin(), shuffledAnalogArrays.end(),
                  randomEngine);
 
-    return task_schedulers::placeMatrixSetupGroupsAndSurroundingTasks(
+    return task_schedulers::placeLogicalPlacementIslands(
         module, taskGraphFunc, budget, dag, shuffledAnalogArrays);
   }
 };

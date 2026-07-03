@@ -45,10 +45,10 @@ using LayerToMVMConverters = std::vector<std::unique_ptr<LayerToMVMConverter>>;
 // Maps layer_type strings to the converter that can lower them to sculptor.mvm.
 using LayerToMVMConverterMap = llvm::StringMap<const LayerToMVMConverter *>;
 
-// Scans forward's layer calls and delegates extracted sculptor.nn layer functions
-// to converters that lower them to sculptor.mvm. The public pass name stays
-// sculptor-convert-layers for compatibility even though the internal boundary is
-// now sculptor.nn layer-to-MVM lowering.
+// Scans forward's layer calls and delegates extracted sculptor.nn layer
+// functions to converters that lower them to sculptor.mvm. The public pass name
+// stays sculptor-convert-layers for compatibility even though the internal
+// boundary is now sculptor.nn layer-to-MVM lowering.
 struct ConvertLayersPass
     : public mlir::PassWrapper<ConvertLayersPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -61,7 +61,9 @@ struct ConvertLayersPass
   ConvertLayersPass(const ConvertLayersPass &pass) : PassWrapper(pass) {}
 
   // Provides the stable command-line name used to schedule this transform.
-  mlir::StringRef getArgument() const final { return "sculptor-convert-layers"; }
+  mlir::StringRef getArgument() const final {
+    return "sculptor-convert-layers";
+  }
 
   // Summarizes the pass behavior for MLIR pass registration and help text.
   mlir::StringRef getDescription() const final {
@@ -151,7 +153,14 @@ void registerRNNConverter(LayerToMVMConverters &converters,
                           LayerToMVMConverterMap &converterMap,
                           MLIRContext *context);
 
-// Registers the sculptor.nn-to-MVM lowering pass with MLIR's global pass registry.
+// Installs the built-in Transformer block layer-to-MVM converter and every
+// layer_type alias it handles.
+void registerTransformerBlockConverter(LayerToMVMConverters &converters,
+                                       LayerToMVMConverterMap &converterMap,
+                                       MLIRContext *context);
+
+// Registers the sculptor.nn-to-MVM lowering pass with MLIR's global pass
+// registry.
 void registerConvertLayersPass();
 
 } // namespace sculptor

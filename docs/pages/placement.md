@@ -12,13 +12,29 @@ The selected strategy is controlled by the `schedule` option on
 
 | Schedule | Placement idea |
 |---|---|
-| `random` | Baseline randomized physical-array order. |
-| `snake` | Deterministic mesh traversal that fills local arrays before moving to the next core. |
-| `greedy-heavy-edge` | Greedy placement around the heaviest communicating setup groups. |
-| `manhattan-cut` | Deterministic projection of the group graph onto mesh rows or columns. |
-| `boundary-aware-cut` | Recursive rectangular mesh partitioning with region capacity. |
-| `boundary-aware-cut-optimized` | Boundary-aware cut plus endpoint, local-cost, and compact-path refinements. |
+| `random` | Baseline randomized physical-array order with shared island materialization and digital placement. |
+| `snake` | Deterministic mesh traversal that fills local arrays before moving to the next core, with shared island materialization and digital placement. |
+| `greedy` | Island-level lookahead search over configurable candidate core scopes. |
 
+
+The scheduler implementation is split by responsibility:
+
+| File | Role |
+|---|---|
+| `TaskGraphScheduler.h` | Scheduler interface, registry helpers, and public schedule registrations. |
+| `TaskGraphTypes.h` | Hardware budget, parsed DAG nodes, and placement record types. |
+| `TaskGraphDAG.h` | Task graph parser entry point. |
+| `TaskGraphIslands.h` | Logical placement island data model and island graph builder. |
+| `TaskGraphIslandBuilder.cpp` | Matrix/MVM island seeding and island graph coordination. |
+| `TaskGraphIslandDigitalAssignment.cpp` | Pre-placement min-cut digital assignment and local-affinity fallback assignment. |
+| `TaskGraphIslandCommunication.cpp` | Island-level communication edge construction and compaction. |
+| `TaskGraphIslandInternals.h` | Private island-builder helpers shared by the island implementation files. |
+| `TaskGraphPlacement.h` | Shared placement attachment and island materialization API. |
+| `TaskGraphPlacementUtils.cpp` | Physical placement materialization and fallback core propagation. |
+| `TaskGraphScheduleMetadata.h/.cpp` | Final schedule metadata, logical-array layout, transfer summaries, graph score, and digital op counts. |
+| `GreedyPlacement.h/.cpp` | Greedy island search, lookahead, and candidate scopes. |
+| `TaskGraphRoutineFuser.h/.cpp` | Post-schedule task routine fusion. |
+| `TaskGraphScorer.h/.cpp` | Mesh transfer scoring and boundary penalty computation. |
 
 <details class="doc-section" open markdown="1">
 <summary markdown="block">## Placement Pass Flow</summary>
@@ -31,14 +47,14 @@ chooses placements, but the pass owns the full scheduling/finalization flow:
 2. Parse each task graph function into a `TaskGraphDAG`.
 3. Look up the selected `TaskGraphScheduler`.
 4. Let the scheduler attach task placement attributes.
-5. Fuse recognized task routines.
+5. Fuse same-core task components.
 6. Erase unused task callees and temporary resources.
 7. Rebuild the runtime execution plan.
 8. Reparse the compacted task graph.
 9. Finalize schedule metadata, transfer summaries, graph score, and resource
    layout.
 
-That ordering matters. Routine fusion can remove task nodes and graph
+That ordering matters. Same-core routine fusion can remove task nodes and graph
 resources, so the pass reparses the graph before final metadata is computed.
 The final score and runtime resource layout describe the graph that will
 actually be consumed by later lowering and runtime emission.
@@ -60,6 +76,9 @@ The placement pass receives a hardware budget through pass parameters.
 | `mesh-cols` | Number of columns in the mesh topology. If set to `0`, it is inferred from `cores` and `mesh-rows`. |
 | `schedule` | Name of a registered placement strategy. |
 | `random-seed` | Seed used by randomized schedulers. The default is `0` for reproducible output. |
+| `greedy-lookahead` | Future-island scoring depth used by the `greedy` scheduler. The default is `1`. |
+| `greedy-candidate-scope` | Candidate core scope used by the `greedy` scheduler: `cardinal`, `diagonal`, or `producer-consumer`. The default is `diagonal`. |
+| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. |
 
 The total analog array budget is:
 
@@ -113,16 +132,21 @@ The scheduler sees the graph as `TaskGraphDAG`:
 | `logicalArrayResources` | Task graph resources whose payload type is `!sculptor.logical.array`. |
 | `dependencyCount` | Number of explicit task dependencies. |
 
-The main placement unit is a matrix setup group. A group starts at one
-`sculptor.matrix_setup` task and includes the direct `sculptor.mvm` or
-`sculptor.conv_tile_mvm` tasks that consume the logical array produced by that
-setup. The setup and its MVM tasks must use the same physical analog array:
+The main placement unit is a logical island. Each island starts from one matrix
+setup group: a `sculptor.matrix_setup` task and the direct `sculptor.mvm` tasks
+that consume the logical array produced by that setup. The setup and its MVM
+tasks must use the same physical analog array:
 
 ```text
 matrix setup -> logical array -> one or more MVM tasks
 ```
 
-The shared placement helper materializes a strategy's group placement in three
+The island builder then assigns eligible digital components to those islands
+before physical placement. Clear same-source-layer components between analog
+anchors are assigned by a byte-only min-cut. Components that do not have an
+unambiguous analog boundary use the producer/consumer fallback.
+
+The shared placement helper materializes a strategy's island placement in three
 steps:
 
 1. Attach analog placement to the matrix setup and its associated MVM tasks.
@@ -134,9 +158,9 @@ The neighbor fallback is deterministic:
 1. Prefer the most recent placed producer.
 2. Otherwise use the earliest placed consumer.
 
-This is why strategy implementations usually only choose physical arrays for
-matrix setup groups. The common helper then expands those decisions to the
-surrounding graph.
+This is why simple strategy implementations can choose only a physical-array
+order. The common island helper expands that order to analog tasks, assigned
+digital work, and remaining core-only tasks.
 
 </details>
 
@@ -181,23 +205,9 @@ placements illegal.
 
 
 Routine fusion is a post-scheduler cleanup step, not a property of one
-placement strategy. It currently recognizes the convolution tile pipeline:
-
-```text
-digital.conv_patch
--> digital.vector_tile
--> sculptor.mvm
--> digital.tile_recombine
--> digital.bias_add
-```
-
-When the pattern appears as a task chain, the fuser combines it into a single
-`sculptor.conv_tile_mvm` task. The fused routine keeps only the external ABI
-that is still needed:
-
-```text
-activation input, logical array input -> final output
-```
+placement strategy. It only fuses tasks that have already been placed on the
+same core and can be represented as a single component task without violating
+dependency order.
 
 Internal temporary task graph resources that only connected fused tasks are
 erased. After fusion, the pass rebuilds resource slots, temporary indices,
@@ -231,6 +241,43 @@ policy.
 </details>
 
 <details class="doc-section" open markdown="1">
+<summary markdown="block">## Greedy Schedule</summary>
+
+
+`greedy` first forms logical matrix setup islands: every matrix setup owns its
+direct MVM users, and eligible same-layer digital components are assigned into
+those islands with a byte-only min-cut before any physical mesh coordinate is
+chosen. The islands are then placed with greedy queue lookahead over the mesh:
+the first island starts on core 0, each next island considers candidates
+selected by `greedy-candidate-scope`, and `greedy-lookahead` controls how many
+future islands are simulated when scoring the current choice. Each simulated
+window recomputes transfer cost over an effective island communication graph and
+applies `bytes * ManhattanDistance` to island pairs that have simulated core
+placements.
+
+```text
+island[setup] = {setup, direct_mvm_users}
+island += byte_only_min_cut(eligible_digital_components)
+place(island[0]) = core 0
+for island in island_queue[1:]:
+  candidates = candidate_scope(current_core, placed_region)
+  place(island) = argmin(simulated_cost_for_next_N_islands)
+```
+
+The `cardinal` scope considers the current core, then up, left, down, and right.
+The `diagonal` scope additionally considers the four diagonal neighbors. The
+`producer-consumer` scope considers candidates near already placed islands that
+communicate with the current island.
+
+With `greedy-lookahead=1`, the scheduler scores only the current island. With
+`greedy-lookahead=3`, it scores the current island plus two future islands
+before committing the current placement.
+
+This keeps the scheduler runnable while making the search policy explicit.
+
+</details>
+
+<details class="doc-section" open markdown="1">
 <summary markdown="block">## Snake Schedule</summary>
 
 
@@ -256,279 +303,21 @@ physical arrays: [0, 1], [2, 3], [6, 7], [4, 5]
 ```
 
 Like `random`, `snake` is mainly an ordering strategy. It produces a stable
-physical-array order and lets the shared helper place the MVMs, same-source
-tasks, and remaining core-only tasks.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Greedy Heavy-Edge Schedule</summary>
-
-
-`greedy-heavy-edge` tries to keep high-traffic setup groups close together. It
-first builds a reduced weighted graph:
-
-```text
-node = matrix setup group
-edge = task-resource flow between two setup groups
-weight = sum(resource byte sizes crossing between those groups)
-```
-
-Edges are undirected for placement purposes. A resource produced by one group
-and consumed by another contributes its byte size to the edge between those
-groups. Multiple resources between the same two groups accumulate onto one
-edge.
-
-The algorithm then runs in three stages:
-
-1. Sort edges by weight.
-2. Select the heaviest edges until they cover 80% of total group communication.
-3. Build connected components from those heavy edges and place those components
-   first.
-
-Inside each heavy component, the first anchor is the unplaced group with the
-largest incident communication weight. The next group comes from the component
-frontier: the strongest edge from an already placed group to an unplaced group
-wins, with incident weight and group index as deterministic tie-breakers.
-
-Slot selection is cost-based. For a candidate physical array slot:
-
-```text
-candidate_cost =
-  sum(edge_bytes * ManhattanDistance(candidate_core, placed_neighbor_core))
-```
-
-Only currently least-used slots are considered first, which keeps placement
-balanced when there are more groups than physical arrays. The scheduler also
-prefers slots near already placed neighbors before falling back to the full slot
-set.
-
-With multiple arrays per core, every local array is a separate candidate slot.
-Two heavily communicating groups can therefore occupy different arrays on the
-same core and pay zero mesh-transfer cost.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Manhattan Cut Schedule</summary>
-
-
-`manhattan-cut` uses the same weighted setup-group graph as
-`greedy-heavy-edge`, but it creates a deterministic global ordering instead of
-growing from a frontier.
-
-The scheduler computes two graph-coordinate vectors:
-
-1. `phiX`, using group `0` and the farthest finite group from it as anchors.
-2. `phiY`, using the highest-incident-weight group and the farthest finite
-   group from it as anchors.
-
-Distances are weighted so heavier communication behaves like a shorter graph
-distance:
-
-```text
-edge_length = max(1, max_edge_weight / edge_weight)
-coordinate  = distance_from_anchor_a - distance_from_anchor_b
-```
-
-Those coordinates are projected onto the mesh in two ways:
-
-```text
-x-first: sort by phiX, slice by mesh column, sort each slice by phiY
-y-first: sort by phiY, slice by mesh row, sort each slice by phiX
-```
-
-For each projection, the scheduler also tries primary and secondary orientation
-flips. Each candidate placement is scored with the exact weighted group transfer
-cost over the mesh. The candidate score also includes the same soft boundary
-surcharge used by the final graph scorer, so endpoint placement participates in
-candidate selection.
-
-Arrays-per-core acts as slice capacity. For `x-first`, each mesh column can
-hold:
-
-```text
-mesh_rows * arrays_per_core
-```
-
-groups before placement moves to the next column. For `y-first`, each row can
-hold:
-
-```text
-mesh_cols * arrays_per_core
-```
-
-groups. The final placement remains physical-array based, while the projection
-and score reason about each slot's owning core.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Boundary-Aware Cut Schedule</summary>
-
-
-`boundary-aware-cut` recursively partitions the physical mesh. It treats the
-mesh as rectangular regions and gives each region capacity equal to:
-
-```text
-region_cores * arrays_per_core
-```
-
-The root region is the whole mesh. A region becomes a leaf when either:
-
-1. The region is one core.
-2. The assigned groups fit inside one core's local array capacity.
-
-Otherwise, the scheduler evaluates real mesh cuts. For a rectangular region it
-tries horizontal and vertical splits near the midpoint, including midpoint
-`-1`, midpoint, and midpoint `+1` when those cuts are valid. The longer region
-dimension is considered first.
-
-For each candidate split, group capacity is divided proportionally to child
-region capacity. Groups are then assigned to the two child regions by a greedy
-partitioning rule:
-
-1. Seed the first child with a high-incident-weight group.
-2. Seed the second child with a group that is weakly connected to the first
-   seed.
-3. Assign remaining groups to the side where they have stronger existing
-   connection, while respecting child capacity.
-
-The split score is:
-
-```text
-split_score = cut_weight + balance_waste
-```
-
-`cut_weight` is the total byte weight of group edges crossing the split.
-`balance_waste` penalizes unused region capacity. The lowest-score feasible
-split is chosen, and recursion continues.
-
-At a leaf, groups are assigned to physical array slots in that region. The
-baseline version is intentionally direct: it gives a real recursive,
-capacity-aware placement, but does not do graph coarsening, FM refinement, or
-uncoarsening repair.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Boundary-Aware Cut Optimized Schedule</summary>
-
-
-`boundary-aware-cut-optimized` starts with the recursive rectangular placement
-idea from `boundary-aware-cut`, then adds bounded refinements that are designed
-to improve the score without making the scheduler expensive or unpredictable.
-
-### Endpoint corridors
-
-The final scorer adds a penalty when the first and last tasks do not share a
-mesh boundary edge. The optimized scheduler makes that preference explicit for
-setup-group placement. It maps the first and last DAG nodes back to their
-matrix setup groups when task-group ownership can identify them. If both
-endpoint groups are known, the scheduler tries four endpoint corridors:
-
-```text
-top, bottom, left, right
-```
-
-For each corridor, both endpoint groups must be placed on that same boundary.
-Recursive partitioning is constrained so a child region must retain enough
-boundary capacity for any endpoint group assigned to it. After all corridors are
-evaluated, the scheduler keeps the feasible placement with the lowest exact
-weighted transfer score.
-
-The final scorer still treats boundary alignment as a soft penalty. The
-optimized scheduler uses the same idea as an active placement preference when
-both endpoint groups are known. If either endpoint group cannot be identified,
-the optimized scheduler falls back to unconstrained recursive placement.
-
-### Cost-aware leaf assignment
-
-The baseline boundary-aware scheduler assigns leaf groups in sorted order. The
-optimized scheduler uses the same leaf regions, but chooses unused slots by
-incremental communication cost.
-
-At each leaf:
-
-1. Endpoint groups are considered first so corridor constraints are preserved.
-2. Higher-incident-weight groups are placed before lower-traffic groups.
-3. Each group chooses the unused slot with the lowest cost to already placed
-   neighboring groups.
-
-The incremental cost is:
-
-```text
-sum(edge_bytes * ManhattanDistance(candidate_core, placed_neighbor_core))
-```
-
-This makes local leaf assignment aware of communication that was already fixed
-by earlier recursive choices.
-
-### Pair-swap refinement
-
-After recursive placement, the optimizer runs a bounded exact swap pass. It
-tries swapping the physical arrays of every pair of placed setup groups and
-computes the exact weighted transfer score. A swap is accepted only when:
-
-1. It improves the exact score.
-2. It preserves the endpoint corridor constraint.
-
-The current implementation runs at most four swap passes. This catches simple
-local inversions without turning the scheduler into a full search.
-
-### Hot-edge moves
-
-Pair swaps can only exchange occupied slots. Hot-edge moves use unused physical
-array slots when extra capacity exists.
-
-The optimizer sorts weighted group edges by their current transfer contribution:
-
-```text
-edge_contribution = edge_bytes * ManhattanDistance(group_a_core, group_b_core)
-```
-
-For the hottest edges, it considers moving one endpoint into an unused slot. A
-move is considered only if it does not make that endpoint farther from the
-other endpoint of the hot edge. The move is accepted only if it improves the
-exact total weighted transfer score and preserves any endpoint corridor rule.
-
-This refinement is most useful when `arrays-per-core` or mesh capacity leaves
-unused slots that can absorb high-traffic groups.
-
-### Compact-chain path repacking
-
-Some graphs are naturally chain-like. A legal low-cost placement can still look
-spread out, leaving little contiguous space for future work. The compact-chain
-refinement searches for a denser path placement without increasing exact
-transfer cost.
-
-The optimizer builds connected snake paths through compact rectangular mesh
-regions between the first endpoint core and a candidate endpoint core on the
-selected corridor. It then repacks ordered setup groups monotonically along
-each path:
-
-```text
-group order follows path order
-each core can hold arrays_per_core groups
-first endpoint stays at the path start
-last endpoint stays at the path end
-```
-
-Candidate assignments are exact-scored first. A candidate is rejected if it
-increases weighted transfer cost. If the transfer score is equal, the optimizer
-uses a compactness tie-breaker:
-
-```text
-compact_score =
-  bounding_box_area * 1000
-  + occupied_core_count * 100
-  + squared_adjacent_chain_distance
-```
-
-This favors placements that use fewer cores, a smaller mesh rectangle, and
-shorter consecutive chain hops. The implementation bounds this search to small
-ordered group sets, so it remains a local refinement rather than an exhaustive
-global optimizer.
+physical-array order and lets the shared island helper place the MVMs, assigned
+digital components, and remaining core-only tasks.
+
+### Default Min-Cut Digital Placement
+
+Registered schedulers use min-cut digital placement by default. For an
+unplaced same-source-layer digital component between placed analog MVMs, the
+scheduler builds a small source/sink cut problem. Resource byte sizes become
+edge weights. The predecessor analog core is the source side, the successor
+analog core is the sink side, and the selected cut minimizes the bytes that
+must cross between those two cores.
+
+Components with multiple distinct predecessor or successor analog cores are left
+to the normal producer/consumer fallback. This keeps the policy local to clear
+same-layer analog boundaries.
 
 </details>
 
@@ -551,12 +340,22 @@ public:
 };
 ```
 
-A scheduler usually computes a list of `MatrixSetupGroupPlacement` records and
-then calls the shared helper:
+A scheduler either provides an ordering of physical arrays or an explicit
+island placement.
+
+Ordering schedulers such as `random` and `snake` call:
 
 ```cpp
-placeMatrixSetupGroupsAndSurroundingTasks(module, taskGraphFunc, budget, dag,
-                                          groupPlacements);
+placeLogicalPlacementIslands(module, taskGraphFunc, budget, dag,
+                             physicalArrayOrder);
+```
+
+Schedulers that need direct control over logical island placement build an
+island graph, compute `MatrixSetupGroupPlacement` records, and call:
+
+```cpp
+placeLogicalPlacementIslands(module, taskGraphFunc, budget, dag,
+                             islandGraph, groupPlacements);
 ```
 
 Once registered with the task graph scheduler registry, a strategy can be

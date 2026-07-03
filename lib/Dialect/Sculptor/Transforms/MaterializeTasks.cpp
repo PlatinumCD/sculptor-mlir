@@ -284,8 +284,11 @@ getTaskFunctionType(mlir::OpBuilder &builder,
   mlir::sculptor::TaskRegionOp region = taskRegion.region;
   llvm::SmallVector<mlir::Type> inputTypes;
   inputTypes.reserve(region.getInputs().size());
-  for (mlir::Value input : region.getInputs())
+  for (mlir::Value input : region.getInputs()) {
+    if (classifyExternalCapture(input) == CaptureHandling::CloneSafeConstant)
+      continue;
     inputTypes.push_back(input.getType());
+  }
 
   llvm::SmallVector<mlir::Type> resultTypes;
   resultTypes.reserve(region->getNumResults());
@@ -368,9 +371,25 @@ materializeTaskFunctionBody(mlir::ModuleOp module,
 
   mlir::Block *entryBlock = taskFunc.addEntryBlock();
   mlir::IRMapping mapping;
-  mapping.map(sourceBlock.getArguments(), entryBlock->getArguments());
 
   builder.setInsertionPointToStart(entryBlock);
+  unsigned explicitArgIndex = 0;
+  for (auto [input, sourceArg] :
+       llvm::zip_equal(region.getInputs(), sourceBlock.getArguments())) {
+    if (classifyExternalCapture(input) == CaptureHandling::CloneSafeConstant) {
+      mlir::Operation *definingOp = input.getDefiningOp();
+      if (!definingOp || definingOp->getNumResults() != 1) {
+        return region.emitOpError(
+            "expected clone-safe task capture to have one defining result");
+      }
+      mlir::Operation *cloned = builder.clone(*definingOp);
+      mapping.map(sourceArg, cloned->getResult(0));
+      continue;
+    }
+
+    mapping.map(sourceArg, entryBlock->getArgument(explicitArgIndex++));
+  }
+
   for (mlir::Operation &op : sourceBlock.without_terminator()) {
     if (mlir::failed(validateMappedOperands(region, op, mapping)))
       return mlir::failure();
@@ -416,6 +435,9 @@ collectMappedTaskCallOperands(const MaterializableTaskRegion &taskRegion,
   mlir::sculptor::TaskRegionOp region = taskRegion.region;
   operands.reserve(region.getInputs().size());
   for (mlir::Value input : region.getInputs()) {
+    if (classifyExternalCapture(input) == CaptureHandling::CloneSafeConstant)
+      continue;
+
     mlir::Value mapped = mapping.lookupOrNull(input);
     if (!mapped) {
       return region.emitOpError(
@@ -493,8 +515,32 @@ rewriteLayerCallWithTaskCalls(mlir::ModuleOp module,
   mlir::IRMapping mapping;
   mapping.map(callee.front().getArguments(), call.getOperands());
 
-  builder.setInsertionPoint(call);
+  llvm::DenseMap<mlir::Operation *, const MaterializableTaskRegion *>
+      taskRegionByOp;
   for (const MaterializableTaskRegion &taskRegion : layerCall.taskRegions) {
+    mlir::sculptor::TaskRegionOp region = taskRegion.region;
+    taskRegionByOp[region.getOperation()] = &taskRegion;
+  }
+
+  builder.setInsertionPoint(call);
+  for (mlir::Operation &sourceOp : callee.front().without_terminator()) {
+    auto taskRegionIt = taskRegionByOp.find(&sourceOp);
+    if (taskRegionIt == taskRegionByOp.end()) {
+      if (!mlir::isMemoryEffectFree(&sourceOp)) {
+        return sourceOp.emitError(
+            "cannot materialize layer prelude containing unsupported "
+            "side-effecting op");
+      }
+
+      if (mlir::failed(validateMappedOperands(
+              layerCall.taskRegions.front().region, sourceOp, mapping)))
+        return mlir::failure();
+
+      builder.clone(sourceOp, mapping);
+      continue;
+    }
+
+    const MaterializableTaskRegion &taskRegion = *taskRegionIt->second;
     mlir::func::FuncOp taskFunc = lookupTaskFunction(module, taskRegion);
     if (!taskFunc) {
       return call.emitOpError("could not find materialized task '")

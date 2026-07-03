@@ -1,3 +1,4 @@
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
 
 #include <cstdint>
@@ -48,7 +49,7 @@ public:
     llvm::SmallVector<int64_t, 8> physicalArrayOrder =
         buildSnakePhysicalArrayOrder(budget);
 
-    return task_schedulers::placeMatrixSetupGroupsAndSurroundingTasks(
+    return task_schedulers::placeLogicalPlacementIslands(
         module, taskGraphFunc, budget, dag, physicalArrayOrder);
   }
 };

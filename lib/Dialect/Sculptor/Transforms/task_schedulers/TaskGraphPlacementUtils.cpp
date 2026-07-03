@@ -1,21 +1,23 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTaskKinds.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 
 #include "llvm/ADT/StringSet.h"
 
+#include <cstdint>
 #include <limits>
 
 namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
-namespace task_graph_names = mlir::sculptor::task_graph_names;
+namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_schedulers = mlir::sculptor::task_schedulers;
 
 using TaskGraphNode = mlir::sculptor::task_schedulers::TaskGraphNode;
-using MatrixSetupMVMMap =
-    llvm::DenseMap<unsigned, llvm::SmallVector<const TaskGraphNode *, 4>>;
 
 static void recordSourceLayerCore(mlir::sculptor::TaskCreateOp taskOp,
                                   int64_t coreId,
@@ -120,7 +122,7 @@ static mlir::LogicalResult attachSourceLayerCorePlacements(
 
 static mlir::LogicalResult attachMostRecentProducerCorePlacements(
     mlir::ModuleOp module, const task_schedulers::HardwareBudget &budget,
-    const task_schedulers::TaskGraphDAG &dag) {
+    const task_schedulers::TaskGraphDAG &dag, bool &changed) {
   for (const TaskGraphNode &node : dag.nodes) {
     mlir::sculptor::TaskCreateOp taskOp = node.op;
     if (getCoreIdAttr(taskOp))
@@ -134,6 +136,7 @@ static mlir::LogicalResult attachMostRecentProducerCorePlacements(
     if (mlir::failed(task_schedulers::attachTaskCorePlacement(module, taskOp,
                                                               budget, coreId)))
       return mlir::failure();
+    changed = true;
   }
 
   return mlir::success();
@@ -141,7 +144,7 @@ static mlir::LogicalResult attachMostRecentProducerCorePlacements(
 
 static mlir::LogicalResult attachEarliestConsumerCorePlacements(
     mlir::ModuleOp module, const task_schedulers::HardwareBudget &budget,
-    const task_schedulers::TaskGraphDAG &dag) {
+    const task_schedulers::TaskGraphDAG &dag, bool &changed) {
   for (const TaskGraphNode &node : dag.nodes) {
     mlir::sculptor::TaskCreateOp taskOp = node.op;
     if (getCoreIdAttr(taskOp))
@@ -155,44 +158,34 @@ static mlir::LogicalResult attachEarliestConsumerCorePlacements(
     if (mlir::failed(task_schedulers::attachTaskCorePlacement(module, taskOp,
                                                               budget, coreId)))
       return mlir::failure();
+    changed = true;
   }
 
   return mlir::success();
 }
 
-static llvm::SmallVector<const TaskGraphNode *, 8>
-collectMatrixSetupTasks(const task_schedulers::TaskGraphDAG &dag) {
-  llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks;
-  for (const TaskGraphNode &node : dag.nodes) {
-    mlir::sculptor::TaskCreateOp taskOp = node.op;
-    if (taskOp.getTaskKind() == task_graph_names::kMatrixSetupTaskKind)
-      matrixSetupTasks.push_back(&node);
-  }
-  return matrixSetupTasks;
-}
+static mlir::LogicalResult attachAdjacentCorePlacementsToFixedPoint(
+    mlir::ModuleOp module, const task_schedulers::HardwareBudget &budget,
+    const task_schedulers::TaskGraphDAG &dag) {
+  bool changed = false;
+  do {
+    changed = false;
+    if (mlir::failed(attachMostRecentProducerCorePlacements(module, budget, dag,
+                                                            changed)))
+      return mlir::failure();
 
-static MatrixSetupMVMMap buildMVMTasksByMatrixSetupTask(
-    const task_schedulers::TaskGraphDAG &dag,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks) {
-  MatrixSetupMVMMap mvmTasksByMatrixSetupTask;
-  for (const TaskGraphNode *setupNode : matrixSetupTasks) {
-    llvm::SmallVector<const TaskGraphNode *, 4> &mvmTasks =
-        mvmTasksByMatrixSetupTask[setupNode->index];
+    if (mlir::failed(
+            attachEarliestConsumerCorePlacements(module, budget, dag, changed)))
+      return mlir::failure();
+  } while (changed);
 
-    for (unsigned successorIndex : setupNode->successors) {
-      const TaskGraphNode &successorNode = dag.nodes[successorIndex];
-      mlir::sculptor::TaskCreateOp successorTask = successorNode.op;
-      if (successorTask.getTaskKind() == task_graph_names::kMVMTaskKind ||
-          successorTask.getTaskKind() == task_graph_names::kConvTileMVMTaskKind)
-        mvmTasks.push_back(&successorNode);
-    }
-  }
-  return mvmTasksByMatrixSetupTask;
+  return mlir::success();
 }
 
 static mlir::LogicalResult buildMatrixSetupPlacementMap(
     mlir::func::FuncOp taskGraphFunc,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
+    const task_schedulers::TaskGraphDAG &dag,
+    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
     llvm::ArrayRef<task_schedulers::MatrixSetupGroupPlacement> groupPlacements,
     llvm::DenseMap<unsigned, int64_t> &physicalArrayByMatrixSetupTask) {
   for (const task_schedulers::MatrixSetupGroupPlacement &placement :
@@ -207,29 +200,43 @@ static mlir::LogicalResult buildMatrixSetupPlacementMap(
     }
   }
 
-  for (const TaskGraphNode *setupNode : matrixSetupTasks) {
-    if (physicalArrayByMatrixSetupTask.contains(setupNode->index))
+  for (const task_schedulers::LogicalPlacementIsland &island :
+       islandGraph.islands) {
+    if (physicalArrayByMatrixSetupTask.contains(island.matrixSetupTaskIndex))
       continue;
 
-    mlir::sculptor::TaskCreateOp setupTask = setupNode->op;
-    setupTask.emitError("expected matrix setup task to have an assigned "
-                        "physical analog array");
+    if (island.matrixSetupTaskIndex < dag.nodes.size()) {
+      mlir::sculptor::TaskCreateOp setupTask =
+          dag.nodes[island.matrixSetupTaskIndex].op;
+      setupTask.emitError("expected matrix setup task to have an assigned "
+                          "physical analog array");
+      return mlir::failure();
+    }
+
+    taskGraphFunc.emitError("expected matrix setup task to have an assigned "
+                            "physical analog array");
     return mlir::failure();
   }
 
   return mlir::success();
 }
 
-static mlir::LogicalResult materializeMatrixSetupGroupPlacements(
+static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
     mlir::ModuleOp module, const task_schedulers::HardwareBudget &budget,
     const task_schedulers::TaskGraphDAG &dag,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
-    const MatrixSetupMVMMap &mvmTasksByMatrixSetupTask,
-    const llvm::DenseMap<unsigned, int64_t> &physicalArrayByMatrixSetupTask) {
+    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
+    const llvm::DenseMap<unsigned, int64_t> &physicalArrayByMatrixSetupTask,
+    const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  mlir::Builder builder(module.getContext());
   llvm::StringMap<int64_t> coreIdBySourceLayer;
   llvm::StringSet<> ambiguousSourceLayers;
 
-  for (const TaskGraphNode *setupNode : matrixSetupTasks) {
+  for (const task_schedulers::LogicalPlacementIsland &island :
+       islandGraph.islands) {
+    if (island.matrixSetupTaskIndex >= dag.nodes.size())
+      continue;
+
+    const TaskGraphNode *setupNode = &dag.nodes[island.matrixSetupTaskIndex];
     auto physicalArrayIt =
         physicalArrayByMatrixSetupTask.find(setupNode->index);
     if (physicalArrayIt == physicalArrayByMatrixSetupTask.end()) {
@@ -241,6 +248,8 @@ static mlir::LogicalResult materializeMatrixSetupGroupPlacements(
 
     int64_t physicalArrayId = physicalArrayIt->second;
     mlir::sculptor::TaskCreateOp setupTask = setupNode->op;
+    setupTask->setAttr(schedule_attrs::kIslandIndexAttrName,
+                       builder.getI64IntegerAttr(setupNode->index));
     auto placement = task_schedulers::resolvePhysicalArrayPlacement(
         setupTask.getOperation(), budget, physicalArrayId);
     if (mlir::failed(placement))
@@ -253,30 +262,83 @@ static mlir::LogicalResult materializeMatrixSetupGroupPlacements(
             module, setupTask, budget, physicalArrayId)))
       return mlir::failure();
 
-    auto mvmTasksIt = mvmTasksByMatrixSetupTask.find(setupNode->index);
-    if (mvmTasksIt == mvmTasksByMatrixSetupTask.end())
-      continue;
+    for (unsigned mvmTaskIndex : island.mvmTaskIndices) {
+      if (mvmTaskIndex >= dag.nodes.size())
+        continue;
 
-    for (const TaskGraphNode *mvmNode : mvmTasksIt->second) {
+      const TaskGraphNode &mvmNode = dag.nodes[mvmTaskIndex];
+      mvmNode.op->setAttr(schedule_attrs::kIslandIndexAttrName,
+                          builder.getI64IntegerAttr(setupNode->index));
       if (mlir::failed(task_schedulers::attachTaskAnalogArrayPlacement(
-              module, mvmNode->op, budget, physicalArrayId)))
+              module, mvmNode.op, budget, physicalArrayId)))
         return mlir::failure();
-      recordSourceLayerCore(mvmNode->op, placement->coreId, coreIdBySourceLayer,
+      recordSourceLayerCore(mvmNode.op, placement->coreId, coreIdBySourceLayer,
                             ambiguousSourceLayers);
     }
+  }
+
+  for (const auto &islandEntry : islandByTaskIndex) {
+    unsigned taskIndex = islandEntry.first;
+    unsigned setupTaskIndex = islandEntry.second;
+    if (taskIndex == setupTaskIndex)
+      continue;
+
+    if (taskIndex >= dag.nodes.size())
+      continue;
+
+    mlir::sculptor::TaskCreateOp taskOp = dag.nodes[taskIndex].op;
+    if (getCoreIdAttr(taskOp) || !task_schedulers::isDigitalTask(taskOp))
+      continue;
+
+    taskOp->setAttr(schedule_attrs::kIslandIndexAttrName,
+                    builder.getI64IntegerAttr(setupTaskIndex));
+
+    auto physicalArrayIt = physicalArrayByMatrixSetupTask.find(setupTaskIndex);
+    if (physicalArrayIt == physicalArrayByMatrixSetupTask.end())
+      continue;
+
+    auto placement = task_schedulers::resolvePhysicalArrayPlacement(
+        taskOp.getOperation(), budget, physicalArrayIt->second);
+    if (mlir::failed(placement))
+      return mlir::failure();
+
+    if (mlir::failed(task_schedulers::attachTaskCorePlacement(
+            module, taskOp, budget, placement->coreId)))
+      return mlir::failure();
   }
 
   if (mlir::failed(attachSourceLayerCorePlacements(
           module, budget, dag, coreIdBySourceLayer, ambiguousSourceLayers)))
     return mlir::failure();
 
-  if (mlir::failed(attachMostRecentProducerCorePlacements(module, budget, dag)))
-    return mlir::failure();
+  return attachAdjacentCorePlacementsToFixedPoint(module, budget, dag);
+}
 
-  if (mlir::failed(attachEarliestConsumerCorePlacements(module, budget, dag)))
+static mlir::FailureOr<
+    llvm::SmallVector<task_schedulers::MatrixSetupGroupPlacement, 8>>
+buildRoundRobinIslandGroupPlacements(
+    mlir::func::FuncOp taskGraphFunc,
+    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
+    llvm::ArrayRef<int64_t> physicalArrayOrder) {
+  if (!islandGraph.islands.empty() && physicalArrayOrder.empty()) {
+    taskGraphFunc.emitError("expected logical island placement to have at "
+                            "least one physical analog array");
     return mlir::failure();
+  }
 
-  return mlir::success();
+  llvm::SmallVector<task_schedulers::MatrixSetupGroupPlacement, 8>
+      groupPlacements;
+  groupPlacements.reserve(islandGraph.islands.size());
+  for (auto indexedIsland : llvm::enumerate(islandGraph.islands)) {
+    const task_schedulers::LogicalPlacementIsland &island =
+        indexedIsland.value();
+    int64_t physicalArrayId =
+        physicalArrayOrder[indexedIsland.index() % physicalArrayOrder.size()];
+    groupPlacements.push_back(task_schedulers::MatrixSetupGroupPlacement{
+        island.matrixSetupTaskIndex, physicalArrayId});
+  }
+
+  return groupPlacements;
 }
 
 } // namespace
@@ -285,49 +347,36 @@ namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
 
-LogicalResult placeMatrixSetupGroupsAndSurroundingTasks(
+LogicalResult placeLogicalPlacementIslands(
     ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
     const TaskGraphDAG &dag, llvm::ArrayRef<int64_t> physicalArrayOrder) {
-  llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks =
-      collectMatrixSetupTasks(dag);
-  if (!matrixSetupTasks.empty() && physicalArrayOrder.empty()) {
-    taskGraphFunc.emitError("expected matrix setup group placement to have at "
-                            "least one physical analog array");
+  auto islandGraph = buildLogicalPlacementIslandGraph(dag);
+  if (failed(islandGraph))
     return failure();
-  }
 
-  llvm::SmallVector<MatrixSetupGroupPlacement, 8> groupPlacements;
-  groupPlacements.reserve(matrixSetupTasks.size());
-  for (auto indexedSetup : llvm::enumerate(matrixSetupTasks)) {
-    const TaskGraphNode *setupNode = indexedSetup.value();
-    int64_t physicalArrayId =
-        physicalArrayOrder[indexedSetup.index() % physicalArrayOrder.size()];
-    groupPlacements.push_back(
-        MatrixSetupGroupPlacement{setupNode->index, physicalArrayId});
-  }
+  auto groupPlacements =
+      buildRoundRobinIslandGroupPlacements(taskGraphFunc, *islandGraph,
+                                           physicalArrayOrder);
+  if (failed(groupPlacements))
+    return failure();
 
-  return placeMatrixSetupGroupsAndSurroundingTasks(
-      module, taskGraphFunc, budget, dag, groupPlacements);
+  return placeLogicalPlacementIslands(module, taskGraphFunc, budget, dag,
+                                      *islandGraph, *groupPlacements);
 }
 
-LogicalResult placeMatrixSetupGroupsAndSurroundingTasks(
+LogicalResult placeLogicalPlacementIslands(
     ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag,
+    const TaskGraphDAG &dag, const LogicalPlacementIslandGraph &islandGraph,
     llvm::ArrayRef<MatrixSetupGroupPlacement> groupPlacements) {
-  llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks =
-      collectMatrixSetupTasks(dag);
-  MatrixSetupMVMMap mvmTasksByMatrixSetupTask =
-      buildMVMTasksByMatrixSetupTask(dag, matrixSetupTasks);
-
   llvm::DenseMap<unsigned, int64_t> physicalArrayByMatrixSetupTask;
-  if (failed(buildMatrixSetupPlacementMap(taskGraphFunc, matrixSetupTasks,
+  if (failed(buildMatrixSetupPlacementMap(taskGraphFunc, dag, islandGraph,
                                           groupPlacements,
                                           physicalArrayByMatrixSetupTask)))
     return failure();
 
-  return materializeMatrixSetupGroupPlacements(
-      module, budget, dag, matrixSetupTasks, mvmTasksByMatrixSetupTask,
-      physicalArrayByMatrixSetupTask);
+  return materializeMatrixSetupIslandPlacements(
+      module, budget, dag, islandGraph, physicalArrayByMatrixSetupTask,
+      islandGraph.islandByTaskIndex);
 }
 
 } // namespace task_schedulers

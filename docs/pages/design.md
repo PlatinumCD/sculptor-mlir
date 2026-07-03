@@ -39,11 +39,11 @@ physical array tile size used when expanding `sculptor.mvm`.
 `sculptor-lower-golem-to-task-graph` accepts hardware budget options such as
 `cores`, `arrays-per-core`, `topology`, `mesh-rows`, and `mesh-cols`, plus a
 registered scheduler name. The current tree provides several placement
-strategies, including `random`, `snake`, `greedy-heavy-edge`, `manhattan-cut`,
-`boundary-aware-cut`, and `boundary-aware-cut-optimized`. After the selected
-strategy places matrix setup/MVM groups and related digital work, the pass fuses
-recognized task routines, scores the graph on the configured mesh, and
-recomputes the runtime resource layout.
+strategies, including `random`, `snake`, and `greedy`. Registered schedulers use
+min-cut digital placement with local digital-task refinement by default. After
+the selected strategy places matrix setup/MVM groups and related digital work,
+the pass fuses same-core task components, scores the graph on the configured
+mesh, and recomputes the runtime resource layout.
 
 ### `sculptor-lower-to-golem`
 
@@ -75,9 +75,10 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
    be present at this point as a direct call form of the same tasks.
 2. `sculptor-schedule-task-graph`
    Attaches task order, core assignment, logical array placement, transfer
-   metadata, a graph score, routine fusion, and runtime resource layout. Once
-   the task graph is the live representation, the pass removes the stale
-   materialized `forward` entry point and unused generated task callees.
+   metadata, a graph score, same-core routine fusion, final schedule metadata,
+   and runtime resource layout. Once the task graph is the live representation,
+   the pass removes the stale materialized `forward` entry point and unused
+   generated task callees.
 3. `sculptor-lower-golem-to-llvm-shims`
    Rewrites scheduled Golem array operations into LLVM-callable runtime shim
    calls.

@@ -13,6 +13,8 @@
 using namespace mlir;
 using namespace mlir::sculptor;
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorNNOpsEnums.cpp.inc"
+
 #define GET_OP_CLASSES
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.cpp.inc"
 

@@ -16,6 +16,8 @@
 
 // Exposes the TableGen-generated operation classes for analog storage,
 // placement, task-graph, and array-execution IR.
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorNNOpsEnums.h.inc"
+
 #define GET_OP_CLASSES
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h.inc"
 

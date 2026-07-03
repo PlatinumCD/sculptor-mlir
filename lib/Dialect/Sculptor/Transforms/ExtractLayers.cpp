@@ -22,6 +22,7 @@ void ExtractLayersPass::runOnOperation() {
   mlir::sculptor::registerRNNExtractor(extractors, &getContext());
   mlir::sculptor::registerLSTMExtractor(extractors, &getContext());
   mlir::sculptor::registerGRUExtractor(extractors, &getContext());
+  mlir::sculptor::registerTransformerExtractor(extractors, &getContext());
   mlir::sculptor::registerRNNCellExtractor(extractors, &getContext());
   mlir::sculptor::registerLSTMCellExtractor(extractors, &getContext());
   mlir::sculptor::registerGRUCellExtractor(extractors, &getContext());

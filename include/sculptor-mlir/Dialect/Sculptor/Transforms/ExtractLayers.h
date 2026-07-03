@@ -88,6 +88,10 @@ void registerLSTMExtractor(LayerExtractors &extractors, MLIRContext *context);
 // Installs the extractor that recognizes supported GRU computations.
 void registerGRUExtractor(LayerExtractors &extractors, MLIRContext *context);
 
+// Installs the extractor that recognizes supported Transformer computations.
+void registerTransformerExtractor(LayerExtractors &extractors,
+                                  MLIRContext *context);
+
 // Installs the extractor that recognizes LSTM cell computations.
 void registerLSTMCellExtractor(LayerExtractors &extractors,
                                MLIRContext *context);

@@ -2,6 +2,7 @@
 #define SCULPTOR_NN_OPS_TD
 
 include "mlir/IR/CommonAttrConstraints.td"
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpBase.td"
 
 include "sculptor-mlir/Dialect/Sculptor/IR/SculptorBase.td"
@@ -598,6 +599,262 @@ def Sculptor_NNLSTMLayerOp
     $input `,` $h0 `,` $c0 `,` $w_ih `,` $w_hh
     (`,` $b_ih^ `,` $b_hh)? attr-dict
     `:` functional-type(operands, results)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sculptor.nn.transformer
+// Semantic neural-network Transformer stack.
+//===----------------------------------------------------------------------===//
+
+def Sculptor_NNTransformerOp
+    : Sculptor_NNOp<"transformer"> {
+
+  let summary = "Represent a canonical neural-network Transformer stack";
+
+  let description = [{
+    Captures a whole encoder-decoder Transformer stack with source and target
+    input sequences, an ordered variadic parameter list, static block
+    configuration attributes, and one target-sequence output. Encoder
+    parameters are ordered by block as self-attention QKV projection, attention
+    output projection, optional attention norm affine parameters, MLP expansion,
+    MLP contraction, and optional MLP norm affine parameters. Decoder parameters
+    then follow by block as self-attention, cross-attention query/KV/output
+    projections, their optional norms, and MLP parameters. If `has_final_norm`
+    and `has_layer_norm_affine` are both true, the final parameters are encoder
+    final norm scale/bias followed by decoder final norm scale/bias.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$src,
+    AnyRankedTensor:$tgt,
+    Variadic<AnyRankedTensor>:$parameters,
+    BoolAttr:$batch_first,
+    BoolAttr:$has_projection_bias,
+    BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_final_norm,
+    BoolAttr:$causal,
+    StrAttr:$activation,
+    StrAttr:$norm_mode,
+    I64Attr:$hidden_size,
+    I64Attr:$num_heads,
+    I64Attr:$head_dim,
+    I64Attr:$mlp_hidden_size,
+    I64Attr:$num_encoder_blocks,
+    I64Attr:$num_decoder_blocks,
+    F64Attr:$layer_norm_eps
+  );
+
+  let results = (outs
+    AnyRankedTensor:$output
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $src `,` $tgt `,` `parameters` `[` $parameters `]`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sculptor.nn.transformer_encoder
+// Semantic neural-network Transformer encoder stack.
+//===----------------------------------------------------------------------===//
+
+def Sculptor_NNTransformerEncoderOp
+    : Sculptor_NNOp<"transformer_encoder"> {
+
+  let summary = "Represent a canonical neural-network Transformer encoder stack";
+
+  let description = [{
+    Captures a one-input Transformer encoder stack with an ordered variadic
+    parameter list, static block configuration attributes, and one sequence
+    output. Parameters are ordered by block as self-attention QKV projection,
+    attention output projection, optional attention norm affine parameters,
+    MLP expansion, MLP contraction, and optional MLP norm affine parameters.
+    If `has_final_norm` and `has_layer_norm_affine` are both true, the final
+    parameters are final norm scale and bias.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$input,
+    Variadic<AnyRankedTensor>:$parameters,
+    BoolAttr:$batch_first,
+    BoolAttr:$has_projection_bias,
+    BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_final_norm,
+    BoolAttr:$causal,
+    StrAttr:$activation,
+    StrAttr:$norm_mode,
+    I64Attr:$hidden_size,
+    I64Attr:$num_heads,
+    I64Attr:$head_dim,
+    I64Attr:$mlp_hidden_size,
+    I64Attr:$num_blocks,
+    F64Attr:$layer_norm_eps
+  );
+
+  let results = (outs
+    AnyRankedTensor:$output
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $input `,` `parameters` `[` $parameters `]`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sculptor.nn.transformer_decoder
+// Semantic neural-network Transformer decoder-only stack.
+//===----------------------------------------------------------------------===//
+
+def Sculptor_NNTransformerDecoderOp
+    : Sculptor_NNOp<"transformer_decoder"> {
+
+  let summary = "Represent a canonical neural-network Transformer decoder stack";
+
+  let description = [{
+    Captures a one-input decoder-only causal Transformer stack with an ordered
+    variadic parameter list, static block configuration attributes, and one
+    sequence output. This op currently models the causal-only decoder case: the
+    stack has self-attention and MLP parameters per block, optional final norm
+    parameters, and no encoder memory or cross-attention parameter section.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$input,
+    Variadic<AnyRankedTensor>:$parameters,
+    BoolAttr:$batch_first,
+    BoolAttr:$has_projection_bias,
+    BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_final_norm,
+    BoolAttr:$causal,
+    BoolAttr:$has_cross_attention,
+    StrAttr:$decoder_kind,
+    StrAttr:$activation,
+    StrAttr:$norm_mode,
+    I64Attr:$hidden_size,
+    I64Attr:$num_heads,
+    I64Attr:$head_dim,
+    I64Attr:$mlp_hidden_size,
+    I64Attr:$num_blocks,
+    F64Attr:$layer_norm_eps
+  );
+
+  let results = (outs
+    AnyRankedTensor:$output
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $input `,` `parameters` `[` $parameters `]`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sculptor.nn.transformer_block
+// Semantic neural-network Transformer block.
+//===----------------------------------------------------------------------===//
+
+def Sculptor_TransformerBlockKindEncoder
+    : I32EnumAttrCase<"Encoder", 0, "encoder">;
+def Sculptor_TransformerBlockKindDecoder
+    : I32EnumAttrCase<"Decoder", 1, "decoder">;
+
+def Sculptor_TransformerBlockKind
+    : I32EnumAttr<"TransformerBlockKind", "Transformer block kind", [
+        Sculptor_TransformerBlockKindEncoder,
+        Sculptor_TransformerBlockKindDecoder
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_NNTransformerBlockOp
+    : Sculptor_NNOp<"transformer_block", [AttrSizedOperandSegments]> {
+
+  let summary = "Represent a canonical neural-network Transformer block";
+
+  let description = [{
+    Captures one encoder or decoder Transformer block over a batch-major
+    sequence. Encoder blocks own self-attention and MLP parameters. Decoder
+    blocks additionally carry an encoder memory input and cross-attention
+    query, key/value, output, and normalization parameters. The last extracted
+    block in a stack may also carry the stack's final normalization metadata and
+    optional affine parameters. Projection biases and layer-normalization affine
+    parameters are controlled independently by attributes.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$input,
+    Optional<AnyRankedTensor>:$memory,
+    AnyRankedTensor:$qkv_weight,
+    Optional<AnyRankedTensor>:$qkv_bias,
+    AnyRankedTensor:$attn_output_weight,
+    Optional<AnyRankedTensor>:$attn_output_bias,
+    Optional<AnyRankedTensor>:$attn_norm_weight,
+    Optional<AnyRankedTensor>:$attn_norm_bias,
+    Optional<AnyRankedTensor>:$cross_query_weight,
+    Optional<AnyRankedTensor>:$cross_query_bias,
+    Optional<AnyRankedTensor>:$cross_key_value_weight,
+    Optional<AnyRankedTensor>:$cross_key_value_bias,
+    Optional<AnyRankedTensor>:$cross_output_weight,
+    Optional<AnyRankedTensor>:$cross_output_bias,
+    Optional<AnyRankedTensor>:$cross_norm_weight,
+    Optional<AnyRankedTensor>:$cross_norm_bias,
+    AnyRankedTensor:$mlp_up_weight,
+    Optional<AnyRankedTensor>:$mlp_up_bias,
+    AnyRankedTensor:$mlp_down_weight,
+    Optional<AnyRankedTensor>:$mlp_down_bias,
+    Optional<AnyRankedTensor>:$mlp_norm_weight,
+    Optional<AnyRankedTensor>:$mlp_norm_bias,
+    Optional<AnyRankedTensor>:$final_norm_weight,
+    Optional<AnyRankedTensor>:$final_norm_bias,
+    BoolAttr:$batch_first,
+    BoolAttr:$has_projection_bias,
+    BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_final_norm,
+    BoolAttr:$causal,
+    BoolAttr:$has_cross_attention,
+    StrAttr:$activation,
+    Sculptor_TransformerBlockKind:$block_kind,
+    StrAttr:$norm_mode,
+    I64Attr:$hidden_size,
+    I64Attr:$num_heads,
+    I64Attr:$head_dim,
+    I64Attr:$mlp_hidden_size,
+    I64Attr:$block_index,
+    I64Attr:$num_blocks,
+    F64Attr:$layer_norm_eps
+  );
+
+  let results = (outs
+    AnyRankedTensor:$output
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $input `,`
+    `memory` `[` ($memory^)? `]` `,`
+    `qkv` `[` $qkv_weight (`,` $qkv_bias^)? `]` `,`
+    `attn_output` `[` $attn_output_weight (`,` $attn_output_bias^)? `]` `,`
+    `attn_norm` `[` ($attn_norm_weight^ `,` $attn_norm_bias)? `]`
+    `,` `cross_query` `[` ($cross_query_weight^)? (`,` $cross_query_bias^)? `]`
+    `,` `cross_key_value` `[` ($cross_key_value_weight^)? (`,` $cross_key_value_bias^)? `]`
+    `,` `cross_output` `[` ($cross_output_weight^)? (`,` $cross_output_bias^)? `]`
+    `,` `cross_norm` `[` ($cross_norm_weight^ `,` $cross_norm_bias)? `]`
+    `,` `mlp_up` `[` $mlp_up_weight (`,` $mlp_up_bias^)? `]`
+    `,` `mlp_down` `[` $mlp_down_weight (`,` $mlp_down_bias^)? `]`
+    `,` `mlp_norm` `[` ($mlp_norm_weight^ `,` $mlp_norm_bias)? `]`
+    `,` `final_norm` `[` ($final_norm_weight^ `,` $final_norm_bias)? `]`
+    `block_kind` `=` $block_kind
+    attr-dict `:` functional-type(operands, results)
   }];
 }
 

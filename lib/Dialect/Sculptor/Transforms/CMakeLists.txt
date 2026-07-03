@@ -13,13 +13,17 @@ add_mlir_library(MLIRSculptorTransforms
   assemblers/TaskGraphGeneratorAssembler.cpp
   assemblers/TaskGraphResourceAssembler.cpp
   assemblers/TaskGraphTaskAssembler.cpp
+  task_schedulers/TaskGraphIslandBuilder.cpp
+  task_schedulers/TaskGraphIslandCommunication.cpp
+  task_schedulers/TaskGraphIslandDigitalAssignment.cpp
   task_schedulers/TaskGraphPlacementUtils.cpp
+  task_schedulers/TaskGraphResources.cpp
   task_schedulers/TaskGraphScorer.cpp
+  task_schedulers/TaskGraphScheduleMetadata.cpp
+  task_schedulers/MeshGeometry.cpp
   task_schedulers/TaskGraphRoutineFuser.cpp
-  task_schedulers/BoundaryAwareCutTaskScheduler.cpp
-  task_schedulers/BoundaryAwareCutOptimizedTaskScheduler.cpp
-  task_schedulers/GreedyHeavyEdgeTaskScheduler.cpp
-  task_schedulers/ManhattanCutTaskScheduler.cpp
+  task_schedulers/GreedyPlacement.cpp
+  task_schedulers/GreedyTaskScheduler.cpp
   task_schedulers/RandomTaskScheduler.cpp
   task_schedulers/SnakeTaskScheduler.cpp
   canonicalizers/Conv1DCanonicalizer.cpp
@@ -29,6 +33,7 @@ add_mlir_library(MLIRSculptorTransforms
   canonicalizers/RNNCanonicalizer.cpp
   canonicalizers/LSTMCanonicalizer.cpp
   canonicalizers/GRUCanonicalizer.cpp
+  canonicalizers/TransformerCanonicalizer.cpp
   canonicalizers/LinearCanonicalizer.cpp
   canonicalizers/GRUCellCanonicalizer.cpp
   canonicalizers/LSTMCellCanonicalizer.cpp
@@ -46,6 +51,7 @@ add_mlir_library(MLIRSculptorTransforms
   converters/GRUCellConverter.cpp
   converters/GRUConverter.cpp
   converters/RNNConverter.cpp
+  converters/TransformerBlockConverter.cpp
   extractors/LinearExtractor.cpp
   extractors/Conv1DExtractor.cpp
   extractors/Conv2DExtractor.cpp
@@ -54,6 +60,7 @@ add_mlir_library(MLIRSculptorTransforms
   extractors/RNNExtractor.cpp
   extractors/LSTMExtractor.cpp
   extractors/GRUExtractor.cpp
+  extractors/TransformerExtractor.cpp
   extractors/RNNCellExtractor.cpp
   extractors/LSTMCellExtractor.cpp
   extractors/GRUCellExtractor.cpp

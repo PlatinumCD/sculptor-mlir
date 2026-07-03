@@ -55,6 +55,24 @@ struct ScheduleTaskGraphPass
       llvm::cl::desc("Seed used by randomized task graph schedulers"),
       llvm::cl::init(0)};
 
+  Option<int64_t> greedyLookahead{
+      *this, "greedy-lookahead",
+      llvm::cl::desc("Future-island lookahead depth used by the greedy task "
+                     "scheduler"),
+      llvm::cl::init(1)};
+
+  Option<std::string> greedyCandidateScope{
+      *this, "greedy-candidate-scope",
+      llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
+                     "cardinal, diagonal, or producer-consumer"),
+      llvm::cl::init("diagonal")};
+
+  Option<std::string> summaryOutput{
+      *this, "summary-output",
+      llvm::cl::desc("Optional CSV path where the scheduler appends a compact "
+                     "result summary"),
+      llvm::cl::init("")};
+
   ScheduleTaskGraphPass() = default;
 
   ScheduleTaskGraphPass(const ScheduleTaskGraphPass &pass)
@@ -85,7 +103,22 @@ struct ScheduleTaskGraphPass
         randomSeed(*this, "random-seed",
                    llvm::cl::desc(
                        "Seed used by randomized task graph schedulers"),
-                   llvm::cl::init(0)) {
+                   llvm::cl::init(0)),
+        greedyLookahead(
+            *this, "greedy-lookahead",
+            llvm::cl::desc("Future-island lookahead depth used by the greedy "
+                           "task scheduler"),
+            llvm::cl::init(1)),
+        greedyCandidateScope(
+            *this, "greedy-candidate-scope",
+            llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
+                           "cardinal, diagonal, or producer-consumer"),
+            llvm::cl::init("diagonal")),
+        summaryOutput(
+            *this, "summary-output",
+            llvm::cl::desc("Optional CSV path where the scheduler appends a "
+                           "compact result summary"),
+            llvm::cl::init("")) {
     cores = pass.cores;
     arraysPerCore = pass.arraysPerCore;
     topology = pass.topology;
@@ -93,6 +126,9 @@ struct ScheduleTaskGraphPass
     meshCols = pass.meshCols;
     schedule = pass.schedule;
     randomSeed = pass.randomSeed;
+    greedyLookahead = pass.greedyLookahead;
+    greedyCandidateScope = pass.greedyCandidateScope;
+    summaryOutput = pass.summaryOutput;
   }
 
   mlir::StringRef getArgument() const final {

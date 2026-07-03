@@ -1,7 +1,7 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCORER_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCORER_H
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -22,6 +22,7 @@ struct TaskGraphScore {
   int64_t boundaryPenalty = 0;
   int64_t interCoreTransferBytes = 0;
   int64_t totalTransferCost = 0;
+  double transferCostPerInterCoreByte = 0.0;
   llvm::SmallVector<int64_t, 16> coreTransferBytes;
   llvm::SmallVector<int64_t, 16> coreTransferCost;
 };

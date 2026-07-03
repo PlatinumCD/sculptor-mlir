@@ -49,8 +49,11 @@ struct HardwareModel {
 struct SummaryModel {
   int64_t taskCount = 0;
   int64_t dependencyCount = 0;
+  int64_t graphScore = 0;
+  int64_t boundaryPenalty = 0;
   int64_t interCoreTransferBytes = 0;
   int64_t totalTransferCost = 0;
+  double transferCostPerInterCoreByte = 0.0;
   int64_t totalDigitalOps = 0;
   int64_t numLogicalArrays = 0;
   llvm::SmallVector<int64_t> coreTransferBytes;
@@ -236,6 +239,10 @@ mlir::FailureOr<SummaryModel> buildSummaryModel(mlir::func::FuncOp func) {
   auto taskCount = getRequiredI64Attr(func, schedule_attrs::kTaskCountAttrName);
   auto dependencyCount =
       getRequiredI64Attr(func, schedule_attrs::kDependencyCountAttrName);
+  auto graphScore =
+      getRequiredI64Attr(func, schedule_attrs::kGraphScoreAttrName);
+  auto boundaryPenalty =
+      getRequiredI64Attr(func, schedule_attrs::kBoundaryPenaltyAttrName);
   auto coreTransferBytes =
       getRequiredI64ArrayAttr(func, schedule_attrs::kCoreTransferBytesAttrName);
   auto interCoreTransferBytes =
@@ -252,6 +259,7 @@ mlir::FailureOr<SummaryModel> buildSummaryModel(mlir::func::FuncOp func) {
       func, schedule_attrs::kLogicalArrayToAnalogArrayAttrName);
 
   if (mlir::failed(taskCount) || mlir::failed(dependencyCount) ||
+      mlir::failed(graphScore) || mlir::failed(boundaryPenalty) ||
       mlir::failed(coreTransferBytes) || mlir::failed(interCoreTransferBytes) ||
       mlir::failed(coreTransferCost) || mlir::failed(totalTransferCost) ||
       mlir::failed(totalDigitalOps) || mlir::failed(numLogicalArrays) ||
@@ -260,10 +268,17 @@ mlir::FailureOr<SummaryModel> buildSummaryModel(mlir::func::FuncOp func) {
 
   summary.taskCount = *taskCount;
   summary.dependencyCount = *dependencyCount;
+  summary.graphScore = *graphScore;
+  summary.boundaryPenalty = *boundaryPenalty;
   summary.coreTransferBytes = std::move(*coreTransferBytes);
   summary.interCoreTransferBytes = *interCoreTransferBytes;
   summary.coreTransferCost = std::move(*coreTransferCost);
   summary.totalTransferCost = *totalTransferCost;
+  if (summary.interCoreTransferBytes > 0) {
+    summary.transferCostPerInterCoreByte =
+        static_cast<double>(summary.totalTransferCost) /
+        static_cast<double>(summary.interCoreTransferBytes);
+  }
   summary.totalDigitalOps = *totalDigitalOps;
   summary.numLogicalArrays = *numLogicalArrays;
   summary.logicalArrayToAnalogArray = std::move(*logicalArrayToAnalogArray);
@@ -814,8 +829,12 @@ void emitSummary(llvm::json::OStream &json, const SummaryModel &summary) {
   json.attributeObject("summary", [&] {
     json.attribute("task_count", summary.taskCount);
     json.attribute("dependency_count", summary.dependencyCount);
+    json.attribute("graph_score", summary.graphScore);
+    json.attribute("boundary_penalty", summary.boundaryPenalty);
     json.attribute("inter_core_transfer_bytes", summary.interCoreTransferBytes);
     json.attribute("total_transfer_cost", summary.totalTransferCost);
+    json.attribute("transfer_cost_per_inter_core_byte",
+                   summary.transferCostPerInterCoreByte);
     json.attribute("total_digital_ops", summary.totalDigitalOps);
     json.attribute("num_logical_arrays", summary.numLogicalArrays);
     emitI64ArrayAttr(json, "core_transfer_bytes", summary.coreTransferBytes);

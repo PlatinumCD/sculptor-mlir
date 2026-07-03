@@ -26,6 +26,11 @@ __pycache__/
 *.dll
 *.exe
 
+# Generated graph visualization artifacts
+graph.ml
+*.graph.ml
+*.graphml
+
 # First public push excludes device/simulator-specific backends and examples.
 runtime/golem/
 runtime/golem-simulator/

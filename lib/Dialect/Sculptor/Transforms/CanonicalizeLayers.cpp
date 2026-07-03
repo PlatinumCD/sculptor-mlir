@@ -26,6 +26,8 @@ void CanonicalizeLayersPass::runOnOperation() {
   mlir::sculptor::registerLSTMCellCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerGRUCellCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerRNNCellCanonicalizer(canonicalizers, &getContext());
+  mlir::sculptor::registerTransformerCanonicalizer(canonicalizers,
+                                                   &getContext());
   mlir::sculptor::registerLinearCanonicalizer(canonicalizers, &getContext());
 
   // Only forward is treated as the source function for layer canonicalization.

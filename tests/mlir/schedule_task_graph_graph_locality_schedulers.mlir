@@ -1,4 +1,6 @@
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=2 topology=mesh mesh-rows=1 mesh-cols=2 schedule=boundary-aware-cut" | FileCheck %s
+// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=random" | FileCheck %s --check-prefix=RANDOM
+// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=snake" | FileCheck %s --check-prefix=SNAKE
+// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-lookahead=1 greedy-candidate-scope=cardinal" | FileCheck %s --check-prefix=GREEDY
 
 module {
   func.func private @task_matrix() -> !sculptor.logical.array {
@@ -29,27 +31,15 @@ module {
   }
 }
 
-// CHECK-LABEL: func.func private @generate_task_graph
-// CHECK-SAME: sculptor.schedule.graph_score = 0 : i64
-// CHECK-SAME: sculptor.schedule.logical_array_to_analog_array = [0, 1]
-// CHECK-SAME: sculptor.schedule.total_transfer_cost = 0 : i64
-// CHECK: sculptor.task.create {{.*}} @task_matrix
-// CHECK-SAME: task_name = "layer0_matrix"
-// CHECK-SAME: sculptor.runtime.core_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.local_array_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.physical_array_id = 0 : i64
-// CHECK: sculptor.task.create {{.*}} @task_matrix
-// CHECK-SAME: task_name = "layer1_matrix"
-// CHECK-SAME: sculptor.runtime.core_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.local_array_id = 1 : i64
-// CHECK-SAME: sculptor.runtime.physical_array_id = 1 : i64
-// CHECK: sculptor.task.create {{.*}} @task_mvm
-// CHECK-SAME: task_name = "layer0_mvm"
-// CHECK-SAME: sculptor.runtime.core_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.local_array_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.physical_array_id = 0 : i64
-// CHECK: sculptor.task.create {{.*}} @task_mvm
-// CHECK-SAME: task_name = "layer1_mvm"
-// CHECK-SAME: sculptor.runtime.core_id = 0 : i64
-// CHECK-SAME: sculptor.runtime.local_array_id = 1 : i64
-// CHECK-SAME: sculptor.runtime.physical_array_id = 1 : i64
+// RANDOM-LABEL: func.func private @generate_task_graph
+// RANDOM-SAME: sculptor.schedule.graph_score = 8 : i64
+// RANDOM-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
+
+// SNAKE-LABEL: func.func private @generate_task_graph
+// SNAKE-SAME: sculptor.schedule.graph_score = 8 : i64
+// SNAKE-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
+
+// GREEDY-LABEL: func.func private @generate_task_graph
+// GREEDY-SAME: sculptor.schedule.graph_score = 8 : i64
+// GREEDY-SAME: sculptor.schedule.greedy_candidate_scope = "cardinal"
+// GREEDY-SAME: sculptor.schedule.total_transfer_cost = 8 : i64

@@ -65,6 +65,18 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
       *this, "schedule",
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
       llvm::cl::init("")};
+
+  PassOptions::Option<int64_t> greedyLookahead{
+      *this, "greedy-lookahead",
+      llvm::cl::desc("Future-island lookahead depth used by the greedy task "
+                     "scheduler"),
+      llvm::cl::init(1)};
+
+  PassOptions::Option<std::string> greedyCandidateScope{
+      *this, "greedy-candidate-scope",
+      llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
+                     "cardinal, diagonal, or producer-consumer"),
+      llvm::cl::init("diagonal")};
 };
 
 void buildSculptorLowerToGolemPipeline(
@@ -93,6 +105,8 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   scheduleTaskGraphPass->meshRows = options.meshRows;
   scheduleTaskGraphPass->meshCols = options.meshCols;
   scheduleTaskGraphPass->schedule = options.schedule;
+  scheduleTaskGraphPass->greedyLookahead = options.greedyLookahead;
+  scheduleTaskGraphPass->greedyCandidateScope = options.greedyCandidateScope;
   pm.addPass(std::move(scheduleTaskGraphPass));
 
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());
