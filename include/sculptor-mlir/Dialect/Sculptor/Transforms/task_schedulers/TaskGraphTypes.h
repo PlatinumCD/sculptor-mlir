@@ -2,6 +2,7 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHTYPES_H
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleConfig.h"
 
 #include "mlir/IR/Value.h"
 
@@ -23,8 +24,8 @@ struct HardwareBudget {
   int64_t meshCols = 0;
   int64_t numAnalogArrays = 0;
   int64_t randomSeed = 0;
-  int64_t greedyLookahead = 1;
-  std::string greedyCandidateScope = "diagonal";
+  GreedyScheduleConfig greedy;
+  AnnealingScheduleConfig annealing;
   llvm::SmallVector<int64_t, 8> analogArrays;
 };
 
@@ -51,11 +52,6 @@ struct PhysicalArrayPlacement {
   int64_t physicalArrayId = 0;
   int64_t coreId = 0;
   int64_t localArrayId = 0;
-};
-
-struct MatrixSetupGroupPlacement {
-  unsigned matrixSetupTaskIndex = 0;
-  int64_t physicalArrayId = 0;
 };
 
 } // namespace task_schedulers

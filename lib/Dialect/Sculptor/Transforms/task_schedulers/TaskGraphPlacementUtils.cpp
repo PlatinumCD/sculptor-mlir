@@ -6,6 +6,10 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/SymbolTable.h"
+
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <cstdint>
@@ -18,6 +22,36 @@ namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_schedulers = mlir::sculptor::task_schedulers;
 
 using TaskGraphNode = mlir::sculptor::task_schedulers::TaskGraphNode;
+
+static mlir::FailureOr<mlir::func::FuncOp>
+lookupTaskCallee(mlir::ModuleOp module, mlir::sculptor::TaskCreateOp taskOp,
+                 llvm::StringRef placementKind) {
+  auto callee = module.lookupSymbol<mlir::func::FuncOp>(
+      taskOp.getCalleeAttr().getValue());
+  if (!callee) {
+    return taskOp.emitError("expected task callee '")
+           << taskOp.getCalleeAttr().getValue()
+           << "' to resolve to a function for " << placementKind
+           << " placement";
+  }
+  return callee;
+}
+
+static void attachCorePlacementAttrs(mlir::Operation *op,
+                                     mlir::Builder &builder, int64_t coreId) {
+  op->setAttr(runtime_attrs::kTaskCoreIdAttrName,
+              builder.getI64IntegerAttr(coreId));
+}
+
+static void attachAnalogArrayPlacementAttrs(
+    mlir::Operation *op, mlir::Builder &builder,
+    const task_schedulers::PhysicalArrayPlacement &placement) {
+  attachCorePlacementAttrs(op, builder, placement.coreId);
+  op->setAttr(runtime_attrs::kTaskPhysicalArrayIdAttrName,
+              builder.getI64IntegerAttr(placement.physicalArrayId));
+  op->setAttr(runtime_attrs::kTaskLocalArrayIdAttrName,
+              builder.getI64IntegerAttr(placement.localArrayId));
+}
 
 static void recordSourceLayerCore(mlir::sculptor::TaskCreateOp taskOp,
                                   int64_t coreId,
@@ -182,43 +216,15 @@ static mlir::LogicalResult attachAdjacentCorePlacementsToFixedPoint(
   return mlir::success();
 }
 
-static mlir::LogicalResult buildMatrixSetupPlacementMap(
-    mlir::func::FuncOp taskGraphFunc,
-    const task_schedulers::TaskGraphDAG &dag,
+static void buildMatrixSetupPlacementMap(
     const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
-    llvm::ArrayRef<task_schedulers::MatrixSetupGroupPlacement> groupPlacements,
+    const task_schedulers::IslandPlacementPlan &plan,
     llvm::DenseMap<unsigned, int64_t> &physicalArrayByMatrixSetupTask) {
-  for (const task_schedulers::MatrixSetupGroupPlacement &placement :
-       groupPlacements) {
-    if (!physicalArrayByMatrixSetupTask
-             .try_emplace(placement.matrixSetupTaskIndex,
-                          placement.physicalArrayId)
-             .second) {
-      taskGraphFunc.emitError("expected matrix setup group placement to be "
-                              "specified once per task");
-      return mlir::failure();
-    }
+  for (auto indexedIsland : llvm::enumerate(islandGraph.islands)) {
+    physicalArrayByMatrixSetupTask.try_emplace(
+        indexedIsland.value().matrixSetupTaskIndex,
+        plan.physicalArrayByIsland[indexedIsland.index()]);
   }
-
-  for (const task_schedulers::LogicalPlacementIsland &island :
-       islandGraph.islands) {
-    if (physicalArrayByMatrixSetupTask.contains(island.matrixSetupTaskIndex))
-      continue;
-
-    if (island.matrixSetupTaskIndex < dag.nodes.size()) {
-      mlir::sculptor::TaskCreateOp setupTask =
-          dag.nodes[island.matrixSetupTaskIndex].op;
-      setupTask.emitError("expected matrix setup task to have an assigned "
-                          "physical analog array");
-      return mlir::failure();
-    }
-
-    taskGraphFunc.emitError("expected matrix setup task to have an assigned "
-                            "physical analog array");
-    return mlir::failure();
-  }
-
-  return mlir::success();
 }
 
 static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
@@ -314,69 +320,79 @@ static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
   return attachAdjacentCorePlacementsToFixedPoint(module, budget, dag);
 }
 
-static mlir::FailureOr<
-    llvm::SmallVector<task_schedulers::MatrixSetupGroupPlacement, 8>>
-buildRoundRobinIslandGroupPlacements(
-    mlir::func::FuncOp taskGraphFunc,
-    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
-    llvm::ArrayRef<int64_t> physicalArrayOrder) {
-  if (!islandGraph.islands.empty() && physicalArrayOrder.empty()) {
-    taskGraphFunc.emitError("expected logical island placement to have at "
-                            "least one physical analog array");
-    return mlir::failure();
-  }
-
-  llvm::SmallVector<task_schedulers::MatrixSetupGroupPlacement, 8>
-      groupPlacements;
-  groupPlacements.reserve(islandGraph.islands.size());
-  for (auto indexedIsland : llvm::enumerate(islandGraph.islands)) {
-    const task_schedulers::LogicalPlacementIsland &island =
-        indexedIsland.value();
-    int64_t physicalArrayId =
-        physicalArrayOrder[indexedIsland.index() % physicalArrayOrder.size()];
-    groupPlacements.push_back(task_schedulers::MatrixSetupGroupPlacement{
-        island.matrixSetupTaskIndex, physicalArrayId});
-  }
-
-  return groupPlacements;
-}
-
 } // namespace
 
 namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
 
-LogicalResult placeLogicalPlacementIslands(
-    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag, llvm::ArrayRef<int64_t> physicalArrayOrder) {
-  auto islandGraph = buildLogicalPlacementIslandGraph(dag);
-  if (failed(islandGraph))
+FailureOr<PhysicalArrayPlacement>
+resolvePhysicalArrayPlacement(Operation *diagnosticOp,
+                              const HardwareBudget &budget,
+                              int64_t physicalArrayId) {
+  int64_t coreId = physicalArrayId / budget.arraysPerCore;
+  int64_t localArrayId = physicalArrayId % budget.arraysPerCore;
+  if (physicalArrayId < 0 || coreId < 0 || coreId >= budget.numCores ||
+      localArrayId < 0 || localArrayId >= budget.arraysPerCore) {
+    if (diagnosticOp)
+      diagnosticOp->emitError("assigned analog array is outside the hardware "
+                              "budget");
     return failure();
-
-  auto groupPlacements =
-      buildRoundRobinIslandGroupPlacements(taskGraphFunc, *islandGraph,
-                                           physicalArrayOrder);
-  if (failed(groupPlacements))
-    return failure();
-
-  return placeLogicalPlacementIslands(module, taskGraphFunc, budget, dag,
-                                      *islandGraph, *groupPlacements);
+  }
+  return PhysicalArrayPlacement{physicalArrayId, coreId, localArrayId};
 }
 
-LogicalResult placeLogicalPlacementIslands(
-    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag, const LogicalPlacementIslandGraph &islandGraph,
-    llvm::ArrayRef<MatrixSetupGroupPlacement> groupPlacements) {
-  llvm::DenseMap<unsigned, int64_t> physicalArrayByMatrixSetupTask;
-  if (failed(buildMatrixSetupPlacementMap(taskGraphFunc, dag, islandGraph,
-                                          groupPlacements,
-                                          physicalArrayByMatrixSetupTask)))
+LogicalResult attachTaskCorePlacement(ModuleOp module,
+                                      sculptor::TaskCreateOp taskOp,
+                                      const HardwareBudget &budget,
+                                      int64_t coreId) {
+  if (coreId < 0 || coreId >= budget.numCores) {
+    taskOp.emitError("assigned core is outside the hardware budget");
+    return failure();
+  }
+
+  auto callee = lookupTaskCallee(module, taskOp, "core");
+  if (failed(callee))
     return failure();
 
+  Builder builder(module.getContext());
+  attachCorePlacementAttrs(taskOp.getOperation(), builder, coreId);
+  attachCorePlacementAttrs(callee->getOperation(), builder, coreId);
+  return success();
+}
+
+LogicalResult attachTaskAnalogArrayPlacement(ModuleOp module,
+                                             sculptor::TaskCreateOp taskOp,
+                                             const HardwareBudget &budget,
+                                             int64_t physicalArrayId) {
+  auto placement = resolvePhysicalArrayPlacement(taskOp.getOperation(), budget,
+                                                 physicalArrayId);
+  if (failed(placement))
+    return failure();
+
+  auto callee = lookupTaskCallee(module, taskOp, "analog array");
+  if (failed(callee))
+    return failure();
+
+  Builder builder(module.getContext());
+  attachAnalogArrayPlacementAttrs(taskOp.getOperation(), builder, *placement);
+  attachAnalogArrayPlacementAttrs(callee->getOperation(), builder, *placement);
+  return success();
+}
+
+LogicalResult commitPlacementPlan(ModuleOp module, func::FuncOp taskGraphFunc,
+                                  const TaskGraphPlacementProblem &problem,
+                                  const IslandPlacementPlan &plan) {
+  if (failed(validatePlacementPlan(problem, plan)))
+    return failure();
+
+  llvm::DenseMap<unsigned, int64_t> physicalArrayByMatrixSetupTask;
+  buildMatrixSetupPlacementMap(problem.islandGraph, plan,
+                               physicalArrayByMatrixSetupTask);
+
   return materializeMatrixSetupIslandPlacements(
-      module, budget, dag, islandGraph, physicalArrayByMatrixSetupTask,
-      islandGraph.islandByTaskIndex);
+      module, problem.budget, problem.dag, problem.islandGraph,
+      physicalArrayByMatrixSetupTask, problem.islandGraph.islandByTaskIndex);
 }
 
 } // namespace task_schedulers

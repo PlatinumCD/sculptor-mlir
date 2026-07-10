@@ -55,17 +55,56 @@ struct ScheduleTaskGraphPass
       llvm::cl::desc("Seed used by randomized task graph schedulers"),
       llvm::cl::init(0)};
 
-  Option<int64_t> greedyLookahead{
-      *this, "greedy-lookahead",
-      llvm::cl::desc("Future-island lookahead depth used by the greedy task "
-                     "scheduler"),
-      llvm::cl::init(1)};
+  Option<std::string> greedyHeuristic{
+      *this, "greedy-heuristic",
+      llvm::cl::desc("Heuristic terms used by the greedy task scheduler, "
+                     "joined with ',': transfer-cost, boundary-regret, "
+                     "compact-region, lookahead=N, beam=N, scope=NAME"),
+      llvm::cl::init("transfer-cost")};
 
-  Option<std::string> greedyCandidateScope{
-      *this, "greedy-candidate-scope",
-      llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
-                     "cardinal, diagonal, or producer-consumer"),
-      llvm::cl::init("diagonal")};
+  Option<std::string> annealingInitialSchedule{
+      *this, "annealing-initial-schedule",
+      llvm::cl::desc("Initial placement schedule used by the annealing task "
+                     "scheduler: identity, random, snake, or greedy"),
+      llvm::cl::init("snake")};
+
+  Option<std::string> annealingMoveSet{
+      *this, "annealing-move-set",
+      llvm::cl::desc("Comma-separated simulated annealing perturbation moves "
+                     "or presets: basic, basic-wide, all, "
+                     "move-one-position, move-one-relocation, "
+                     "swap-two-positions, adjacent-swap, segment-reverse, "
+                     "segment-relocation, block-swap"),
+      llvm::cl::init("basic")};
+
+  Option<int64_t> annealingMoveRadius{
+      *this, "annealing-move-radius",
+      llvm::cl::desc("Maximum physical-array-order index distance for "
+                     "single-position annealing moves, or 0 for unbounded"),
+      llvm::cl::init(0)};
+
+  Option<double> annealingInitialTemperature{
+      *this, "annealing-initial-temperature",
+      llvm::cl::desc("Initial temperature used by the annealing task "
+                     "scheduler, or 0 to infer it from the initial score"),
+      llvm::cl::init(0.0)};
+
+  Option<double> annealingFinalTemperature{
+      *this, "annealing-final-temperature",
+      llvm::cl::desc("Final temperature used by the annealing task scheduler"),
+      llvm::cl::init(1.0)};
+
+  Option<double> annealingCoolingRate{
+      *this, "annealing-cooling-rate",
+      llvm::cl::desc("Multiplicative cooling rate used by the annealing task "
+                     "scheduler"),
+      llvm::cl::init(0.9)};
+
+  Option<int64_t> annealingStepsPerTemperature{
+      *this, "annealing-steps-per-temperature",
+      llvm::cl::desc("Number of perturbation attempts per annealing "
+                     "temperature"),
+      llvm::cl::init(32)};
 
   Option<std::string> summaryOutput{
       *this, "summary-output",
@@ -100,20 +139,58 @@ struct ScheduleTaskGraphPass
             *this, "schedule",
             llvm::cl::desc("Registered task graph scheduling algorithm to run"),
             llvm::cl::init("")),
-        randomSeed(*this, "random-seed",
-                   llvm::cl::desc(
-                       "Seed used by randomized task graph schedulers"),
-                   llvm::cl::init(0)),
-        greedyLookahead(
-            *this, "greedy-lookahead",
-            llvm::cl::desc("Future-island lookahead depth used by the greedy "
+        randomSeed(
+            *this, "random-seed",
+            llvm::cl::desc("Seed used by randomized task graph schedulers"),
+            llvm::cl::init(0)),
+        greedyHeuristic(
+            *this, "greedy-heuristic",
+            llvm::cl::desc("Heuristic terms used by the greedy task "
+                           "scheduler, joined with ',': transfer-cost, "
+                           "boundary-regret, compact-region, lookahead=N, "
+                           "beam=N, scope=NAME"),
+            llvm::cl::init("transfer-cost")),
+        annealingInitialSchedule(
+            *this, "annealing-initial-schedule",
+            llvm::cl::desc("Initial placement schedule used by the annealing "
+                           "task scheduler: identity, random, snake, or "
+                           "greedy"),
+            llvm::cl::init("snake")),
+        annealingMoveSet(
+            *this, "annealing-move-set",
+            llvm::cl::desc("Comma-separated simulated annealing perturbation "
+                           "moves or presets: basic, basic-wide, all, "
+                           "move-one-position, move-one-relocation, "
+                           "swap-two-positions, adjacent-swap, "
+                           "segment-reverse, segment-relocation, block-swap"),
+            llvm::cl::init("basic")),
+        annealingMoveRadius(
+            *this, "annealing-move-radius",
+            llvm::cl::desc("Maximum physical-array-order index distance for "
+                           "single-position annealing moves, or 0 for "
+                           "unbounded"),
+            llvm::cl::init(0)),
+        annealingInitialTemperature(
+            *this, "annealing-initial-temperature",
+            llvm::cl::desc("Initial temperature used by the annealing task "
+                           "scheduler, or 0 to infer it from the initial "
+                           "score"),
+            llvm::cl::init(0.0)),
+        annealingFinalTemperature(
+            *this, "annealing-final-temperature",
+            llvm::cl::desc(
+                "Final temperature used by the annealing task scheduler"),
+            llvm::cl::init(1.0)),
+        annealingCoolingRate(
+            *this, "annealing-cooling-rate",
+            llvm::cl::desc("Multiplicative cooling rate used by the annealing "
                            "task scheduler"),
-            llvm::cl::init(1)),
-        greedyCandidateScope(
-            *this, "greedy-candidate-scope",
-            llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
-                           "cardinal, diagonal, or producer-consumer"),
-            llvm::cl::init("diagonal")),
+            llvm::cl::init(0.9)),
+        annealingStepsPerTemperature(
+            *this, "annealing-steps-per-temperature",
+            llvm::cl::desc("Number of perturbation attempts per annealing "
+                           "temperature"),
+            llvm::cl::init(32)),
         summaryOutput(
             *this, "summary-output",
             llvm::cl::desc("Optional CSV path where the scheduler appends a "
@@ -126,8 +203,14 @@ struct ScheduleTaskGraphPass
     meshCols = pass.meshCols;
     schedule = pass.schedule;
     randomSeed = pass.randomSeed;
-    greedyLookahead = pass.greedyLookahead;
-    greedyCandidateScope = pass.greedyCandidateScope;
+    greedyHeuristic = pass.greedyHeuristic;
+    annealingInitialSchedule = pass.annealingInitialSchedule;
+    annealingMoveSet = pass.annealingMoveSet;
+    annealingMoveRadius = pass.annealingMoveRadius;
+    annealingInitialTemperature = pass.annealingInitialTemperature;
+    annealingFinalTemperature = pass.annealingFinalTemperature;
+    annealingCoolingRate = pass.annealingCoolingRate;
+    annealingStepsPerTemperature = pass.annealingStepsPerTemperature;
     summaryOutput = pass.summaryOutput;
   }
 

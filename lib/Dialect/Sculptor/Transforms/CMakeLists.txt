@@ -17,14 +17,27 @@ add_mlir_library(MLIRSculptorTransforms
   task_schedulers/TaskGraphIslandCommunication.cpp
   task_schedulers/TaskGraphIslandDigitalAssignment.cpp
   task_schedulers/TaskGraphPlacementUtils.cpp
+  task_schedulers/TaskGraphPlacementPlan.cpp
+  task_schedulers/TaskGraphPlacementObjective.cpp
+  task_schedulers/TaskGraphScheduleConfig.cpp
+  task_schedulers/TaskGraphPhysicalArrayOrders.cpp
   task_schedulers/TaskGraphResources.cpp
-  task_schedulers/TaskGraphScorer.cpp
-  task_schedulers/TaskGraphScheduleMetadata.cpp
+  task_schedulers/TaskGraphScheduler.cpp
+  task_graph/TaskGraphDAG.cpp
+  task_graph/TaskGraphCleanup.cpp
+  task_graph/TaskGraphScorer.cpp
+  task_graph/TaskGraphScheduleMetadata.cpp
   task_schedulers/MeshGeometry.cpp
-  task_schedulers/TaskGraphRoutineFuser.cpp
-  task_schedulers/GreedyPlacement.cpp
+  task_graph/TaskGraphRoutineFuser.cpp
+  task_schedulers/greedy/GreedyHeuristic.cpp
+  task_schedulers/greedy/GreedyCandidates.cpp
+  task_schedulers/greedy/GreedyBoundaryRepair.cpp
+  task_schedulers/greedy/GreedySearch.cpp
   task_schedulers/GreedyTaskScheduler.cpp
   task_schedulers/RandomTaskScheduler.cpp
+  task_schedulers/annealing/AnnealingMoves.cpp
+  task_schedulers/annealing/AnnealingSearch.cpp
+  task_schedulers/SimulatedAnnealingTaskScheduler.cpp
   task_schedulers/SnakeTaskScheduler.cpp
   canonicalizers/Conv1DCanonicalizer.cpp
   canonicalizers/Conv2DCanonicalizer.cpp

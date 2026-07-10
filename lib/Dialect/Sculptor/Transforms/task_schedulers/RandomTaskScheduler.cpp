@@ -1,10 +1,8 @@
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPhysicalArrayOrders.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
 
-#include <algorithm>
-#include <cstdint>
 #include <memory>
-#include <random>
 
 namespace {
 
@@ -15,23 +13,19 @@ class RandomTaskScheduler final
 public:
   mlir::StringRef getName() const final { return "random"; }
 
-  mlir::LogicalResult schedule(
-      mlir::ModuleOp module, mlir::func::FuncOp taskGraphFunc,
-      const mlir::sculptor::task_schedulers::HardwareBudget &budget,
-      const mlir::sculptor::task_schedulers::TaskGraphDAG &dag) const final {
-    if (budget.analogArrays.empty()) {
-      taskGraphFunc.emitError("expected random task scheduler to have at "
-                              "least one analog array");
+  mlir::FailureOr<task_schedulers::IslandPlacementPlan> buildPlacementPlan(
+      const task_schedulers::TaskGraphPlacementProblem &problem) const final {
+    if (problem.budget.analogArrays.empty()) {
+      problem.diagnosticOp->emitError(
+          "expected random task scheduler to have at least one analog array");
       return mlir::failure();
     }
 
-    llvm::SmallVector<int64_t, 8> shuffledAnalogArrays = budget.analogArrays;
-    std::mt19937 randomEngine(static_cast<uint32_t>(budget.randomSeed));
-    std::shuffle(shuffledAnalogArrays.begin(), shuffledAnalogArrays.end(),
-                 randomEngine);
+    llvm::SmallVector<int64_t, 8> shuffledAnalogArrays =
+        task_schedulers::buildRandomPhysicalArrayOrder(problem.budget);
 
-    return task_schedulers::placeLogicalPlacementIslands(
-        module, taskGraphFunc, budget, dag, shuffledAnalogArrays);
+    return task_schedulers::buildPlacementPlanFromPhysicalArrayOrder(
+        problem, shuffledAnalogArrays);
   }
 };
 

@@ -1,5 +1,5 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphRoutineFuser.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphDAG.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphRoutineFuser.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"

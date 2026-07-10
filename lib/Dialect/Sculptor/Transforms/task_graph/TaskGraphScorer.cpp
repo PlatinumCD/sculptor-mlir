@@ -1,4 +1,4 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScorer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScorer.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/MeshGeometry.h"

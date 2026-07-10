@@ -1,15 +1,15 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleMetadata.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScheduleMetadata.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScorer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScorer.h"
 
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Builders.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -63,9 +63,8 @@ static LogicalResult normalizeTaskPlacement(ModuleOp module,
       getOptionalI64Attr(taskOp, runtime_attrs::kTaskLocalArrayIdAttrName);
 
   if (physicalArrayId) {
-    auto placement =
-        resolvePhysicalArrayPlacement(taskOp.getOperation(), budget,
-                                      *physicalArrayId);
+    auto placement = resolvePhysicalArrayPlacement(taskOp.getOperation(),
+                                                   budget, *physicalArrayId);
     if (failed(placement))
       return failure();
 

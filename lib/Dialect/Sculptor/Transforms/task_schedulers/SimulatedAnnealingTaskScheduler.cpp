@@ -1,4 +1,5 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/GreedySearch.h"
+#include "annealing/AnnealingSearch.h"
+
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
 
 #include <memory>
@@ -6,22 +7,23 @@
 namespace {
 
 namespace task_schedulers = mlir::sculptor::task_schedulers;
+namespace annealing = task_schedulers::annealing_detail;
 
-class GreedyTaskScheduler final
-    : public mlir::sculptor::task_schedulers::TaskGraphScheduler {
+class SimulatedAnnealingTaskScheduler final
+    : public task_schedulers::TaskGraphScheduler {
 public:
-  mlir::StringRef getName() const final { return "greedy"; }
+  mlir::StringRef getName() const final { return "annealing"; }
 
   mlir::FailureOr<task_schedulers::IslandPlacementPlan> buildPlacementPlan(
       const task_schedulers::TaskGraphPlacementProblem &problem) const final {
     if (problem.budget.analogArrays.empty()) {
       problem.diagnosticOp->emitError(
-          "expected greedy task scheduler to have at least one analog array");
+          "expected simulated annealing task scheduler to have at least one "
+          "analog array");
       return mlir::failure();
     }
 
-    return task_schedulers::buildGreedyPlacementPlan(
-        problem, problem.budget.analogArrays);
+    return annealing::buildPlacementPlan(problem, problem.budget.annealing);
   }
 };
 
@@ -31,9 +33,10 @@ namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
 
-void registerGreedyTaskScheduler(TaskGraphSchedulerRegistry &registry) {
-  (void)registerTaskGraphScheduler(registry,
-                                   std::make_unique<GreedyTaskScheduler>());
+void registerSimulatedAnnealingTaskScheduler(
+    TaskGraphSchedulerRegistry &registry) {
+  (void)registerTaskGraphScheduler(
+      registry, std::make_unique<SimulatedAnnealingTaskScheduler>());
 }
 
 } // namespace task_schedulers

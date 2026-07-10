@@ -66,17 +66,56 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
       llvm::cl::desc("Registered task graph scheduling algorithm to run"),
       llvm::cl::init("")};
 
-  PassOptions::Option<int64_t> greedyLookahead{
-      *this, "greedy-lookahead",
-      llvm::cl::desc("Future-island lookahead depth used by the greedy task "
-                     "scheduler"),
-      llvm::cl::init(1)};
+  PassOptions::Option<std::string> greedyHeuristic{
+      *this, "greedy-heuristic",
+      llvm::cl::desc("Heuristic terms used by the greedy task scheduler, "
+                     "joined with ',': transfer-cost, boundary-regret, "
+                     "compact-region, lookahead=N, beam=N, scope=NAME"),
+      llvm::cl::init("transfer-cost")};
 
-  PassOptions::Option<std::string> greedyCandidateScope{
-      *this, "greedy-candidate-scope",
-      llvm::cl::desc("Candidate scope used by the greedy task scheduler: "
-                     "cardinal, diagonal, or producer-consumer"),
-      llvm::cl::init("diagonal")};
+  PassOptions::Option<std::string> annealingInitialSchedule{
+      *this, "annealing-initial-schedule",
+      llvm::cl::desc("Initial placement schedule used by the annealing task "
+                     "scheduler: identity, random, snake, or greedy"),
+      llvm::cl::init("snake")};
+
+  PassOptions::Option<std::string> annealingMoveSet{
+      *this, "annealing-move-set",
+      llvm::cl::desc("Comma-separated simulated annealing perturbation moves "
+                     "or presets: basic, basic-wide, all, "
+                     "move-one-position, move-one-relocation, "
+                     "swap-two-positions, adjacent-swap, segment-reverse, "
+                     "segment-relocation, block-swap"),
+      llvm::cl::init("basic")};
+
+  PassOptions::Option<int64_t> annealingMoveRadius{
+      *this, "annealing-move-radius",
+      llvm::cl::desc("Maximum physical-array-order index distance for "
+                     "single-position annealing moves, or 0 for unbounded"),
+      llvm::cl::init(0)};
+
+  PassOptions::Option<double> annealingInitialTemperature{
+      *this, "annealing-initial-temperature",
+      llvm::cl::desc("Initial temperature used by the annealing task "
+                     "scheduler, or 0 to infer it from the initial score"),
+      llvm::cl::init(0.0)};
+
+  PassOptions::Option<double> annealingFinalTemperature{
+      *this, "annealing-final-temperature",
+      llvm::cl::desc("Final temperature used by the annealing task scheduler"),
+      llvm::cl::init(1.0)};
+
+  PassOptions::Option<double> annealingCoolingRate{
+      *this, "annealing-cooling-rate",
+      llvm::cl::desc("Multiplicative cooling rate used by the annealing task "
+                     "scheduler"),
+      llvm::cl::init(0.9)};
+
+  PassOptions::Option<int64_t> annealingStepsPerTemperature{
+      *this, "annealing-steps-per-temperature",
+      llvm::cl::desc("Number of perturbation attempts per annealing "
+                     "temperature"),
+      llvm::cl::init(32)};
 };
 
 void buildSculptorLowerToGolemPipeline(
@@ -105,8 +144,18 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   scheduleTaskGraphPass->meshRows = options.meshRows;
   scheduleTaskGraphPass->meshCols = options.meshCols;
   scheduleTaskGraphPass->schedule = options.schedule;
-  scheduleTaskGraphPass->greedyLookahead = options.greedyLookahead;
-  scheduleTaskGraphPass->greedyCandidateScope = options.greedyCandidateScope;
+  scheduleTaskGraphPass->greedyHeuristic = options.greedyHeuristic;
+  scheduleTaskGraphPass->annealingInitialSchedule =
+      options.annealingInitialSchedule;
+  scheduleTaskGraphPass->annealingMoveSet = options.annealingMoveSet;
+  scheduleTaskGraphPass->annealingMoveRadius = options.annealingMoveRadius;
+  scheduleTaskGraphPass->annealingInitialTemperature =
+      options.annealingInitialTemperature;
+  scheduleTaskGraphPass->annealingFinalTemperature =
+      options.annealingFinalTemperature;
+  scheduleTaskGraphPass->annealingCoolingRate = options.annealingCoolingRate;
+  scheduleTaskGraphPass->annealingStepsPerTemperature =
+      options.annealingStepsPerTemperature;
   pm.addPass(std::move(scheduleTaskGraphPass));
 
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());

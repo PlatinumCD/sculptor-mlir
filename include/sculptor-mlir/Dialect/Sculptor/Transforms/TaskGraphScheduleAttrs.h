@@ -23,18 +23,26 @@ inline constexpr llvm::StringLiteral
     kAnalogArraysAttrName("sculptor.schedule.analog_arrays");
 inline constexpr llvm::StringLiteral
     kGreedyLookaheadAttrName("sculptor.schedule.greedy_lookahead");
-inline constexpr llvm::StringLiteral kGreedyCandidateScopeAttrName(
-    "sculptor.schedule.greedy_candidate_scope");
+inline constexpr llvm::StringLiteral
+    kGreedyBeamWidthAttrName("sculptor.schedule.greedy_beam_width");
+inline constexpr llvm::StringLiteral
+    kGreedyCandidateScopeAttrName("sculptor.schedule.greedy_candidate_scope");
+inline constexpr llvm::StringLiteral
+    kGreedyHeuristicAttrName("sculptor.schedule.greedy_heuristic");
+inline constexpr llvm::StringLiteral
+    kAnnealingMoveSetAttrName("sculptor.schedule.annealing_move_set");
+inline constexpr llvm::StringLiteral
+    kAnnealingMoveRadiusAttrName("sculptor.schedule.annealing_move_radius");
 inline constexpr llvm::StringLiteral
     kTaskCountAttrName("sculptor.schedule.task_count");
 inline constexpr llvm::StringLiteral
     kDependencyCountAttrName("sculptor.schedule.dependency_count");
-inline constexpr llvm::StringLiteral kCoreTransferBytesAttrName(
-    "sculptor.schedule.core_transfer_bytes");
+inline constexpr llvm::StringLiteral
+    kCoreTransferBytesAttrName("sculptor.schedule.core_transfer_bytes");
 inline constexpr llvm::StringLiteral kInterCoreTransferBytesAttrName(
     "sculptor.schedule.inter_core_transfer_bytes");
-inline constexpr llvm::StringLiteral kCoreTransferCostAttrName(
-    "sculptor.schedule.core_transfer_cost");
+inline constexpr llvm::StringLiteral
+    kCoreTransferCostAttrName("sculptor.schedule.core_transfer_cost");
 inline constexpr llvm::StringLiteral
     kTotalTransferCostAttrName("sculptor.schedule.total_transfer_cost");
 inline constexpr llvm::StringLiteral kTransferCostPerInterCoreByteAttrName(

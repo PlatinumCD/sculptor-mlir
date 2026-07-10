@@ -1,10 +1,9 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULER_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULER_H
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementPlan.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -23,9 +22,8 @@ public:
 
   virtual StringRef getName() const = 0;
 
-  virtual LogicalResult schedule(ModuleOp module, func::FuncOp taskGraphFunc,
-                                 const HardwareBudget &budget,
-                                 const TaskGraphDAG &dag) const = 0;
+  virtual FailureOr<IslandPlacementPlan>
+  buildPlacementPlan(const TaskGraphPlacementProblem &problem) const = 0;
 };
 
 using TaskGraphSchedulerRegistry =
@@ -42,6 +40,8 @@ lookupTaskGraphScheduler(const TaskGraphSchedulerRegistry &registry,
 void registerRandomTaskScheduler(TaskGraphSchedulerRegistry &registry);
 void registerSnakeTaskScheduler(TaskGraphSchedulerRegistry &registry);
 void registerGreedyTaskScheduler(TaskGraphSchedulerRegistry &registry);
+void registerSimulatedAnnealingTaskScheduler(
+    TaskGraphSchedulerRegistry &registry);
 
 } // namespace task_schedulers
 } // namespace sculptor

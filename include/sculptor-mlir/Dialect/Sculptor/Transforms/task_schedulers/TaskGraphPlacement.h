@@ -2,6 +2,7 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHPLACEMENT_H
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -32,14 +33,9 @@ LogicalResult attachTaskAnalogArrayPlacement(ModuleOp module,
                                              const HardwareBudget &budget,
                                              int64_t physicalArrayId);
 
-LogicalResult placeLogicalPlacementIslands(
-    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag, llvm::ArrayRef<int64_t> physicalArrayOrder);
-
-LogicalResult placeLogicalPlacementIslands(
-    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphDAG &dag, const LogicalPlacementIslandGraph &islandGraph,
-    llvm::ArrayRef<MatrixSetupGroupPlacement> groupPlacements);
+LogicalResult commitPlacementPlan(ModuleOp module, func::FuncOp taskGraphFunc,
+                                  const TaskGraphPlacementProblem &problem,
+                                  const IslandPlacementPlan &plan);
 
 } // namespace task_schedulers
 } // namespace sculptor
