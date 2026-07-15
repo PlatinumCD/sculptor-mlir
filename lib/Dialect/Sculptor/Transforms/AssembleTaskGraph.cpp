@@ -1,7 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
 
-// AssembleTaskGraph turns the lowered forward function into an executable
-// analog task graph.
+// AssembleTaskGraph turns the lowered forward function into a logical analog
+// task graph.
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyStep.h"
 
@@ -30,8 +30,8 @@ mlir::LogicalResult assembleTaskGraph(mlir::ModuleOp module,
 
     if (!taskGraphFunc) {
       taskGraphFunc =
-          mlir::sculptor::assembler_utils::lookupGeneratedTaskGraphFunc(module,
-                                                                      forward);
+          mlir::sculptor::assembler_utils::lookupGeneratedTaskGraphFunc(
+              module, forward);
     }
   }
 
@@ -41,21 +41,7 @@ mlir::LogicalResult assembleTaskGraph(mlir::ModuleOp module,
     return mlir::failure();
   }
 
-  return mlir::success();
-}
-
-mlir::LogicalResult assembleExecutablePlan(mlir::ModuleOp module,
-                                           mlir::func::FuncOp forward) {
-  mlir::sculptor::TaskGraphAssemblySteps steps;
-  mlir::sculptor::registerTaskGraphExecutionPlanAssembler(steps);
-
-  for (const auto &step : steps) {
-    if (failed(step->assemble(module, forward))) {
-      forward.emitError("failed to apply task graph assembly step '")
-          << step->getName() << "'";
-      return mlir::failure();
-    }
-  }
+  mlir::sculptor::assembler_utils::clearAssemblyAttrs(forward, taskGraphFunc);
 
   return mlir::success();
 }
@@ -71,15 +57,8 @@ void AssembleTaskGraphPass::runOnOperation() {
     if (func.getName() != "forward")
       continue;
 
-    // Build the task graph structure from the lowered forward body.
     mlir::func::FuncOp taskGraphFunc;
     if (failed(assembleTaskGraph(module, func, taskGraphFunc))) {
-      signalPassFailure();
-      return;
-    }
-
-    // Add execution-plan metadata needed by downstream task-graph execution.
-    if (failed(assembleExecutablePlan(module, func))) {
       signalPassFailure();
       return;
     }

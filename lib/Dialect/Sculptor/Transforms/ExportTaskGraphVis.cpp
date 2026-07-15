@@ -112,9 +112,10 @@ getTaskGraphResource(mlir::Operation &op) {
     return std::make_pair(input.getResult(), llvm::StringRef("input"));
   if (auto output = llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op))
     return std::make_pair(output.getResult(), llvm::StringRef("output"));
-  if (auto temporary =
-          llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
-    return std::make_pair(temporary.getResult(), llvm::StringRef("temporary"));
+  if (auto intermediate =
+          llvm::dyn_cast<mlir::sculptor::TaskGraphIntermediateOp>(&op))
+    return std::make_pair(intermediate.getResult(),
+                          llvm::StringRef("intermediate"));
   if (auto persistent =
           llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op))
     return std::make_pair(persistent.getResult(),

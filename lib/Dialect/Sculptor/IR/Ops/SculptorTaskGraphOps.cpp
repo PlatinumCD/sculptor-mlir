@@ -26,7 +26,7 @@ bool belongsToSameGraph(TaskCreateOp taskOp, Value resourceValue) {
 bool isValidTaskResource(TaskCreateOp taskOp, Value resourceValue) {
   return belongsToSameGraph<TaskGraphInputOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphOutputOp>(taskOp, resourceValue) ||
-         belongsToSameGraph<TaskGraphTemporaryOp>(taskOp, resourceValue) ||
+         belongsToSameGraph<TaskGraphIntermediateOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphPersistentOp>(taskOp, resourceValue);
 }
 
@@ -39,7 +39,7 @@ LogicalResult verifyTaskResources(TaskCreateOp taskOp, ValuesT resources,
       return taskOp.emitOpError("expected ")
              << name << " to be produced by sculptor.task_graph.input, "
              << "sculptor.task_graph.output, or "
-             << "sculptor.task_graph.temporary, or "
+             << "sculptor.task_graph.intermediate, or "
              << "sculptor.task_graph.persistent in the same graph";
     }
   }

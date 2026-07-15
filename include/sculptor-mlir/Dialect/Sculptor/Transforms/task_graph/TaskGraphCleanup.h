@@ -7,14 +7,14 @@
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 
 LogicalResult
-eraseUnusedTaskGraphTemporaryResources(func::FuncOp taskGraphFunc);
+eraseUnusedTaskGraphIntermediateResources(func::FuncOp taskGraphFunc);
 
 void eraseUnusedTaskCallees(ModuleOp module);
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir
 

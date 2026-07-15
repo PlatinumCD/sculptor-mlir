@@ -14,7 +14,15 @@ public:
   mlir::StringRef getName() const final { return "random"; }
 
   mlir::FailureOr<task_schedulers::IslandPlacementPlan> buildPlacementPlan(
-      const task_schedulers::TaskGraphPlacementProblem &problem) const final {
+      const task_schedulers::TaskGraphPlacementProblem &problem,
+      const task_schedulers::TaskGraphSchedulerOptions &options) const final {
+    const auto *random =
+        std::get_if<task_schedulers::RandomSchedulerOptions>(&options);
+    if (!random) {
+      problem.diagnosticOp->emitError(
+          "random scheduler received incompatible scheduler options");
+      return mlir::failure();
+    }
     if (problem.budget.analogArrays.empty()) {
       problem.diagnosticOp->emitError(
           "expected random task scheduler to have at least one analog array");
@@ -22,7 +30,8 @@ public:
     }
 
     llvm::SmallVector<int64_t, 8> shuffledAnalogArrays =
-        task_schedulers::buildRandomPhysicalArrayOrder(problem.budget);
+        task_schedulers::buildRandomPhysicalArrayOrder(problem.budget,
+                                                       random->randomSeed);
 
     return task_schedulers::buildPlacementPlanFromPhysicalArrayOrder(
         problem, shuffledAnalogArrays);

@@ -60,7 +60,7 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral kLogicalArrayToAnalogArrayAttrName(
     "sculptor.schedule.logical_array_to_analog_array");
 inline constexpr llvm::StringLiteral
-    kIslandIndexAttrName("sculptor.schedule.island");
+    kIslandIdAttrName("sculptor.schedule.island_id");
 
 } // namespace schedule_attrs
 } // namespace sculptor

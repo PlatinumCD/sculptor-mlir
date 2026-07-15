@@ -183,13 +183,13 @@ public:
           return mlir::failure();
         }
 
-        auto temporaryResource =
-            rewriter.create<mlir::sculptor::TaskGraphTemporaryOp>(
+        auto intermediateResource =
+            rewriter.create<mlir::sculptor::TaskGraphIntermediateOp>(
                 call.getLoc(), *resourceType, graph.getResult());
-        temporaryResource->setAttr(
+        intermediateResource->setAttr(
             mlir::sculptor::assembler_utils::kForwardCallIndexAttrName,
             rewriter.getI64IntegerAttr(indexedCall.index()));
-        temporaryResource->setAttr(
+        intermediateResource->setAttr(
             mlir::sculptor::assembler_utils::kForwardResultIndexAttrName,
             rewriter.getI64IntegerAttr(indexedResult.index()));
       }

@@ -1,10 +1,12 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphSimModel.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -30,6 +32,7 @@ namespace {
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
+namespace timing_attrs = mlir::sculptor::timing_attrs;
 
 bool isAnalogArrayOp(mlir::Operation *op) {
   llvm::StringRef opName = op->getName().getStringRef();
@@ -82,6 +85,32 @@ struct AnalogOpModel {
   std::string name;
 };
 
+struct TaskTimingModel {
+  std::optional<int64_t> topologicalIndex;
+  std::optional<int64_t> dependencyDepth;
+  std::optional<int64_t> incomingDataBytes;
+  std::optional<int64_t> outgoingDataBytes;
+  std::optional<double> analogLoadLatencyNs;
+  std::optional<double> analogExecuteLatencyNs;
+  std::optional<double> analogStoreLatencyNs;
+  std::optional<double> intrinsicLatencyNs;
+  std::optional<double> earliestStartNs;
+  std::optional<double> earliestFinishNs;
+  std::optional<double> incomingNetworkDelayNs;
+  std::optional<double> criticalPathRemainingNs;
+  std::optional<bool> isCritical;
+};
+
+struct NetworkEdgeTimingModel {
+  int64_t sourceCore = -1;
+  int64_t destinationCore = -1;
+  int64_t hops = 0;
+  double transferStartNs = 0.0;
+  double transferFinishNs = 0.0;
+  double latencyNs = 0.0;
+  double contentionDelayNs = 0.0;
+};
+
 struct TaskModel {
   mlir::sculptor::TaskCreateOp op;
   int64_t index = 0;
@@ -93,12 +122,34 @@ struct TaskModel {
   uint64_t sourceTaskOrdinal = 0;
   int64_t coreId = 0;
   int64_t digitalOps = 0;
+  std::optional<int64_t> islandId;
   std::optional<int64_t> physicalArrayId;
   std::optional<int64_t> localArrayId;
+  TaskTimingModel timing;
   llvm::SmallVector<int64_t> inputResourceIds;
   llvm::SmallVector<int64_t> outputResourceIds;
   llvm::SmallVector<int64_t> dependencyTaskIndices;
   llvm::SmallVector<AnalogOpModel, 4> analogOps;
+};
+
+struct GraphTimingModel {
+  std::optional<int64_t> taskCount;
+  std::optional<int64_t> executionEdgeCount;
+  std::optional<int64_t> executionDepth;
+  std::optional<int64_t> totalDataBytes;
+  std::optional<double> criticalPathNs;
+  std::optional<bool> placementAware;
+  std::optional<double> totalNetworkLatencyNs;
+  std::optional<double> totalNetworkContentionDelayNs;
+  std::optional<int64_t> analogMVMLatencyNs;
+  std::optional<int64_t> analogIOBitsPerCycle;
+  std::optional<bool> analogIOShared;
+  std::optional<double> digitalClockGHz;
+  std::optional<int64_t> digitalIssueWidth;
+  std::optional<int64_t> digitalVectorBitsPerCycle;
+  std::optional<int64_t> networkLinkBitsPerCycle;
+  std::optional<int64_t> networkHopLatencyCycles;
+  std::optional<bool> networkPipelined;
 };
 
 struct IoBoundaryModel {
@@ -116,13 +167,20 @@ struct GraphModel {
   std::string name;
   HardwareModel hardware;
   SummaryModel summary;
+  GraphTimingModel timing;
   std::optional<IoBoundaryModel> ioBoundary;
   llvm::SmallVector<ResourceModel, 0> resources;
   llvm::SmallVector<TaskModel, 0> tasks;
   llvm::DenseMap<mlir::Value, int64_t> resourceIdByValue;
   llvm::DenseMap<mlir::Value, int64_t> taskIndexByResult;
   llvm::DenseMap<mlir::Value, int64_t> producerTaskIndexByResource;
+  llvm::DenseMap<uint64_t, NetworkEdgeTimingModel> networkTimingByTaskPair;
 };
+
+uint64_t getTaskPairKey(int64_t producer, int64_t consumer) {
+  return (static_cast<uint64_t>(producer) << 32) |
+         static_cast<uint32_t>(consumer);
+}
 
 bool returnsTaskGraph(mlir::func::FuncOp func) {
   auto functionType = func.getFunctionType();
@@ -152,6 +210,20 @@ std::optional<int64_t> getOptionalI64Attr(mlir::Operation *op,
                                           llvm::StringRef attrName) {
   if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(attrName))
     return attr.getInt();
+  return std::nullopt;
+}
+
+std::optional<double> getOptionalF64Attr(mlir::Operation *op,
+                                         llvm::StringRef attrName) {
+  if (auto attr = op->getAttrOfType<mlir::FloatAttr>(attrName))
+    return attr.getValueAsDouble();
+  return std::nullopt;
+}
+
+std::optional<bool> getOptionalBoolAttr(mlir::Operation *op,
+                                        llvm::StringRef attrName) {
+  if (auto attr = op->getAttrOfType<mlir::BoolAttr>(attrName))
+    return attr.getValue();
   return std::nullopt;
 }
 
@@ -285,15 +357,88 @@ mlir::FailureOr<SummaryModel> buildSummaryModel(mlir::func::FuncOp func) {
   return summary;
 }
 
+GraphTimingModel buildGraphTimingModel(mlir::func::FuncOp func) {
+  GraphTimingModel timing;
+  timing.taskCount = getOptionalI64Attr(func, timing_attrs::kTaskCountAttrName);
+  timing.executionEdgeCount =
+      getOptionalI64Attr(func, timing_attrs::kExecutionEdgeCountAttrName);
+  timing.executionDepth =
+      getOptionalI64Attr(func, timing_attrs::kExecutionDepthAttrName);
+  timing.totalDataBytes =
+      getOptionalI64Attr(func, timing_attrs::kTotalDataBytesAttrName);
+  timing.criticalPathNs =
+      getOptionalF64Attr(func, timing_attrs::kCriticalPathNsAttrName);
+  timing.placementAware =
+      getOptionalBoolAttr(func, timing_attrs::kPlacementAwareAttrName);
+  timing.totalNetworkLatencyNs =
+      getOptionalF64Attr(func, timing_attrs::kTotalNetworkLatencyNsAttrName);
+  timing.totalNetworkContentionDelayNs = getOptionalF64Attr(
+      func, timing_attrs::kTotalNetworkContentionDelayNsAttrName);
+  if (auto model = func->getAttrOfType<mlir::sculptor::TimingModelAttr>(
+          timing_attrs::kTimingModelAttrName)) {
+    timing.analogMVMLatencyNs = model.getAnalogMVMLatencyNs().getInt();
+    timing.analogIOBitsPerCycle = model.getAnalogIOBitsPerCycle().getInt();
+    timing.analogIOShared = model.getAnalogIOShared().getValue();
+    timing.digitalClockGHz = model.getDigitalClockGHz().getValueAsDouble();
+    timing.digitalIssueWidth = model.getDigitalIssueWidth().getInt();
+    timing.digitalVectorBitsPerCycle =
+        model.getDigitalVectorBitsPerCycle().getInt();
+    timing.networkLinkBitsPerCycle =
+        model.getNetworkLinkBitsPerCycle().getInt();
+    timing.networkHopLatencyCycles =
+        model.getNetworkHopLatencyCycles().getInt();
+    timing.networkPipelined = model.getNetworkPipelined().getValue();
+  }
+  return timing;
+}
+
+mlir::LogicalResult collectNetworkEdgeTiming(
+    mlir::func::FuncOp func,
+    llvm::DenseMap<uint64_t, NetworkEdgeTimingModel> &timingByTaskPair) {
+  auto edgeAttrs =
+      func->getAttrOfType<mlir::ArrayAttr>(timing_attrs::kNetworkEdgesAttrName);
+  if (!edgeAttrs)
+    return mlir::success();
+
+  for (mlir::Attribute element : edgeAttrs) {
+    auto edge = llvm::dyn_cast<mlir::sculptor::NetworkEdgeTimingAttr>(element);
+    if (!edge) {
+      func.emitError("expected '")
+          << timing_attrs::kNetworkEdgesAttrName
+          << "' to contain #sculptor.network_edge_timing records";
+      return mlir::failure();
+    }
+    int64_t producer = edge.getProducerTask().getInt();
+    int64_t consumer = edge.getConsumerTask().getInt();
+    uint64_t key = getTaskPairKey(producer, consumer);
+    if (!timingByTaskPair
+             .try_emplace(key,
+                          NetworkEdgeTimingModel{
+                              edge.getSourceCore().getInt(),
+                              edge.getDestinationCore().getInt(),
+                              edge.getMeshHops().getInt(),
+                              edge.getTransferStartNs().getValueAsDouble(),
+                              edge.getTransferFinishNs().getValueAsDouble(),
+                              edge.getNetworkLatencyNs().getValueAsDouble(),
+                              edge.getContentionDelayNs().getValueAsDouble()})
+             .second) {
+      func.emitError("expected unique network timing task pairs");
+      return mlir::failure();
+    }
+  }
+  return mlir::success();
+}
+
 std::optional<std::pair<mlir::Value, llvm::StringRef>>
 getTaskGraphResource(mlir::Operation &op) {
   if (auto input = llvm::dyn_cast<mlir::sculptor::TaskGraphInputOp>(&op))
     return std::make_pair(input.getResult(), llvm::StringRef("input"));
   if (auto output = llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op))
     return std::make_pair(output.getResult(), llvm::StringRef("output"));
-  if (auto temporary =
-          llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op))
-    return std::make_pair(temporary.getResult(), llvm::StringRef("temporary"));
+  if (auto intermediate =
+          llvm::dyn_cast<mlir::sculptor::TaskGraphIntermediateOp>(&op))
+    return std::make_pair(intermediate.getResult(),
+                          llvm::StringRef("intermediate"));
   if (auto persistent =
           llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op))
     return std::make_pair(persistent.getResult(),
@@ -418,6 +563,34 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
     task.sourceTaskOrdinal = taskOp.getSourceTaskOrdinal();
     task.coreId = *coreId;
     task.digitalOps = *digitalOps;
+    task.islandId =
+        getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
+    task.timing.topologicalIndex =
+        getOptionalI64Attr(taskOp, timing_attrs::kTopologicalIndexAttrName);
+    task.timing.dependencyDepth =
+        getOptionalI64Attr(taskOp, timing_attrs::kDependencyDepthAttrName);
+    task.timing.incomingDataBytes =
+        getOptionalI64Attr(taskOp, timing_attrs::kIncomingDataBytesAttrName);
+    task.timing.outgoingDataBytes =
+        getOptionalI64Attr(taskOp, timing_attrs::kOutgoingDataBytesAttrName);
+    task.timing.analogLoadLatencyNs =
+        getOptionalF64Attr(taskOp, timing_attrs::kAnalogLoadLatencyNsAttrName);
+    task.timing.analogExecuteLatencyNs = getOptionalF64Attr(
+        taskOp, timing_attrs::kAnalogExecuteLatencyNsAttrName);
+    task.timing.analogStoreLatencyNs =
+        getOptionalF64Attr(taskOp, timing_attrs::kAnalogStoreLatencyNsAttrName);
+    task.timing.intrinsicLatencyNs =
+        getOptionalF64Attr(taskOp, timing_attrs::kIntrinsicLatencyNsAttrName);
+    task.timing.earliestStartNs =
+        getOptionalF64Attr(taskOp, timing_attrs::kEarliestStartNsAttrName);
+    task.timing.earliestFinishNs =
+        getOptionalF64Attr(taskOp, timing_attrs::kEarliestFinishNsAttrName);
+    task.timing.incomingNetworkDelayNs = getOptionalF64Attr(
+        taskOp, timing_attrs::kIncomingNetworkDelayNsAttrName);
+    task.timing.criticalPathRemainingNs = getOptionalF64Attr(
+        taskOp, timing_attrs::kCriticalPathRemainingNsAttrName);
+    task.timing.isCritical =
+        getOptionalBoolAttr(taskOp, timing_attrs::kIsCriticalAttrName);
     auto callee = module.lookupSymbol<mlir::func::FuncOp>(
         taskOp.getCalleeAttr().getValue());
     if (!callee) {
@@ -581,6 +754,7 @@ mlir::FailureOr<GraphModel> buildGraphModel(mlir::ModuleOp module,
     return mlir::failure();
   graph.hardware = std::move(*hardware);
   graph.summary = std::move(*summary);
+  graph.timing = buildGraphTimingModel(func);
 
   auto resources = collectResources(func, graph.hardware, graph.summary,
                                     graph.resourceIdByValue);
@@ -594,6 +768,10 @@ mlir::FailureOr<GraphModel> buildGraphModel(mlir::ModuleOp module,
   if (mlir::failed(tasks))
     return mlir::failure();
   graph.tasks = std::move(*tasks);
+
+  if (mlir::failed(
+          collectNetworkEdgeTiming(func, graph.networkTimingByTaskPair)))
+    return mlir::failure();
 
   auto ioBoundary = buildIoBoundaryModel(func, graph);
   if (mlir::failed(ioBoundary))
@@ -610,6 +788,24 @@ void emitOptionalI64Attr(llvm::json::OStream &json, llvm::StringRef key,
     return;
   }
 
+  json.attribute(key, nullptr);
+}
+
+void emitOptionalF64Attr(llvm::json::OStream &json, llvm::StringRef key,
+                         std::optional<double> value) {
+  if (value) {
+    json.attribute(key, *value);
+    return;
+  }
+  json.attribute(key, nullptr);
+}
+
+void emitOptionalBoolAttr(llvm::json::OStream &json, llvm::StringRef key,
+                          std::optional<bool> value) {
+  if (value) {
+    json.attribute(key, *value);
+    return;
+  }
   json.attribute(key, nullptr);
 }
 
@@ -704,6 +900,30 @@ void emitSculptorOps(llvm::json::OStream &json,
   });
 }
 
+void emitTaskTiming(llvm::json::OStream &json, const TaskTimingModel &timing) {
+  json.attributeObject("timing", [&] {
+    emitOptionalI64Attr(json, "topological_index", timing.topologicalIndex);
+    emitOptionalI64Attr(json, "dependency_depth", timing.dependencyDepth);
+    emitOptionalI64Attr(json, "incoming_data_bytes", timing.incomingDataBytes);
+    emitOptionalI64Attr(json, "outgoing_data_bytes", timing.outgoingDataBytes);
+    emitOptionalF64Attr(json, "analog_load_latency_ns",
+                        timing.analogLoadLatencyNs);
+    emitOptionalF64Attr(json, "analog_execute_latency_ns",
+                        timing.analogExecuteLatencyNs);
+    emitOptionalF64Attr(json, "analog_store_latency_ns",
+                        timing.analogStoreLatencyNs);
+    emitOptionalF64Attr(json, "intrinsic_latency_ns",
+                        timing.intrinsicLatencyNs);
+    emitOptionalF64Attr(json, "earliest_start_ns", timing.earliestStartNs);
+    emitOptionalF64Attr(json, "earliest_finish_ns", timing.earliestFinishNs);
+    emitOptionalF64Attr(json, "incoming_network_delay_ns",
+                        timing.incomingNetworkDelayNs);
+    emitOptionalF64Attr(json, "critical_path_remaining_ns",
+                        timing.criticalPathRemainingNs);
+    emitOptionalBoolAttr(json, "is_critical", timing.isCritical);
+  });
+}
+
 void emitTasks(llvm::json::OStream &json, llvm::ArrayRef<TaskModel> tasks) {
   json.attributeArray("tasks", [&] {
     for (const TaskModel &task : tasks) {
@@ -717,9 +937,11 @@ void emitTasks(llvm::json::OStream &json, llvm::ArrayRef<TaskModel> tasks) {
         json.attribute("source_task_ordinal",
                        static_cast<int64_t>(task.sourceTaskOrdinal));
         json.attribute("core_id", task.coreId);
+        emitOptionalI64Attr(json, "island_id", task.islandId);
         emitOptionalI64Attr(json, "physical_array_id", task.physicalArrayId);
         emitOptionalI64Attr(json, "local_array_id", task.localArrayId);
         json.attribute("digital_ops", task.digitalOps);
+        emitTaskTiming(json, task.timing);
         emitSculptorOps(json, task.analogOps);
         emitTaskResourceIds(json, "inputs", task.inputResourceIds);
         emitTaskResourceIds(json, "outputs", task.outputResourceIds);
@@ -807,6 +1029,8 @@ void emitDataEdges(llvm::json::OStream &json, const GraphModel &graph) {
         int64_t meshDistance =
             getMeshDistance(sourceCore, destinationCore, graph.hardware);
         int64_t transferCost = byteSize * meshDistance;
+        auto networkTiming = graph.networkTimingByTaskPair.find(
+            getTaskPairKey(producerIndex, consumer.index));
 
         json.object([&] {
           json.attribute("id", edgeId++);
@@ -819,6 +1043,16 @@ void emitDataEdges(llvm::json::OStream &json, const GraphModel &graph) {
           json.attribute("mesh_distance", meshDistance);
           json.attribute("transfer_cost", transferCost);
           json.attribute("inter_core", sourceCore != destinationCore);
+          if (networkTiming != graph.networkTimingByTaskPair.end()) {
+            const NetworkEdgeTimingModel &timing = networkTiming->second;
+            json.attribute("network_hops", timing.hops);
+            json.attribute("network_transfer_start_ns", timing.transferStartNs);
+            json.attribute("network_transfer_finish_ns",
+                           timing.transferFinishNs);
+            json.attribute("network_latency_ns", timing.latencyNs);
+            json.attribute("network_contention_delay_ns",
+                           timing.contentionDelayNs);
+          }
         });
       }
     }
@@ -844,6 +1078,40 @@ void emitSummary(llvm::json::OStream &json, const SummaryModel &summary) {
   });
 }
 
+void emitGraphTiming(llvm::json::OStream &json,
+                     const GraphTimingModel &timing) {
+  json.attributeObject("timing", [&] {
+    emitOptionalI64Attr(json, "task_count", timing.taskCount);
+    emitOptionalI64Attr(json, "execution_edge_count",
+                        timing.executionEdgeCount);
+    emitOptionalI64Attr(json, "execution_depth", timing.executionDepth);
+    emitOptionalI64Attr(json, "total_data_bytes", timing.totalDataBytes);
+    emitOptionalF64Attr(json, "critical_path_ns", timing.criticalPathNs);
+    emitOptionalBoolAttr(json, "placement_aware", timing.placementAware);
+    emitOptionalF64Attr(json, "total_network_latency_ns",
+                        timing.totalNetworkLatencyNs);
+    emitOptionalF64Attr(json, "total_network_contention_delay_ns",
+                        timing.totalNetworkContentionDelayNs);
+    json.attributeObject("model", [&] {
+      emitOptionalI64Attr(json, "analog_mvm_latency_ns",
+                          timing.analogMVMLatencyNs);
+      emitOptionalI64Attr(json, "analog_io_bits_per_cycle",
+                          timing.analogIOBitsPerCycle);
+      emitOptionalBoolAttr(json, "analog_io_shared", timing.analogIOShared);
+      emitOptionalF64Attr(json, "digital_clock_ghz", timing.digitalClockGHz);
+      emitOptionalI64Attr(json, "digital_issue_width",
+                          timing.digitalIssueWidth);
+      emitOptionalI64Attr(json, "digital_vector_bits_per_cycle",
+                          timing.digitalVectorBitsPerCycle);
+      emitOptionalI64Attr(json, "network_link_bits_per_cycle",
+                          timing.networkLinkBitsPerCycle);
+      emitOptionalI64Attr(json, "network_hop_latency_cycles",
+                          timing.networkHopLatencyCycles);
+      emitOptionalBoolAttr(json, "network_pipelined", timing.networkPipelined);
+    });
+  });
+}
+
 void emitGraph(llvm::json::OStream &json, const GraphModel &graph) {
   json.object([&] {
     json.attribute("name", graph.name);
@@ -854,6 +1122,7 @@ void emitGraph(llvm::json::OStream &json, const GraphModel &graph) {
     emitControlEdges(json, graph.tasks);
     emitDataEdges(json, graph);
     emitSummary(json, graph.summary);
+    emitGraphTiming(json, graph.timing);
   });
 }
 

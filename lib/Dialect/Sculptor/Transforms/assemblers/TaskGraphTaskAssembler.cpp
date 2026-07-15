@@ -302,8 +302,8 @@ mlir::LogicalResult collectResourceByValue(
       continue;
     }
 
-    if (auto temporaryResource =
-            llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op)) {
+    if (auto intermediateResource =
+            llvm::dyn_cast<mlir::sculptor::TaskGraphIntermediateOp>(&op)) {
       auto callIndex = getIndexAttrValue(
           &op, mlir::sculptor::assembler_utils::kForwardCallIndexAttrName);
       if (failed(callIndex))
@@ -326,7 +326,7 @@ mlir::LogicalResult collectResourceByValue(
       }
 
       resourceByValue[call.getResult(*resultIndex)] =
-          temporaryResource.getResult();
+          intermediateResource.getResult();
     }
   }
 

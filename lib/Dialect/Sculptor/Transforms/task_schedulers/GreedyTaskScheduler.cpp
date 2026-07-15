@@ -13,7 +13,15 @@ public:
   mlir::StringRef getName() const final { return "greedy"; }
 
   mlir::FailureOr<task_schedulers::IslandPlacementPlan> buildPlacementPlan(
-      const task_schedulers::TaskGraphPlacementProblem &problem) const final {
+      const task_schedulers::TaskGraphPlacementProblem &problem,
+      const task_schedulers::TaskGraphSchedulerOptions &options) const final {
+    const auto *greedy =
+        std::get_if<task_schedulers::GreedySchedulerOptions>(&options);
+    if (!greedy) {
+      problem.diagnosticOp->emitError(
+          "greedy scheduler received incompatible scheduler options");
+      return mlir::failure();
+    }
     if (problem.budget.analogArrays.empty()) {
       problem.diagnosticOp->emitError(
           "expected greedy task scheduler to have at least one analog array");
@@ -21,7 +29,7 @@ public:
     }
 
     return task_schedulers::buildGreedyPlacementPlan(
-        problem, problem.budget.analogArrays);
+        problem, problem.budget.analogArrays, greedy->greedy);
   }
 };
 

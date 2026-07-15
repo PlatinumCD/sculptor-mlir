@@ -1,8 +1,9 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScorer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScorer.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/MeshGeometry.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Support/LogicalResult.h"
@@ -33,11 +34,12 @@ namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
 
-FailureOr<TaskGraphScore>
-MeshTaskGraphScorer::score(ModuleOp module, func::FuncOp taskGraphFunc,
-                           const HardwareBudget &budget,
-                           const TaskGraphDAG &dag) const {
+FailureOr<TaskGraphScore> MeshTaskGraphScorer::score(
+    ModuleOp module, func::FuncOp taskGraphFunc, const HardwareBudget &budget,
+    const TaskGraphDAG &dag, const LogicalPlacementIslandGraph &islandGraph,
+    const PlacementConstraints &constraints) const {
   (void)module;
+  (void)islandGraph;
 
   if (budget.topology != "mesh") {
     taskGraphFunc.emitError("expected mesh topology for task graph scorer");
@@ -86,33 +88,43 @@ MeshTaskGraphScorer::score(ModuleOp module, func::FuncOp taskGraphFunc,
       if (*sourceCore == *destinationCore)
         continue;
 
-      int64_t byteSize = getResourceByteSize(input);
+      FailureOr<int64_t> byteSize = getTaskResourceByteSize(input);
+      if (failed(byteSize)) {
+        consumerOp.emitError(
+            "expected task inputs to be statically sized task resources");
+        return failure();
+      }
       int64_t meshDistance =
           getMeshDistance(*sourceCore, *destinationCore, budget);
-      int64_t transferCost = byteSize * meshDistance;
+      int64_t transferCost = *byteSize * meshDistance;
 
       if (recordDenseCoreTransfers) {
         size_t transferIndex = static_cast<size_t>(
             *sourceCore * budget.numCores + *destinationCore);
-        result.coreTransferBytes[transferIndex] += byteSize;
+        result.coreTransferBytes[transferIndex] += *byteSize;
         result.coreTransferCost[transferIndex] += transferCost;
       }
-      result.interCoreTransferBytes += byteSize;
+      result.interCoreTransferBytes += *byteSize;
       result.totalTransferCost += transferCost;
       result.score += transferCost;
     }
   }
 
-  if (!dag.nodes.empty()) {
-    sculptor::TaskCreateOp firstTask = dag.nodes.front().op;
-    sculptor::TaskCreateOp lastTask = dag.nodes.back().op;
-    auto firstCore =
-        getRequiredI64Attr(firstTask, runtime_attrs::kTaskCoreIdAttrName);
-    auto lastCore =
-        getRequiredI64Attr(lastTask, runtime_attrs::kTaskCoreIdAttrName);
+  if (constraints.sharedEndpointBoundary) {
+    const SharedMeshBoundaryConstraint &boundary =
+        *constraints.sharedEndpointBoundary;
+    if (boundary.startTask >= dag.nodes.size() ||
+        boundary.terminalTask >= dag.nodes.size()) {
+      taskGraphFunc.emitError(
+          "placement boundary constraint references an unknown task");
+      return failure();
+    }
+    auto firstCore = getRequiredI64Attr(dag.nodes[boundary.startTask].op,
+                                        runtime_attrs::kTaskCoreIdAttrName);
+    auto lastCore = getRequiredI64Attr(dag.nodes[boundary.terminalTask].op,
+                                       runtime_attrs::kTaskCoreIdAttrName);
     if (failed(firstCore) || failed(lastCore))
       return failure();
-
     unsigned firstBoundaryMask = getMeshBoundaryMask(*firstCore, budget);
     unsigned lastBoundaryMask = getMeshBoundaryMask(*lastCore, budget);
     if ((firstBoundaryMask & lastBoundaryMask) == 0) {

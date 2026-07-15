@@ -2,10 +2,14 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/EmitRuntimeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/FinalizeGolemIntrinsics.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/AnalyzeTaskGraphTiming.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
@@ -60,6 +64,52 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
       llvm::cl::desc(
           "Number of columns in a mesh topology, or 0 to infer from cores"),
       llvm::cl::init(0)};
+
+  PassOptions::Option<int64_t> analogMVMLatencyNs{
+      *this, "analog-mvm-latency-ns",
+      llvm::cl::desc(
+          "Fixed latency of one analog MVM operation in nanoseconds"),
+      llvm::cl::init(100)};
+
+  PassOptions::Option<int64_t> analogIOBitsPerCycle{
+      *this, "analog-io-bits-per-cycle",
+      llvm::cl::desc("Analog load/store bandwidth in bits per cycle"),
+      llvm::cl::init(256)};
+
+  PassOptions::Option<bool> analogIOShared{
+      *this, "analog-io-shared",
+      llvm::cl::desc("Whether analog loads and stores share one bandwidth"),
+      llvm::cl::init(true)};
+
+  PassOptions::Option<double> digitalClockGHz{
+      *this, "digital-clock-ghz",
+      llvm::cl::desc("Digital processor clock frequency in gigahertz"),
+      llvm::cl::init(1.0)};
+
+  PassOptions::Option<int64_t> digitalIssueWidth{
+      *this, "digital-issue-width",
+      llvm::cl::desc("Maximum scalar digital operations issued per cycle"),
+      llvm::cl::init(2)};
+
+  PassOptions::Option<int64_t> digitalVectorBitsPerCycle{
+      *this, "digital-vector-bits-per-cycle",
+      llvm::cl::desc("Maximum digital vector throughput in bits per cycle"),
+      llvm::cl::init(256)};
+
+  PassOptions::Option<int64_t> networkLinkBitsPerCycle{
+      *this, "network-link-bits-per-cycle",
+      llvm::cl::desc("Network link bandwidth in bits per cycle"),
+      llvm::cl::init(32)};
+
+  PassOptions::Option<int64_t> networkHopLatencyCycles{
+      *this, "network-hop-latency-cycles",
+      llvm::cl::desc("Network forwarding latency per hop in cycles"),
+      llvm::cl::init(1)};
+
+  PassOptions::Option<bool> networkPipelined{
+      *this, "network-pipelined",
+      llvm::cl::desc("Whether communication across network hops is pipelined"),
+      llvm::cl::init(true)};
 
   PassOptions::Option<std::string> schedule{
       *this, "schedule",
@@ -136,6 +186,22 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
     OpPassManager &pm,
     const SculptorLowerGolemToTaskGraphPipelineOptions &options) {
   pm.addPass(std::make_unique<AssembleTaskGraphPass>());
+  pm.addPass(std::make_unique<BuildTaskGraphIslandsPass>());
+
+  auto createTimingPass = [&options]() {
+    auto pass = std::make_unique<AnalyzeTaskGraphTimingPass>();
+    pass->analogMVMLatencyNs = options.analogMVMLatencyNs;
+    pass->analogIOBitsPerCycle = options.analogIOBitsPerCycle;
+    pass->analogIOShared = options.analogIOShared;
+    pass->digitalClockGHz = options.digitalClockGHz;
+    pass->digitalIssueWidth = options.digitalIssueWidth;
+    pass->digitalVectorBitsPerCycle = options.digitalVectorBitsPerCycle;
+    pass->networkLinkBitsPerCycle = options.networkLinkBitsPerCycle;
+    pass->networkHopLatencyCycles = options.networkHopLatencyCycles;
+    pass->networkPipelined = options.networkPipelined;
+    return pass;
+  };
+  pm.addPass(createTimingPass());
 
   auto scheduleTaskGraphPass = std::make_unique<ScheduleTaskGraphPass>();
   scheduleTaskGraphPass->cores = options.cores;
@@ -157,6 +223,10 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   scheduleTaskGraphPass->annealingStepsPerTemperature =
       options.annealingStepsPerTemperature;
   pm.addPass(std::move(scheduleTaskGraphPass));
+
+  pm.addPass(std::make_unique<FuseTaskGraphPass>());
+  pm.addPass(createTimingPass());
+  pm.addPass(std::make_unique<FinalizeTaskGraphResourcesPass>());
 
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());
 }

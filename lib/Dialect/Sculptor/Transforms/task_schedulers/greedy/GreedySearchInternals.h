@@ -3,6 +3,7 @@
 
 #include "GreedyHeuristic.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementPlan.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleConfig.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -31,6 +32,13 @@ struct PlacementState {
   int64_t score = 0;
 };
 
+struct ExpansionRequest {
+  unsigned island = 0;
+  unsigned placementIndex = 0;
+  unsigned totalPlacementCount = 0;
+  bool pruneCandidates = false;
+};
+
 FailureOr<CorePhysicalArraySlots>
 buildCorePhysicalArraySlots(Operation *diagnosticOp,
                             const HardwareBudget &budget,
@@ -46,25 +54,23 @@ bool isBetterChoice(
     const HardwareBudget &budget,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland);
 
-bool applyCandidate(PlacementState &state, const TaskGraphNode &setupNode,
-                    unsigned island, int64_t candidateCore,
+bool applyCandidate(PlacementState &state, unsigned island,
+                    int64_t candidateCore,
                     const CorePhysicalArraySlots &physicalArraysByCore);
 
 llvm::SmallVector<PlacementState, 16> expandState(
-    const PlacementState &state, unsigned setupIndex,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
-    const HardwareBudget &budget, const GreedyHeuristic &heuristic,
+    const PlacementState &state, const ExpansionRequest &request,
+    const HardwareBudget &budget, const GreedyScheduleConfig &config,
+    const GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland, bool pruneCandidates);
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const PlacementConstraints &constraints);
 
 void repairBoundaryRegretPlacement(
     llvm::SmallVectorImpl<IslandPlacement> &islandPlacements,
     const HardwareBudget &budget, llvm::ArrayRef<int64_t> physicalArrayOrder,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland);
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const PlacementConstraints &constraints);
 
 } // namespace greedy_detail
 } // namespace task_schedulers

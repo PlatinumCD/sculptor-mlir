@@ -14,7 +14,14 @@ public:
   mlir::StringRef getName() const final { return "snake"; }
 
   mlir::FailureOr<task_schedulers::IslandPlacementPlan> buildPlacementPlan(
-      const task_schedulers::TaskGraphPlacementProblem &problem) const final {
+      const task_schedulers::TaskGraphPlacementProblem &problem,
+      const task_schedulers::TaskGraphSchedulerOptions &options) const final {
+    if (!std::holds_alternative<task_schedulers::SnakeSchedulerOptions>(
+            options)) {
+      problem.diagnosticOp->emitError(
+          "snake scheduler received incompatible scheduler options");
+      return mlir::failure();
+    }
     llvm::SmallVector<int64_t, 8> physicalArrayOrder =
         task_schedulers::buildSnakePhysicalArrayOrder(problem.budget);
 

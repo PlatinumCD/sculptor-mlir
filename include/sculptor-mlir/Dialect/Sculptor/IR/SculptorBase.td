@@ -8,9 +8,11 @@ include "mlir/IR/OpBase.td"
 def Sculptor_Dialect : Dialect {
   let name = "sculptor";
   let cppNamespace = "::mlir::sculptor";
+  let useDefaultAttributePrinterParser = 1;
 
   let extraClassDeclaration = [{
     void registerTypes();
+    void registerAttributes();
     void registerOps();
     ::mlir::Type parseType(::mlir::DialectAsmParser &parser) const;
     void printType(::mlir::Type type, ::mlir::DialectAsmPrinter &printer) const;

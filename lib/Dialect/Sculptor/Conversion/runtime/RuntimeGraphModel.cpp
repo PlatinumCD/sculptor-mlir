@@ -84,8 +84,8 @@ getResourceStorageAndValue(Operation &op) {
     return std::make_pair(STORAGE_INPUT, inputOp.getResult());
   if (auto outputOp = dyn_cast<TaskGraphOutputOp>(&op))
     return std::make_pair(STORAGE_OUTPUT, outputOp.getResult());
-  if (auto tempOp = dyn_cast<TaskGraphTemporaryOp>(&op))
-    return std::make_pair(STORAGE_TEMP, tempOp.getResult());
+  if (auto intermediateOp = dyn_cast<TaskGraphIntermediateOp>(&op))
+    return std::make_pair(STORAGE_TEMP, intermediateOp.getResult());
   if (auto persistentOp = dyn_cast<TaskGraphPersistentOp>(&op))
     return std::make_pair(STORAGE_PERSISTENT, persistentOp.getResult());
   return std::nullopt;

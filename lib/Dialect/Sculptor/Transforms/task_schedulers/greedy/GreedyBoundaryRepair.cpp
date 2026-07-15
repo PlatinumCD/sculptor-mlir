@@ -44,14 +44,11 @@ buildCoreByIsland(llvm::ArrayRef<IslandPlacement> islandPlacements,
 static task_schedulers::IslandPlacementScore scoreIslandPlacement(
     llvm::ArrayRef<IslandPlacement> islandPlacements,
     const task_schedulers::HardwareBudget &budget,
-    llvm::ArrayRef<task_schedulers::LogicalIslandCommunicationEdge>
-        islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland) {
+    llvm::ArrayRef<task_schedulers::IslandAffinityEdge> islandAffinityEdges,
+    const task_schedulers::PlacementConstraints &constraints) {
   return task_schedulers::evaluateIslandCorePlacement(
-      budget, islandCommunicationEdges,
-      buildCoreByIsland(islandPlacements, budget), firstTaskIsland,
-      lastTaskIsland);
+      budget, islandAffinityEdges, buildCoreByIsland(islandPlacements, budget),
+      constraints);
 }
 
 } // namespace
@@ -64,14 +61,17 @@ namespace greedy_detail {
 void repairBoundaryRegretPlacement(
     llvm::SmallVectorImpl<IslandPlacement> &islandPlacements,
     const HardwareBudget &budget, llvm::ArrayRef<int64_t> physicalArrayOrder,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland) {
-  if (!firstTaskIsland || !lastTaskIsland || islandPlacements.empty())
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const PlacementConstraints &constraints) {
+  if (!constraints.sharedEndpointBoundary || islandPlacements.empty())
+    return;
+  const SharedMeshBoundaryConstraint &boundary =
+      *constraints.sharedEndpointBoundary;
+  if (!boundary.islands)
     return;
 
-  std::optional<unsigned> terminalPlacementIndex =
-      findIslandPlacementIndex(islandPlacements, *lastTaskIsland);
+  std::optional<unsigned> terminalPlacementIndex = findIslandPlacementIndex(
+      islandPlacements, boundary.islands->terminalIsland);
   if (!terminalPlacementIndex)
     return;
 
@@ -81,8 +81,8 @@ void repairBoundaryRegretPlacement(
 
   llvm::DenseMap<unsigned, int64_t> coreByIsland =
       buildCoreByIsland(islandPlacements, budget);
-  auto firstCoreIt = coreByIsland.find(*firstTaskIsland);
-  auto lastCoreIt = coreByIsland.find(*lastTaskIsland);
+  auto firstCoreIt = coreByIsland.find(boundary.islands->startIsland);
+  auto lastCoreIt = coreByIsland.find(boundary.islands->terminalIsland);
   if (firstCoreIt == coreByIsland.end() || lastCoreIt == coreByIsland.end())
     return;
 
@@ -91,9 +91,8 @@ void repairBoundaryRegretPlacement(
   if (firstBoundaryMask == 0 || (firstBoundaryMask & lastBoundaryMask) != 0)
     return;
 
-  IslandPlacementScore bestScore =
-      scoreIslandPlacement(islandPlacements, budget, islandCommunicationEdges,
-                           firstTaskIsland, lastTaskIsland);
+  IslandPlacementScore bestScore = scoreIslandPlacement(
+      islandPlacements, budget, islandAffinityEdges, constraints);
   int64_t bestPhysicalArrayId =
       islandPlacements[*terminalPlacementIndex].physicalArrayId;
 
@@ -112,8 +111,7 @@ void repairBoundaryRegretPlacement(
     candidatePlacements[*terminalPlacementIndex].physicalArrayId =
         candidatePhysicalArrayId;
     IslandPlacementScore candidateScore = scoreIslandPlacement(
-        candidatePlacements, budget, islandCommunicationEdges, firstTaskIsland,
-        lastTaskIsland);
+        candidatePlacements, budget, islandAffinityEdges, constraints);
     if (candidateScore.total > bestScore.total)
       continue;
     if (candidateScore.total == bestScore.total &&

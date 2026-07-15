@@ -1,10 +1,9 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTaskKinds.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
@@ -17,8 +16,9 @@
 
 namespace {
 
+namespace task_graph = mlir::sculptor::task_graph;
+
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
-namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_schedulers = mlir::sculptor::task_schedulers;
 
 using TaskGraphNode = mlir::sculptor::task_schedulers::TaskGraphNode;
@@ -233,7 +233,6 @@ static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
     const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
     const llvm::DenseMap<unsigned, int64_t> &physicalArrayByMatrixSetupTask,
     const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
-  mlir::Builder builder(module.getContext());
   llvm::StringMap<int64_t> coreIdBySourceLayer;
   llvm::StringSet<> ambiguousSourceLayers;
 
@@ -254,8 +253,6 @@ static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
 
     int64_t physicalArrayId = physicalArrayIt->second;
     mlir::sculptor::TaskCreateOp setupTask = setupNode->op;
-    setupTask->setAttr(schedule_attrs::kIslandIndexAttrName,
-                       builder.getI64IntegerAttr(setupNode->index));
     auto placement = task_schedulers::resolvePhysicalArrayPlacement(
         setupTask.getOperation(), budget, physicalArrayId);
     if (mlir::failed(placement))
@@ -273,8 +270,6 @@ static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
         continue;
 
       const TaskGraphNode &mvmNode = dag.nodes[mvmTaskIndex];
-      mvmNode.op->setAttr(schedule_attrs::kIslandIndexAttrName,
-                          builder.getI64IntegerAttr(setupNode->index));
       if (mlir::failed(task_schedulers::attachTaskAnalogArrayPlacement(
               module, mvmNode.op, budget, physicalArrayId)))
         return mlir::failure();
@@ -293,11 +288,8 @@ static mlir::LogicalResult materializeMatrixSetupIslandPlacements(
       continue;
 
     mlir::sculptor::TaskCreateOp taskOp = dag.nodes[taskIndex].op;
-    if (getCoreIdAttr(taskOp) || !task_schedulers::isDigitalTask(taskOp))
+    if (getCoreIdAttr(taskOp) || !task_graph::isDigitalTask(taskOp))
       continue;
-
-    taskOp->setAttr(schedule_attrs::kIslandIndexAttrName,
-                    builder.getI64IntegerAttr(setupTaskIndex));
 
     auto physicalArrayIt = physicalArrayByMatrixSetupTask.find(setupTaskIndex);
     if (physicalArrayIt == physicalArrayByMatrixSetupTask.end())

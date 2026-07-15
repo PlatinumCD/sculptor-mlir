@@ -1,27 +1,11 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTaskKinds.h"
-
-#include "mlir/IR/BuiltinAttributes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
-
-namespace runtime_attrs = mlir::sculptor::runtime_attrs;
-
-int64_t getResourceByteSize(Value resource) {
-  Operation *resourceOp = resource.getDefiningOp();
-  if (!resourceOp)
-    return 0;
-
-  auto byteSizeAttr = resourceOp->getAttrOfType<IntegerAttr>(
-      runtime_attrs::kResourceByteSizeAttrName);
-  if (!byteSizeAttr)
-    return 0;
-  return byteSizeAttr.getInt();
-}
+namespace task_graph {
 
 LogicalResult
 collectResourceProducers(const TaskGraphDAG &dag,
@@ -75,7 +59,13 @@ collectResourceEdges(const TaskGraphDAG &dag) {
       ResourceEdge edge;
       edge.producerIndex = producerIt->second;
       edge.consumerIndex = consumer.index;
-      edge.byteSize = getResourceByteSize(input);
+      FailureOr<int64_t> byteSize = getTaskResourceByteSize(input);
+      if (failed(byteSize)) {
+        consumerTask.emitError(
+            "expected task inputs to be statically sized task resources");
+        return failure();
+      }
+      edge.byteSize = *byteSize;
       edges.push_back(edge);
     }
   }
@@ -93,6 +83,6 @@ collectMatrixSetupTasks(const TaskGraphDAG &dag) {
   return matrixSetupTasks;
 }
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

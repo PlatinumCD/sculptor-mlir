@@ -1,9 +1,10 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/GreedySearch.h"
 
+#include "GreedySearchEngine.h"
 #include "GreedySearchInternals.h"
 
 #include "GreedyHeuristic.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -18,89 +19,11 @@ namespace task_schedulers = mlir::sculptor::task_schedulers;
 namespace greedy = task_schedulers::greedy_detail;
 
 using TaskGraphNode = task_schedulers::TaskGraphNode;
-using IslandCommunicationEdge = task_schedulers::LogicalIslandCommunicationEdge;
+using IslandAffinityEdge = task_schedulers::IslandAffinityEdge;
 
-struct GreedyLookaheadChoice {
-  int64_t coreId = -1;
-  int64_t score = 0;
-};
-
-static mlir::FailureOr<GreedyLookaheadChoice> chooseLookaheadPlacement(
-    unsigned setupIndex, int64_t remainingLookahead,
-    const greedy::PlacementState &state,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
-    const task_schedulers::HardwareBudget &budget,
-    const task_schedulers::GreedyHeuristic &heuristic,
-    const greedy::CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland) {
-  if (setupIndex >= matrixSetupTasks.size() || remainingLookahead <= 0) {
-    return GreedyLookaheadChoice{
-        state.currentCore,
-        heuristic.evaluate(task_schedulers::GreedyHeuristicContext{
-            budget, islandCommunicationEdges, state.coreByPlacedIsland,
-            /*activeIsland=*/0, setupIndex,
-            static_cast<unsigned>(matrixSetupTasks.size()), firstTaskIsland,
-            lastTaskIsland, std::nullopt})};
-  }
-
-  llvm::SmallVector<greedy::PlacementState, 16> expandedStates =
-      greedy::expandState(state, setupIndex, matrixSetupTasks, budget,
-                          heuristic, physicalArraysByCore,
-                          islandCommunicationEdges, firstTaskIsland,
-                          lastTaskIsland,
-                          /*pruneCandidates=*/remainingLookahead > 1);
-  if (expandedStates.empty())
-    return mlir::failure();
-
-  bool hasBest = false;
-  GreedyLookaheadChoice best;
-  for (const greedy::PlacementState &expandedState : expandedStates) {
-    int64_t candidateScore = expandedState.score;
-    if (remainingLookahead > 1 && setupIndex + 1 < matrixSetupTasks.size()) {
-      auto futureChoice = chooseLookaheadPlacement(
-          setupIndex + 1, remainingLookahead - 1, expandedState,
-          matrixSetupTasks, budget, heuristic, physicalArraysByCore,
-          islandCommunicationEdges, firstTaskIsland, lastTaskIsland);
-      if (mlir::failed(futureChoice))
-        continue;
-      candidateScore = futureChoice->score;
-    }
-
-    if (greedy::isBetterChoice(
-            hasBest, candidateScore, expandedState.currentCore, best.score,
-            best.coreId, state.currentCore, budget, state.coreByPlacedIsland)) {
-      hasBest = true;
-      best.coreId = expandedState.currentCore;
-      best.score = candidateScore;
-    }
-  }
-
-  if (!hasBest)
-    return mlir::failure();
-  return best;
-}
-
-static mlir::FailureOr<llvm::SmallVector<greedy::IslandPlacement, 8>>
-buildBeamIslandPlacements(
-    mlir::func::FuncOp taskGraphFunc,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
-    const task_schedulers::HardwareBudget &budget,
-    const task_schedulers::GreedyHeuristic &heuristic,
-    const greedy::CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland) {
-  unsigned beamWidth = static_cast<unsigned>(budget.greedy.beamWidth);
-  llvm::SmallVector<greedy::PlacementState, 8> states;
-
-  greedy::PlacementState initialState;
-  initialState.usedSlotsByCore.assign(static_cast<size_t>(budget.numCores), 0);
-  states.push_back(std::move(initialState));
-
-  auto compareStates = [&](const greedy::PlacementState &lhs,
-                           const greedy::PlacementState &rhs) {
+static bool comparePlacementStates(
+    const greedy::PlacementState &lhs, const greedy::PlacementState &rhs,
+    const task_schedulers::HardwareBudget &budget) {
     if (lhs.score != rhs.score)
       return lhs.score < rhs.score;
 
@@ -111,60 +34,37 @@ buildBeamIslandPlacements(
     if (lhsRegionDistance != rhsRegionDistance)
       return lhsRegionDistance < rhsRegionDistance;
     return lhs.currentCore < rhs.currentCore;
-  };
+}
 
-  auto pruneStates =
-      [&](llvm::SmallVectorImpl<greedy::PlacementState> &nextStates) {
-        llvm::sort(nextStates, compareStates);
-        if (nextStates.size() <= beamWidth)
-          return;
+static void prunePlacementBeam(
+    llvm::SmallVectorImpl<greedy::PlacementState> &states,
+    unsigned beamWidth, const task_schedulers::HardwareBudget &budget) {
+  llvm::sort(states, [&](const greedy::PlacementState &lhs,
+                         const greedy::PlacementState &rhs) {
+    return comparePlacementStates(lhs, rhs, budget);
+  });
+  if (states.size() <= beamWidth)
+    return;
 
-        llvm::SmallVector<greedy::PlacementState, 8> prunedStates;
-        llvm::DenseSet<int64_t> selectedCurrentCores;
-        prunedStates.reserve(beamWidth);
-
-        for (const greedy::PlacementState &state : nextStates) {
-          if (prunedStates.size() >= beamWidth)
-            break;
-          if (!selectedCurrentCores.insert(state.currentCore).second)
-            continue;
-          prunedStates.push_back(state);
-        }
-
-        for (const greedy::PlacementState &state : nextStates) {
-          if (prunedStates.size() >= beamWidth)
-            break;
-          prunedStates.push_back(state);
-        }
-        nextStates = std::move(prunedStates);
-      };
-
-  for (auto indexedSetup : llvm::enumerate(matrixSetupTasks)) {
-    unsigned setupIndex = static_cast<unsigned>(indexedSetup.index());
-    llvm::SmallVector<greedy::PlacementState, 16> nextStates;
-
-    for (const greedy::PlacementState &state : states) {
-      llvm::SmallVector<greedy::PlacementState, 16> expandedStates =
-          greedy::expandState(state, setupIndex, matrixSetupTasks, budget,
-                              heuristic, physicalArraysByCore,
-                              islandCommunicationEdges, firstTaskIsland,
-                              lastTaskIsland, /*pruneCandidates=*/true);
-      nextStates.append(std::make_move_iterator(expandedStates.begin()),
-                        std::make_move_iterator(expandedStates.end()));
-    }
-
-    if (nextStates.empty()) {
-      taskGraphFunc.emitError("failed to find an available core for greedy "
-                              "beam island placement");
-      return mlir::failure();
-    }
-
-    pruneStates(nextStates);
-    states = std::move(nextStates);
+  llvm::SmallVector<greedy::PlacementState, 8> selected;
+  llvm::SmallVector<bool, 16> wasSelected(states.size(), false);
+  llvm::DenseSet<int64_t> selectedCurrentCores;
+  selected.reserve(beamWidth);
+  for (auto indexedState : llvm::enumerate(states)) {
+    if (selected.size() >= beamWidth)
+      break;
+    if (!selectedCurrentCores.insert(indexedState.value().currentCore).second)
+      continue;
+    selected.push_back(indexedState.value());
+    wasSelected[indexedState.index()] = true;
   }
-
-  llvm::sort(states, compareStates);
-  return states.front().islandPlacements;
+  for (auto indexedState : llvm::enumerate(states)) {
+    if (selected.size() >= beamWidth)
+      break;
+    if (!wasSelected[indexedState.index()])
+      selected.push_back(indexedState.value());
+  }
+  states = std::move(selected);
 }
 
 static mlir::FailureOr<llvm::SmallVector<greedy::IslandPlacement, 8>>
@@ -172,11 +72,11 @@ buildIslandPlacements(
     mlir::func::FuncOp taskGraphFunc,
     llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
     const task_schedulers::HardwareBudget &budget,
+    const task_schedulers::GreedyScheduleConfig &config,
     const task_schedulers::GreedyHeuristic &heuristic,
     llvm::ArrayRef<int64_t> physicalArrayOrder,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland) {
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const task_schedulers::PlacementConstraints &constraints) {
   if (matrixSetupTasks.empty())
     return llvm::SmallVector<greedy::IslandPlacement, 8>();
 
@@ -193,70 +93,67 @@ buildIslandPlacements(
   if (mlir::failed(physicalArraysByCore))
     return mlir::failure();
 
-  llvm::SmallVector<unsigned, 16> emptyUsedSlotsByCore(
-      static_cast<size_t>(budget.numCores), 0);
   if ((*physicalArraysByCore)[0].empty()) {
     taskGraphFunc.emitError("expected greedy island placement to have an "
                             "available analog array on core 0");
     return mlir::failure();
   }
 
-  bool repairBoundary = budget.greedy.boundaryRegret;
-  if (budget.greedy.beamWidth > 1) {
-    auto beamIslandPlacements = buildBeamIslandPlacements(
-        taskGraphFunc, matrixSetupTasks, budget, heuristic,
-        *physicalArraysByCore, islandCommunicationEdges, firstTaskIsland,
-        lastTaskIsland);
-    if (mlir::failed(beamIslandPlacements))
-      return mlir::failure();
+  auto isComplete = [&](const greedy::PlacementState &state) {
+    return state.islandPlacements.size() == matrixSetupTasks.size();
+  };
+  auto expand = [&](const greedy::PlacementState &state,
+                    bool recursivePruning) {
+    unsigned placementIndex = state.islandPlacements.size();
+    if (placementIndex >= matrixSetupTasks.size())
+      return llvm::SmallVector<greedy::PlacementState, 16>{};
+    unsigned island = matrixSetupTasks[placementIndex]->index;
+    greedy::ExpansionRequest request{
+        island, placementIndex,
+        static_cast<unsigned>(matrixSetupTasks.size()), recursivePruning};
+    return greedy::expandState(state, request, budget, config, heuristic,
+                               *physicalArraysByCore, islandAffinityEdges,
+                               constraints);
+  };
 
-    if (repairBoundary)
-      greedy::repairBoundaryRegretPlacement(
-          *beamIslandPlacements, budget, physicalArrayOrder,
-          islandCommunicationEdges, firstTaskIsland, lastTaskIsland);
-    return *beamIslandPlacements;
+  greedy::PlacementState initialState;
+  initialState.usedSlotsByCore.assign(static_cast<size_t>(budget.numCores), 0);
+  initialState.islandPlacements.reserve(matrixSetupTasks.size());
+
+  mlir::FailureOr<greedy::PlacementState> finalState =
+      config.beamWidth > 1
+          ? greedy::runBeamSearch(
+                std::move(initialState),
+                static_cast<unsigned>(config.beamWidth), isComplete,
+                expand,
+                [&](llvm::SmallVectorImpl<greedy::PlacementState> &states,
+                    unsigned beamWidth) {
+                  prunePlacementBeam(states, beamWidth, budget);
+                })
+          : greedy::runLookaheadSearch<greedy::PlacementState, int64_t>(
+                std::move(initialState), config.lookahead, isComplete,
+                expand,
+                [](const greedy::PlacementState &state) { return state.score; },
+                [&](int64_t candidateScore,
+                    const greedy::PlacementState &candidate, bool hasBest,
+                    int64_t bestScore, const greedy::PlacementState &best,
+                    const greedy::PlacementState &parent) {
+                  return greedy::isBetterChoice(
+                      hasBest, candidateScore, candidate.currentCore,
+                      bestScore, best.currentCore, parent.currentCore, budget,
+                      parent.coreByPlacedIsland);
+                });
+  if (mlir::failed(finalState)) {
+    taskGraphFunc.emitError(
+        "failed to find an available core for greedy island placement");
+    return mlir::failure();
   }
 
-  greedy::PlacementState state;
-  state.usedSlotsByCore.assign(static_cast<size_t>(budget.numCores), 0);
-  state.islandPlacements.reserve(matrixSetupTasks.size());
-  for (auto indexedSetup : llvm::enumerate(matrixSetupTasks)) {
-    const TaskGraphNode *setupNode = indexedSetup.value();
-    unsigned island = setupNode->index;
-
-    auto selected = chooseLookaheadPlacement(
-        static_cast<unsigned>(indexedSetup.index()), budget.greedy.lookahead,
-        state, matrixSetupTasks, budget, heuristic, *physicalArraysByCore,
-        islandCommunicationEdges, firstTaskIsland, lastTaskIsland);
-    if (mlir::failed(selected)) {
-      taskGraphFunc.emitError("failed to find an available core for greedy "
-                              "island placement");
-      return mlir::failure();
-    }
-
-    if (!greedy::applyCandidate(state, *setupNode, island, selected->coreId,
-                                *physicalArraysByCore)) {
-      taskGraphFunc.emitError("failed to commit selected greedy island "
-                              "placement candidate");
-      return mlir::failure();
-    }
-    state.score = selected->score;
-  }
-
-  if (repairBoundary)
+  if (config.boundaryRegret)
     greedy::repairBoundaryRegretPlacement(
-        state.islandPlacements, budget, physicalArrayOrder,
-        islandCommunicationEdges, firstTaskIsland, lastTaskIsland);
-  return state.islandPlacements;
-}
-
-static std::optional<unsigned> lookupIslandForTask(
-    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
-    unsigned taskIndex) {
-  auto islandIt = islandGraph.islandByTaskIndex.find(taskIndex);
-  if (islandIt == islandGraph.islandByTaskIndex.end())
-    return std::nullopt;
-  return islandIt->second;
+        finalState->islandPlacements, budget, physicalArrayOrder,
+        islandAffinityEdges, constraints);
+  return finalState->islandPlacements;
 }
 
 } // namespace
@@ -267,7 +164,8 @@ namespace task_schedulers {
 
 FailureOr<IslandPlacementPlan>
 buildGreedyPlacementPlan(const TaskGraphPlacementProblem &problem,
-                         llvm::ArrayRef<int64_t> physicalArrayOrder) {
+                         llvm::ArrayRef<int64_t> physicalArrayOrder,
+                         const GreedyScheduleConfig &config) {
   llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks =
       collectMatrixSetupTasks(problem.dag);
   if (!matrixSetupTasks.empty() && physicalArrayOrder.empty()) {
@@ -277,23 +175,15 @@ buildGreedyPlacementPlan(const TaskGraphPlacementProblem &problem,
     return failure();
   }
 
-  CompositeGreedyHeuristic heuristic(problem.budget.greedy.specification,
-                                     problem.budget.greedy.boundaryRegret,
-                                     problem.budget.greedy.compactRegion);
-
-  std::optional<unsigned> firstTaskIsland;
-  std::optional<unsigned> lastTaskIsland;
-  if (!problem.dag.nodes.empty()) {
-    firstTaskIsland = lookupIslandForTask(problem.islandGraph,
-                                          problem.dag.nodes.front().index);
-    lastTaskIsland = lookupIslandForTask(problem.islandGraph,
-                                         problem.dag.nodes.back().index);
-  }
+  CompositeGreedyHeuristic heuristic(config.specification,
+                                     config.boundaryRegret,
+                                     config.compactRegion);
 
   auto islandPlacements = buildIslandPlacements(
-      problem.taskGraphFunc, matrixSetupTasks, problem.budget, heuristic,
-      physicalArrayOrder, problem.islandGraph.communicationEdges,
-      firstTaskIsland, lastTaskIsland);
+      problem.taskGraphFunc, matrixSetupTasks, problem.budget, config,
+      heuristic,
+      physicalArrayOrder, problem.islandGraph.affinityGraph.edges,
+      problem.constraints);
   if (failed(islandPlacements))
     return failure();
 

@@ -42,8 +42,8 @@ registered scheduler name. The current tree provides several placement
 strategies, including `random`, `snake`, and `greedy`. Registered schedulers use
 min-cut digital placement with local digital-task refinement by default. After
 the selected strategy places matrix setup/MVM groups and related digital work,
-the pass fuses same-core task components, scores the graph on the configured
-mesh, and recomputes the runtime resource layout.
+separate passes fuse same-island components and finalize the surviving runtime
+resource layout.
 
 ### `sculptor-lower-to-golem`
 
@@ -60,7 +60,9 @@ This pipeline turns model-level IR into task-shaped Golem IR.
    standard tensor, linalg, math, or control-flow glue.
 4. `sculptor-expand-mvm-to-golem`
    Expands each `sculptor.mvm` into Golem array setup, vector tiling, array
-   execution, store, and recombine task regions.
+   execution, store, and recombine task regions. Matrix and vector tiles retain
+   their physical padded dimensions, while MVM stores and recombination expose
+   only the valid logical output rows.
 5. `sculptor-materialize-tasks`
    Turns `sculptor.task_region` boundaries into private task functions with task
    metadata, then rewrites `forward` to call those tasks.
@@ -73,13 +75,24 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
    Builds `generate_task_graph` with `sculptor.task_graph.*` resources and
    `sculptor.task.create` nodes. The materialized `forward` function may still
    be present at this point as a direct call form of the same tasks.
-2. `sculptor-schedule-task-graph`
-   Attaches task order, core assignment, logical array placement, transfer
-   metadata, a graph score, same-core routine fusion, final schedule metadata,
-   and runtime resource layout. Once the task graph is the live representation,
-   the pass removes the stale materialized `forward` entry point and unused
-   generated task callees.
-3. `sculptor-lower-golem-to-llvm-shims`
+2. `sculptor-build-task-graph-islands`
+   Builds logical placement islands and attaches stable island IDs without
+   assigning physical cores or arrays.
+3. `sculptor-analyze-task-graph-timing`
+   Combines explicit task dependencies with resource producer-consumer edges,
+   validates the resulting execution DAG, and attaches timing metadata used by
+   `greedy-timing` and preserved for post-fusion reporting. Standalone ordinary
+   schedulers do not require this pass before scheduling.
+4. `sculptor-schedule-task-graph`
+   Consumes the prebuilt islands, assigns cores and arrays, and records transfer
+   metadata and the placement score without changing graph topology.
+5. `sculptor-fuse-task-graph`
+   Fuses connected tasks only when they share both a logical island and a core,
+   then removes task callees and intermediate resources made dead by fusion.
+6. `sculptor-finalize-task-graph-resources`
+   Assigns runtime task indices, resource slots, intermediate offsets, and the
+   final workspace size after topology-changing passes have finished.
+7. `sculptor-lower-golem-to-llvm-shims`
    Rewrites scheduled Golem array operations into LLVM-callable runtime shim
    calls.
 
@@ -93,7 +106,11 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
 | `sculptor-expand-mvm-to-golem` | `sculptor.mvm` inside layer/helper functions. | Golem array setup, vector tiling, array execution, store, and recombine task regions. |
 | `sculptor-materialize-tasks` | `sculptor.task_region` boundaries. | Private task functions with task metadata, called from `forward`. |
 | `sculptor-assemble-task-graph` | A `forward` function that calls materialized task functions. | Materialized task functions plus `generate_task_graph` with `sculptor.task_graph.*` resources and `sculptor.task.create` nodes. |
-| `sculptor-schedule-task-graph` | An assembled task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
+| `sculptor-build-task-graph-islands` | An assembled task graph. | Placement-island members annotated with stable logical island IDs. |
+| `sculptor-analyze-task-graph-timing` | An island-annotated task graph. | Task-level execution order and latency metadata plus graph critical-path and island-work summaries. |
+| `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
+| `sculptor-fuse-task-graph` | A scheduled task graph with island and core assignments. | Same-island, same-core components outlined as fused task routines. |
+| `sculptor-finalize-task-graph-resources` | A scheduled graph whose topology is final. | Runtime slots, task indices, intermediate offsets, and workspace metadata. |
 | `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions containing Golem array operations. | Calls to LLVM-callable Golem runtime shims. |
 
 ### Export And Runtime Passes
@@ -204,7 +221,7 @@ runtime metadata.
 | Operation family | Operations |
 |---|---|
 | Graph construction | `sculptor.task_graph.create` |
-| Graph resources | `sculptor.task_graph.input`, `sculptor.task_graph.output`, `sculptor.task_graph.temporary`, `sculptor.task_graph.persistent` |
+| Graph resources | `sculptor.task_graph.input`, `sculptor.task_graph.output`, `sculptor.task_graph.intermediate`, `sculptor.task_graph.persistent` |
 | Task nodes | `sculptor.task.create` |
 
 The task graph IR makes dependencies and resources explicit. Each task records

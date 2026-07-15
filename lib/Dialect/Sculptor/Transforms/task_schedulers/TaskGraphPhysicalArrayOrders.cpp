@@ -28,10 +28,11 @@ buildIdentityPhysicalArrayOrder(const HardwareBudget &budget) {
 }
 
 llvm::SmallVector<int64_t, 8>
-buildRandomPhysicalArrayOrder(const HardwareBudget &budget) {
+buildRandomPhysicalArrayOrder(const HardwareBudget &budget,
+                              int64_t randomSeed) {
   llvm::SmallVector<int64_t, 8> physicalArrayOrder =
       buildIdentityPhysicalArrayOrder(budget);
-  std::mt19937 randomEngine(static_cast<uint32_t>(budget.randomSeed));
+  std::mt19937 randomEngine(static_cast<uint32_t>(randomSeed));
   std::shuffle(physicalArrayOrder.begin(), physicalArrayOrder.end(),
                randomEngine);
   return physicalArrayOrder;

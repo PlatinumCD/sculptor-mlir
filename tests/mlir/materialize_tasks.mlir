@@ -1,4 +1,4 @@
-// RUN: sculptor-mlir-opt %s --sculptor-materialize-tasks | FileCheck %s --implicit-check-not="call @layer" --implicit-check-not="func.func @layer"
+// RUN: sculptor-mlir-opt %s --sculptor-materialize-tasks | FileCheck %s --implicit-check-not="call @layer" --implicit-check-not="func.func @layer" --implicit-check-not=sculptor.task_graph
 
 module {
   // CHECK-LABEL: func.func @forward

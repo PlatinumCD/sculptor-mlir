@@ -36,8 +36,15 @@ constexpr llvm::StringLiteral kForwardFunctionName = "forward";
 constexpr llvm::StringLiteral kSourceResourceAttr = "sculptor.source_resource";
 constexpr llvm::StringLiteral kTileAttr = "sculptor.tile";
 constexpr llvm::StringLiteral kTileGridAttr = "sculptor.tile_grid";
+constexpr llvm::StringLiteral kTilePhysicalShapeAttr =
+    "sculptor.tile_physical_shape";
+constexpr llvm::StringLiteral kTileValidShapeAttr = "sculptor.tile_valid_shape";
 constexpr llvm::StringLiteral kVectorTileAttr = "sculptor.vector_tile";
 constexpr llvm::StringLiteral kVectorTileGridAttr = "sculptor.vector_tile_grid";
+constexpr llvm::StringLiteral kVectorTilePhysicalColsAttr =
+    "sculptor.vector_tile_physical_cols";
+constexpr llvm::StringLiteral kVectorTileValidColsAttr =
+    "sculptor.vector_tile_valid_cols";
 
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 
@@ -51,8 +58,27 @@ struct MatrixPartitionSpec {
   int64_t gridCols = 0;
 };
 
+struct MatrixTileExtent {
+  int64_t physicalRows = 0;
+  int64_t physicalCols = 0;
+  int64_t validRows = 0;
+  int64_t validCols = 0;
+};
+
 static int64_t ceilDiv(int64_t value, int64_t divisor) {
   return (value + divisor - 1) / divisor;
+}
+
+static MatrixTileExtent getMatrixTileExtent(const MatrixPartitionSpec &spec,
+                                            int64_t tileRow, int64_t tileCol,
+                                            int64_t arrayRows,
+                                            int64_t arrayCols) {
+  auto matrixShape = spec.type.getShape();
+  int64_t rowOffset = tileRow * arrayRows;
+  int64_t colOffset = tileCol * arrayCols;
+  return MatrixTileExtent{arrayRows, arrayCols,
+                          std::min(arrayRows, matrixShape[0] - rowOffset),
+                          std::min(arrayCols, matrixShape[1] - colOffset)};
 }
 
 static llvm::SmallVector<mlir::OpFoldResult>
@@ -99,8 +125,8 @@ static mlir::StringAttr buildVectorTileName(mlir::OpBuilder &builder,
 }
 
 static mlir::StringAttr buildMVMName(mlir::OpBuilder &builder,
-                                     mlir::sculptor::MVMOp mvmOp, int64_t tileRow,
-                                     int64_t tileCol) {
+                                     mlir::sculptor::MVMOp mvmOp,
+                                     int64_t tileRow, int64_t tileCol) {
   std::string name = getTaskNamePrefix(mvmOp.getOperation());
   name += "_mvm_";
   name += std::to_string(tileRow);
@@ -321,11 +347,19 @@ createTileConstant(const MatrixPartitionSpec &spec, int64_t tileRow,
 static void attachMatrixTileAttrs(mlir::Operation *op,
                                   const MatrixPartitionSpec &spec,
                                   int64_t tileRow, int64_t tileCol,
+                                  int64_t arrayRows, int64_t arrayCols,
                                   mlir::RewriterBase &rewriter) {
+  MatrixTileExtent extent =
+      getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
   op->setAttr(kSourceResourceAttr, rewriter.getStringAttr(spec.sourceResource));
   op->setAttr(kTileAttr, rewriter.getI64ArrayAttr({tileRow, tileCol}));
   op->setAttr(kTileGridAttr,
               rewriter.getI64ArrayAttr({spec.gridRows, spec.gridCols}));
+  op->setAttr(
+      kTilePhysicalShapeAttr,
+      rewriter.getI64ArrayAttr({extent.physicalRows, extent.physicalCols}));
+  op->setAttr(kTileValidShapeAttr,
+              rewriter.getI64ArrayAttr({extent.validRows, extent.validCols}));
 }
 
 static mlir::sculptor::ArraySetOp
@@ -350,7 +384,7 @@ static mlir::Value createMatrixSetupRegion(MatrixPartitionSpec &spec,
       task_graph_names::kMatrixSetupTaskKind,
       buildMatrixSetupName(rewriter, spec, tileRow, tileCol));
   attachMatrixTileAttrs(setupRegion.getOperation(), spec, tileRow, tileCol,
-                        rewriter);
+                        arrayRows, arrayCols, rewriter);
 
   mlir::Block *body = new mlir::Block();
   setupRegion.getBody().push_back(body);
@@ -388,21 +422,26 @@ getMVMVectorType(mlir::sculptor::MVMOp mvmOp,
 }
 
 static void attachVectorTileAttrs(mlir::Operation *op, int64_t vectorTile,
-                                  int64_t vectorTileGrid,
+                                  int64_t vectorTileGrid, int64_t physicalCols,
+                                  int64_t validCols,
                                   mlir::RewriterBase &rewriter) {
   op->setAttr(kVectorTileAttr, rewriter.getI64IntegerAttr(vectorTile));
   op->setAttr(kVectorTileGridAttr, rewriter.getI64IntegerAttr(vectorTileGrid));
+  op->setAttr(kVectorTilePhysicalColsAttr,
+              rewriter.getI64IntegerAttr(physicalCols));
+  op->setAttr(kVectorTileValidColsAttr, rewriter.getI64IntegerAttr(validCols));
 }
 
 static mlir::sculptor::TaskRegionOp createDigitalPreparationRegion(
     mlir::sculptor::MVMOp mvmOp, mlir::RankedTensorType resultType,
-    int64_t vectorTile, int64_t vectorTileGrid, mlir::RewriterBase &rewriter) {
+    int64_t vectorTile, int64_t vectorTileGrid, int64_t physicalCols,
+    int64_t validCols, mlir::RewriterBase &rewriter) {
   auto prepRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
       mvmOp.getLoc(), mlir::TypeRange{resultType},
       mlir::ValueRange{mvmOp.getVector()}, "digital.vector_tile",
       buildVectorTileName(rewriter, mvmOp, vectorTile));
   attachVectorTileAttrs(prepRegion.getOperation(), vectorTile, vectorTileGrid,
-                        rewriter);
+                        physicalCols, validCols, rewriter);
 
   mlir::Block *body = new mlir::Block();
   prepRegion.getBody().push_back(body);
@@ -418,7 +457,8 @@ static mlir::Value createFullVectorTile(mlir::sculptor::MVMOp mvmOp,
   mlir::RankedTensorType tileType =
       mlir::RankedTensorType::get({1, arrayCols}, rewriter.getF32Type());
   auto prepRegion = createDigitalPreparationRegion(mvmOp, tileType, vectorTile,
-                                                   vectorTileGrid, rewriter);
+                                                   vectorTileGrid, arrayCols,
+                                                   arrayCols, rewriter);
 
   mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(&prepRegion.getBody().front());
@@ -441,7 +481,8 @@ createPaddedVectorTile(mlir::sculptor::MVMOp mvmOp, int64_t vectorTile,
   mlir::RankedTensorType sourceTileType =
       mlir::RankedTensorType::get({1, remainingCols}, rewriter.getF32Type());
   auto prepRegion = createDigitalPreparationRegion(
-      mvmOp, fullTileType, vectorTile, vectorTileGrid, rewriter);
+      mvmOp, fullTileType, vectorTile, vectorTileGrid, arrayCols, remainingCols,
+      rewriter);
 
   mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(&prepRegion.getBody().front());
@@ -461,7 +502,7 @@ createPaddedVectorTile(mlir::sculptor::MVMOp mvmOp, int64_t vectorTile,
       buildIndexAttrs(rewriter, {1, remainingCols}),
       buildIndexAttrs(rewriter, {1, 1}));
   rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(),
-                                         paddedTile.getResult());
+                                           paddedTile.getResult());
   return prepRegion.getResult(0);
 }
 
@@ -494,18 +535,26 @@ createVectorTiles(mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
 static void attachArrayExecutionAttrs(mlir::Operation *op,
                                       const MatrixPartitionSpec &spec,
                                       int64_t tileRow, int64_t tileCol,
-                                      int64_t vectorTile,
+                                      int64_t vectorTile, int64_t arrayRows,
+                                      int64_t arrayCols,
                                       mlir::RewriterBase &rewriter) {
-  attachMatrixTileAttrs(op, spec, tileRow, tileCol, rewriter);
-  attachVectorTileAttrs(op, vectorTile, spec.gridCols, rewriter);
+  MatrixTileExtent extent =
+      getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
+  attachMatrixTileAttrs(op, spec, tileRow, tileCol, arrayRows, arrayCols,
+                        rewriter);
+  attachVectorTileAttrs(op, vectorTile, spec.gridCols, extent.physicalCols,
+                        extent.validCols, rewriter);
 }
 
 static mlir::Value createArrayExecutionRegion(
     mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
     mlir::Value vectorTileValue, mlir::Value logicalArray, int64_t tileRow,
-    int64_t vectorTile, int64_t arrayRows, mlir::RewriterBase &rewriter) {
+    int64_t vectorTile, int64_t arrayRows, int64_t arrayCols,
+    mlir::RewriterBase &rewriter) {
+  MatrixTileExtent extent =
+      getMatrixTileExtent(spec, tileRow, vectorTile, arrayRows, arrayCols);
   mlir::RankedTensorType storeType =
-      mlir::RankedTensorType::get({1, arrayRows}, rewriter.getF32Type());
+      mlir::RankedTensorType::get({1, extent.validRows}, rewriter.getF32Type());
 
   llvm::SmallVector<mlir::Value> inputs = {vectorTileValue, logicalArray};
   auto executionRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
@@ -513,7 +562,8 @@ static mlir::Value createArrayExecutionRegion(
       task_graph_names::kMVMTaskKind,
       buildMVMName(rewriter, mvmOp, tileRow, vectorTile));
   attachArrayExecutionAttrs(executionRegion.getOperation(), spec, tileRow,
-                            vectorTile, vectorTile, rewriter);
+                            vectorTile, vectorTile, arrayRows, arrayCols,
+                            rewriter);
 
   mlir::Block *body = new mlir::Block();
   executionRegion.getBody().push_back(body);
@@ -529,7 +579,7 @@ static mlir::Value createArrayExecutionRegion(
   mlir::Value vectorArg = body->getArgument(0);
   mlir::Value arrayArg = body->getArgument(1);
   rewriter.create<mlir::sculptor::ArrayLoadOp>(mvmOp.getLoc(), vectorArg,
-                                             arrayArg);
+                                               arrayArg);
 
   auto resultType = mlir::sculptor::ArrayResultType::get(rewriter.getContext());
   auto arrayExecute = rewriter.create<mlir::sculptor::ArrayExecuteOp>(
@@ -539,7 +589,7 @@ static mlir::Value createArrayExecutionRegion(
       mvmOp.getLoc(), storeType, arrayExecute.getResult());
 
   rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(),
-                                         arrayStore.getOutput());
+                                           arrayStore.getOutput());
   return executionRegion.getResult(0);
 }
 
@@ -577,7 +627,7 @@ static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
 createArrayLoads(mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
                  llvm::ArrayRef<mlir::Value> logicalArrays,
                  llvm::ArrayRef<mlir::Value> vectorTiles, int64_t arrayRows,
-                 mlir::RewriterBase &rewriter) {
+                 int64_t arrayCols, mlir::RewriterBase &rewriter) {
   if (static_cast<int64_t>(logicalArrays.size()) !=
           spec.gridRows * spec.gridCols ||
       static_cast<int64_t>(vectorTiles.size()) != spec.gridCols)
@@ -590,7 +640,7 @@ createArrayLoads(mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
       int64_t index = getTileIndex(spec, tileRow, vectorTile);
       partialTiles[index] = createArrayExecutionRegion(
           mvmOp, spec, vectorTiles[vectorTile], logicalArrays[index], tileRow,
-          vectorTile, arrayRows, rewriter);
+          vectorTile, arrayRows, arrayCols, rewriter);
     }
   }
 
@@ -648,11 +698,10 @@ static mlir::Value sumRowPartials(mlir::sculptor::MVMOp mvmOp,
   return row;
 }
 
-static mlir::FailureOr<mlir::Value>
-createRecombinedMVMResult(mlir::sculptor::MVMOp mvmOp,
-                          const MatrixPartitionSpec &spec,
-                          llvm::ArrayRef<mlir::Value> partialTiles,
-                          int64_t arrayRows, mlir::RewriterBase &rewriter) {
+static mlir::FailureOr<mlir::Value> createRecombinedMVMResult(
+    mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
+    llvm::ArrayRef<mlir::Value> partialTiles, int64_t arrayRows,
+    int64_t arrayCols, mlir::RewriterBase &rewriter) {
   if (static_cast<int64_t>(partialTiles.size()) !=
       spec.gridRows * spec.gridCols)
     return mvmOp.emitError("internal error: mismatched partial tile count for "
@@ -663,12 +712,7 @@ createRecombinedMVMResult(mlir::sculptor::MVMOp mvmOp,
   if (failed(resultType))
     return mlir::failure();
 
-  int64_t wideWidth = spec.gridRows * arrayRows;
   int64_t resultWidth = (*resultType).getDimSize(1);
-  if (resultWidth > wideWidth)
-    return mvmOp.emitError("internal error: recombined tensor is narrower than "
-                           "the original MVM result"),
-           mlir::failure();
 
   auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
       mvmOp.getLoc(), mlir::TypeRange{*resultType},
@@ -695,34 +739,31 @@ createRecombinedMVMResult(mlir::sculptor::MVMOp mvmOp,
   for (mlir::BlockArgument arg : body->getArguments())
     regionPartialTiles.push_back(arg);
 
-  mlir::RankedTensorType rowTileType =
-      mlir::RankedTensorType::get({1, arrayRows}, rewriter.getF32Type());
   llvm::SmallVector<mlir::Value> rowResults;
   rowResults.reserve(spec.gridRows);
+  int64_t recombinedWidth = 0;
   for (int64_t tileRow = 0; tileRow < spec.gridRows; ++tileRow) {
+    MatrixTileExtent extent =
+        getMatrixTileExtent(spec, tileRow, 0, arrayRows, arrayCols);
+    mlir::RankedTensorType rowTileType = mlir::RankedTensorType::get(
+        {1, extent.validRows}, rewriter.getF32Type());
     rowResults.push_back(sumRowPartials(mvmOp, spec, regionPartialTiles,
                                         tileRow, rowTileType, rewriter));
+    recombinedWidth += extent.validRows;
   }
 
-  mlir::Value wideResult = rowResults.front();
+  if (recombinedWidth != resultWidth)
+    return mvmOp.emitError("internal error: valid row tile extents do not "
+                           "match the original MVM result width"),
+           mlir::failure();
+
+  mlir::Value recombined = rowResults.front();
   if (spec.gridRows > 1) {
-    mlir::RankedTensorType wideType =
-        mlir::RankedTensorType::get({1, wideWidth}, rewriter.getF32Type());
-    wideResult =
-        rewriter
-            .create<mlir::tensor::ConcatOp>(mvmOp.getLoc(), wideType, /*dim=*/1,
-                                            mlir::ValueRange(rowResults))
-            .getResult();
-  }
-
-  mlir::Value recombined = wideResult;
-  if (resultWidth != wideWidth) {
-    auto slice = rewriter.create<mlir::tensor::ExtractSliceOp>(
-        mvmOp.getLoc(), *resultType, wideResult,
-        buildIndexAttrs(rewriter, {0, 0}),
-        buildIndexAttrs(rewriter, {1, resultWidth}),
-        buildIndexAttrs(rewriter, {1, 1}));
-    recombined = slice.getResult();
+    recombined = rewriter
+                     .create<mlir::tensor::ConcatOp>(
+                         mvmOp.getLoc(), *resultType,
+                         /*dim=*/1, mlir::ValueRange(rowResults))
+                     .getResult();
   }
 
   rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(), recombined);
@@ -781,13 +822,14 @@ private:
     if (failed(vectorTiles))
       return mlir::failure();
 
-    auto partialTiles = createArrayLoads(op, *spec, *logicalArrays,
-                                         *vectorTiles, arrayRows, rewriter);
+    auto partialTiles =
+        createArrayLoads(op, *spec, *logicalArrays, *vectorTiles, arrayRows,
+                         arrayCols, rewriter);
     if (failed(partialTiles))
       return mlir::failure();
 
     auto recombined = createRecombinedMVMResult(op, *spec, *partialTiles,
-                                                arrayRows, rewriter);
+                                                arrayRows, arrayCols, rewriter);
     if (failed(recombined))
       return mlir::failure();
 

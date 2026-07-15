@@ -42,10 +42,10 @@ static bool callsGeneratedTaskCallee(mlir::ModuleOp module,
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 
 LogicalResult
-eraseUnusedTaskGraphTemporaryResources(func::FuncOp taskGraphFunc) {
+eraseUnusedTaskGraphIntermediateResources(func::FuncOp taskGraphFunc) {
   if (!taskGraphFunc.getBody().hasOneBlock()) {
     taskGraphFunc.emitError("expected scheduled task graph function to have "
                             "one block");
@@ -54,8 +54,8 @@ eraseUnusedTaskGraphTemporaryResources(func::FuncOp taskGraphFunc) {
 
   SmallVector<Operation *> unusedResources;
   for (Operation &op : taskGraphFunc.getBody().front()) {
-    auto temporaryOp = dyn_cast<sculptor::TaskGraphTemporaryOp>(&op);
-    if (temporaryOp && temporaryOp.getResult().use_empty())
+    auto intermediateOp = dyn_cast<sculptor::TaskGraphIntermediateOp>(&op);
+    if (intermediateOp && intermediateOp.getResult().use_empty())
       unusedResources.push_back(&op);
   }
   for (Operation *op : unusedResources)
@@ -116,6 +116,6 @@ void eraseUnusedTaskCallees(ModuleOp module) {
     func.erase();
 }
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

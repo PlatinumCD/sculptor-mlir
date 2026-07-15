@@ -3,7 +3,7 @@
 #include "GreedyHeuristic.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/MeshGeometry.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -23,8 +23,8 @@ using TaskGraphNode = task_schedulers::TaskGraphNode;
 using CorePhysicalArraySlots =
     llvm::SmallVector<llvm::SmallVector<int64_t, 4>, 16>;
 
-using IslandCommunicationEdge =
-    mlir::sculptor::task_schedulers::LogicalIslandCommunicationEdge;
+using IslandAffinityEdge =
+    mlir::sculptor::task_schedulers::IslandAffinityEdge;
 struct GreedyCandidateScore {
   int64_t coreId = -1;
   int64_t score = 0;
@@ -70,16 +70,16 @@ buildCorePhysicalArraySlotsImpl(mlir::Operation *diagnosticOp,
 static int64_t evaluateGreedyHeuristic(
     const task_schedulers::GreedyHeuristic &heuristic,
     const task_schedulers::HardwareBudget &budget,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland,
     unsigned activeIsland, unsigned activePlacementIndex,
-    unsigned totalPlacementCount, std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland,
+    unsigned totalPlacementCount,
+    const task_schedulers::PlacementConstraints &constraints,
     std::optional<int64_t> bestTransferCost) {
   return heuristic.evaluate(task_schedulers::GreedyHeuristicContext{
-      budget, islandCommunicationEdges, coreByPlacedIsland, activeIsland,
-      activePlacementIndex, totalPlacementCount, firstTaskIsland,
-      lastTaskIsland, bestTransferCost});
+      budget, islandAffinityEdges, coreByPlacedIsland, activeIsland,
+      activePlacementIndex, totalPlacementCount, constraints,
+      bestTransferCost});
 }
 
 static void
@@ -137,15 +137,15 @@ static void appendGreedyLocalCandidates(
 static llvm::SmallVector<std::pair<unsigned, int64_t>, 8>
 collectPlacedCommunicationAnchors(
     unsigned island,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
   llvm::DenseMap<unsigned, int64_t> weightByIsland;
-  for (const IslandCommunicationEdge &edge : islandCommunicationEdges) {
+  for (const IslandAffinityEdge &edge : islandAffinityEdges) {
     unsigned otherIsland = std::numeric_limits<unsigned>::max();
-    if (edge.producerIsland == island) {
-      otherIsland = edge.consumerIsland;
-    } else if (edge.consumerIsland == island) {
-      otherIsland = edge.producerIsland;
+    if (edge.firstIsland == island) {
+      otherIsland = edge.secondIsland;
+    } else if (edge.secondIsland == island) {
+      otherIsland = edge.firstIsland;
     } else {
       continue;
     }
@@ -181,10 +181,9 @@ static void appendNearestAvailableCoreCandidates(
 static GreedyTransferOpportunity computeGreedyTransferOpportunity(
     llvm::ArrayRef<int64_t> candidateCores, unsigned island,
     unsigned placementIndex, unsigned totalPlacementCount,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland,
+    const task_schedulers::PlacementConstraints &constraints,
     const task_schedulers::HardwareBudget &budget,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     llvm::SmallVectorImpl<unsigned> &usedSlotsByCore,
     llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
   GreedyTransferOpportunity opportunity;
@@ -196,9 +195,9 @@ static GreedyTransferOpportunity computeGreedyTransferOpportunity(
     ++usedSlotsByCore[candidateCore];
     coreByPlacedIsland[island] = candidateCore;
     int64_t score = evaluateGreedyHeuristic(
-        transferCost, budget, islandCommunicationEdges, coreByPlacedIsland,
-        island, placementIndex, totalPlacementCount, firstTaskIsland,
-        lastTaskIsland, std::nullopt);
+        transferCost, budget, islandAffinityEdges, coreByPlacedIsland,
+        island, placementIndex, totalPlacementCount, constraints,
+        std::nullopt);
     coreByPlacedIsland.erase(island);
     --usedSlotsByCore[candidateCore];
 
@@ -215,10 +214,10 @@ static GreedyTransferOpportunity computeGreedyTransferOpportunity(
 static void retainBestGreedyImmediateCandidates(
     llvm::SmallVectorImpl<int64_t> &candidateCores, unsigned island,
     unsigned placementIndex, unsigned totalPlacementCount,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland, unsigned maxCandidates,
+    const task_schedulers::PlacementConstraints &constraints,
+    unsigned maxCandidates,
     const task_schedulers::HardwareBudget &budget,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     llvm::SmallVectorImpl<unsigned> &usedSlotsByCore,
     llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
   if (candidateCores.size() <= maxCandidates)
@@ -231,9 +230,9 @@ static void retainBestGreedyImmediateCandidates(
     ++usedSlotsByCore[candidateCore];
     coreByPlacedIsland[island] = candidateCore;
     int64_t score = evaluateGreedyHeuristic(
-        transferCost, budget, islandCommunicationEdges, coreByPlacedIsland,
-        island, placementIndex, totalPlacementCount, firstTaskIsland,
-        lastTaskIsland, std::nullopt);
+        transferCost, budget, islandAffinityEdges, coreByPlacedIsland,
+        island, placementIndex, totalPlacementCount, constraints,
+        std::nullopt);
     coreByPlacedIsland.erase(island);
     --usedSlotsByCore[candidateCore];
     scoredCandidates.push_back(GreedyCandidateScore{candidateCore, score});
@@ -273,13 +272,13 @@ static void appendGreedyProducerConsumerCandidates(
     int64_t currentCore, const task_schedulers::HardwareBudget &budget,
     const CorePhysicalArraySlots &physicalArraysByCore,
     llvm::ArrayRef<unsigned> usedSlotsByCore,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
   appendAvailableCoreCandidate(candidates, currentCore, physicalArraysByCore,
                                usedSlotsByCore);
 
   auto anchors = collectPlacedCommunicationAnchors(
-      island, islandCommunicationEdges, coreByPlacedIsland);
+      island, islandAffinityEdges, coreByPlacedIsland);
   unsigned visitedAnchors = 0;
   for (const auto &anchor : anchors) {
     if (visitedAnchors++ >= kGreedyMaxAnchorIslands)
@@ -425,29 +424,28 @@ static void appendNearestAvailableCoreCandidates(
 }
 
 static void appendGreedyCandidateCores(
-    llvm::SmallVectorImpl<int64_t> &candidateCores, unsigned setupIndex,
+    llvm::SmallVectorImpl<int64_t> &candidateCores, unsigned placementIndex,
     unsigned island, int64_t currentCore,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
     const task_schedulers::HardwareBudget &budget,
+    const task_schedulers::GreedyScheduleConfig &config,
     const CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     llvm::ArrayRef<unsigned> usedSlotsByCore,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
-  (void)matrixSetupTasks;
-  if (setupIndex == 0 && coreByPlacedIsland.empty()) {
+  if (placementIndex == 0 && coreByPlacedIsland.empty()) {
     if (hasAvailableCoreSlot(/*coreId=*/0, physicalArraysByCore,
                              usedSlotsByCore))
       candidateCores.push_back(0);
     return;
   }
 
-  if (budget.greedy.candidateScope ==
+  if (config.candidateScope ==
       task_schedulers::GreedyCandidateScope::ProducerConsumer) {
     appendGreedyProducerConsumerCandidates(
         candidateCores, island, currentCore, budget, physicalArraysByCore,
-        usedSlotsByCore, islandCommunicationEdges, coreByPlacedIsland);
+        usedSlotsByCore, islandAffinityEdges, coreByPlacedIsland);
   } else {
-    bool includeDiagonals = budget.greedy.candidateScope ==
+    bool includeDiagonals = config.candidateScope ==
                             task_schedulers::GreedyCandidateScope::Diagonal;
     appendGreedyLocalCandidates(candidateCores, currentCore, budget,
                                 physicalArraysByCore, usedSlotsByCore,
@@ -460,8 +458,8 @@ static void appendGreedyCandidateCores(
 }
 
 static bool
-applyCandidateImpl(GreedyPlacementState &state, const TaskGraphNode &setupNode,
-                   unsigned island, int64_t candidateCore,
+applyCandidateImpl(GreedyPlacementState &state, unsigned island,
+                   int64_t candidateCore,
                    const CorePhysicalArraySlots &physicalArraysByCore) {
   unsigned localSlot = state.usedSlotsByCore[candidateCore]++;
   if (localSlot >= physicalArraysByCore[candidateCore].size()) {
@@ -471,7 +469,7 @@ applyCandidateImpl(GreedyPlacementState &state, const TaskGraphNode &setupNode,
 
   int64_t physicalArrayId = physicalArraysByCore[candidateCore][localSlot];
   state.islandPlacements.push_back(
-      task_schedulers::greedy_detail::IslandPlacement{setupNode.index,
+      task_schedulers::greedy_detail::IslandPlacement{island,
                                                       physicalArrayId});
   state.coreByPlacedIsland[island] = candidateCore;
   state.currentCore = candidateCore;
@@ -479,58 +477,57 @@ applyCandidateImpl(GreedyPlacementState &state, const TaskGraphNode &setupNode,
 }
 
 static llvm::SmallVector<GreedyPlacementState, 16> expandStateImpl(
-    const GreedyPlacementState &state, unsigned setupIndex,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
+    const GreedyPlacementState &state,
+    const task_schedulers::greedy_detail::ExpansionRequest &request,
     const task_schedulers::HardwareBudget &budget,
+    const task_schedulers::GreedyScheduleConfig &config,
     const task_schedulers::GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<IslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland, bool pruneCandidates) {
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const task_schedulers::PlacementConstraints &constraints) {
   llvm::SmallVector<GreedyPlacementState, 16> expandedStates;
-  if (setupIndex >= matrixSetupTasks.size())
+  if (request.totalPlacementCount == 0 ||
+      request.placementIndex >= request.totalPlacementCount)
     return expandedStates;
 
-  const TaskGraphNode *setupNode = matrixSetupTasks[setupIndex];
-  unsigned island = setupNode->index;
-  unsigned totalPlacementCount = static_cast<unsigned>(matrixSetupTasks.size());
-
   llvm::SmallVector<int64_t, 8> candidateCores;
-  appendGreedyCandidateCores(candidateCores, setupIndex, island,
-                             state.currentCore, matrixSetupTasks, budget,
-                             physicalArraysByCore, islandCommunicationEdges,
+  appendGreedyCandidateCores(candidateCores, request.placementIndex,
+                             request.island, state.currentCore, budget,
+                             config, physicalArraysByCore, islandAffinityEdges,
                              state.usedSlotsByCore, state.coreByPlacedIsland);
   if (candidateCores.empty())
     return expandedStates;
 
-  if (pruneCandidates) {
+  if (request.pruneCandidates) {
     GreedyPlacementState pruningScratchState = state;
     retainBestGreedyImmediateCandidates(
-        candidateCores, island, setupIndex, totalPlacementCount,
-        firstTaskIsland, lastTaskIsland, kGreedyMaxRecursiveCandidates, budget,
-        islandCommunicationEdges, pruningScratchState.usedSlotsByCore,
+        candidateCores, request.island, request.placementIndex,
+        request.totalPlacementCount, constraints,
+        kGreedyMaxRecursiveCandidates, budget,
+        islandAffinityEdges, pruningScratchState.usedSlotsByCore,
         pruningScratchState.coreByPlacedIsland);
   }
 
   GreedyPlacementState transferScratchState = state;
   GreedyTransferOpportunity transferOpportunity =
       computeGreedyTransferOpportunity(
-          candidateCores, island, setupIndex, totalPlacementCount,
-          firstTaskIsland, lastTaskIsland, budget, islandCommunicationEdges,
+          candidateCores, request.island, request.placementIndex,
+          request.totalPlacementCount, constraints, budget,
+          islandAffinityEdges,
           transferScratchState.usedSlotsByCore,
           transferScratchState.coreByPlacedIsland);
 
   expandedStates.reserve(candidateCores.size());
   for (int64_t candidateCore : candidateCores) {
     GreedyPlacementState expandedState = state;
-    if (!applyCandidateImpl(expandedState, *setupNode, island, candidateCore,
+    if (!applyCandidateImpl(expandedState, request.island, candidateCore,
                             physicalArraysByCore))
       continue;
 
     expandedState.score = evaluateGreedyHeuristic(
-        heuristic, budget, islandCommunicationEdges,
-        expandedState.coreByPlacedIsland, island, setupIndex,
-        totalPlacementCount, firstTaskIsland, lastTaskIsland,
+        heuristic, budget, islandAffinityEdges,
+        expandedState.coreByPlacedIsland, request.island,
+        request.placementIndex, request.totalPlacementCount, constraints,
         transferOpportunity.bestTransferCost);
     expandedStates.push_back(std::move(expandedState));
   }
@@ -568,24 +565,23 @@ bool isBetterChoice(
                             bestCore, currentCore, budget, coreByPlacedIsland);
 }
 
-bool applyCandidate(PlacementState &state, const TaskGraphNode &setupNode,
-                    unsigned island, int64_t candidateCore,
+bool applyCandidate(PlacementState &state, unsigned island,
+                    int64_t candidateCore,
                     const CorePhysicalArraySlots &physicalArraysByCore) {
-  return applyCandidateImpl(state, setupNode, island, candidateCore,
+  return applyCandidateImpl(state, island, candidateCore,
                             physicalArraysByCore);
 }
 
 llvm::SmallVector<PlacementState, 16> expandState(
-    const PlacementState &state, unsigned setupIndex,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
-    const HardwareBudget &budget, const GreedyHeuristic &heuristic,
+    const PlacementState &state, const ExpansionRequest &request,
+    const HardwareBudget &budget, const GreedyScheduleConfig &config,
+    const GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> islandCommunicationEdges,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland, bool pruneCandidates) {
-  return expandStateImpl(state, setupIndex, matrixSetupTasks, budget, heuristic,
-                         physicalArraysByCore, islandCommunicationEdges,
-                         firstTaskIsland, lastTaskIsland, pruneCandidates);
+    llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    const PlacementConstraints &constraints) {
+  return expandStateImpl(state, request, budget, config, heuristic,
+                         physicalArraysByCore, islandAffinityEdges,
+                         constraints);
 }
 
 } // namespace greedy_detail

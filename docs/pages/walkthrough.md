@@ -428,24 +428,23 @@ module {
       %cst = arith.constant dense_resource<torch_tensor_3_4_torch.float32__tile_0_0> : tensor<4x4xf32>
       %5 = sculptor.array.set %cst : tensor<4x4xf32> -> !sculptor.logical.array
       sculptor.yield %5 : !sculptor.logical.array
-    } {sculptor.source_resource = "torch_tensor_3_4_torch.float32", sculptor.tile = [0, 0], sculptor.tile_grid = [1, 1]} : () -> !sculptor.logical.array
+    } {sculptor.source_resource = "torch_tensor_3_4_torch.float32", sculptor.tile = [0, 0], sculptor.tile_grid = [1, 1], sculptor.tile_physical_shape = [4, 4], sculptor.tile_valid_shape = [3, 4]} : () -> !sculptor.logical.array
     %1 = sculptor.task_region kind = "digital.vector_tile" name = "linearwbias_0_vector_tile_0"(%arg0) {
     ^bb0(%arg1: tensor<1x4xf32>):
       %extracted_slice = tensor.extract_slice %arg1[0, 0] [1, 4] [1, 1] : tensor<1x4xf32> to tensor<1x4xf32>
       sculptor.yield %extracted_slice : tensor<1x4xf32>
-    } {sculptor.vector_tile = 0 : i64, sculptor.vector_tile_grid = 1 : i64} : (tensor<1x4xf32>) -> tensor<1x4xf32>
+    } {sculptor.vector_tile = 0 : i64, sculptor.vector_tile_grid = 1 : i64, sculptor.vector_tile_physical_cols = 4 : i64, sculptor.vector_tile_valid_cols = 4 : i64} : (tensor<1x4xf32>) -> tensor<1x4xf32>
     %2 = sculptor.task_region kind = "sculptor.mvm" name = "linearwbias_0_mvm_0_0"(%1, %0) {
     ^bb0(%arg1: tensor<1x4xf32>, %arg2: !sculptor.logical.array):
       sculptor.array.load %arg1, %arg2 : tensor<1x4xf32>, !sculptor.logical.array
       %5 = sculptor.array.execute %arg2 : !sculptor.logical.array -> !sculptor.array.result
-      %6 = sculptor.array.store %5 : !sculptor.array.result -> tensor<1x4xf32>
-      sculptor.yield %6 : tensor<1x4xf32>
-    } {sculptor.source_resource = "torch_tensor_3_4_torch.float32", sculptor.tile = [0, 0], sculptor.tile_grid = [1, 1], sculptor.vector_tile = 0 : i64, sculptor.vector_tile_grid = 1 : i64} : (tensor<1x4xf32>, !sculptor.logical.array) -> tensor<1x4xf32>
+      %6 = sculptor.array.store %5 : !sculptor.array.result -> tensor<1x3xf32>
+      sculptor.yield %6 : tensor<1x3xf32>
+    } {sculptor.source_resource = "torch_tensor_3_4_torch.float32", sculptor.tile = [0, 0], sculptor.tile_grid = [1, 1], sculptor.tile_physical_shape = [4, 4], sculptor.tile_valid_shape = [3, 4], sculptor.vector_tile = 0 : i64, sculptor.vector_tile_grid = 1 : i64, sculptor.vector_tile_physical_cols = 4 : i64, sculptor.vector_tile_valid_cols = 4 : i64} : (tensor<1x4xf32>, !sculptor.logical.array) -> tensor<1x3xf32>
     %3 = sculptor.task_region kind = "digital.tile_recombine" name = "linearwbias_0_tile_recombine"(%2) {
-    ^bb0(%arg1: tensor<1x4xf32>):
-      %extracted_slice = tensor.extract_slice %arg1[0, 0] [1, 3] [1, 1] : tensor<1x4xf32> to tensor<1x3xf32>
-      sculptor.yield %extracted_slice : tensor<1x3xf32>
-    } : (tensor<1x4xf32>) -> tensor<1x3xf32>
+    ^bb0(%arg1: tensor<1x3xf32>):
+      sculptor.yield %arg1 : tensor<1x3xf32>
+    } : (tensor<1x3xf32>) -> tensor<1x3xf32>
     %4 = sculptor.task_region kind = "digital.bias_add" name = "linear_bias_add"(%3) {
     ^bb0(%arg1: tensor<1x3xf32>):
       %cst = arith.constant dense_resource<torch_tensor_3_torch.float32> : tensor<3xf32>
@@ -494,9 +493,11 @@ vector tile, executes the logical analog array, and stores the analog result.
 
 ### `digital.tile_recombine`
 
-This task converts the padded analog result back into the real output shape. The
-analog array produces a `4`-wide result, but the linear layer output is `3`
-values wide.
+This task sums column-tile partials and concatenates row tiles when an MVM spans
+multiple physical arrays. Physical matrix tiles remain `4x4`, but each array
+store exposes only its valid logical rows. The single tile in this example
+therefore produces `tensor<1x3xf32>` directly, and recombination is an identity.
+Padded rows never become task-graph communication.
 
 ### `digital.bias_add`
 
@@ -652,10 +653,10 @@ module {
     %0 = sculptor.task_graph.create : !sculptor.task_graph
     %1 = sculptor.task_graph.input %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
     %2 = sculptor.task_graph.output %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-    %3 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %4 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %5 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %6 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
+    %3 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %4 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %5 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %6 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
     %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %8 = sculptor.task.create %0, @task_linearwbias_0_vector_tile_0_1, domain = "digital", task_kind = "digital.vector_tile", task_name = "linearwbias_0_vector_tile_0", source_layer = "linearwbias_0", source_task_ordinal = 1, inputs[%1], outputs[%4], deps[] {sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [3], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>) -> !sculptor.task
     %9 = sculptor.task.create %0, @task_linearwbias_0_mvm_0_0_2, domain = "analog", task_kind = "sculptor.mvm", task_name = "linearwbias_0_mvm_0_0", source_layer = "linearwbias_0", source_task_ordinal = 2, inputs[%4, %3], outputs[%5], deps[%7, %8] {sculptor.runtime.input_slots = [3, 2], sculptor.runtime.output_slots = [4], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
@@ -698,11 +699,11 @@ This declares a value that the runtime should read after the graph finishes.
 Here, `%2` is output slot `1`, has a byte size of `12`, and represents the
 `tensor<1x3xf32>` final result.
 
-### `sculptor.task_graph.temporary`
+### `sculptor.task_graph.intermediate`
 
 This declares storage for values produced between tasks. In this example, the
-temporary resources hold the logical array, the vector tile, the MVM result, and
-the recombined tensor before bias add. These resources make the graph's
+intermediate resources hold the logical array, the vector tile, the MVM result,
+and the recombined tensor before bias add. These resources make the graph's
 intermediate data movement explicit.
 
 ### `sculptor.task.create`
@@ -715,17 +716,21 @@ The dependency list is the graph ordering. Matrix setup and vector tiling have
 no dependencies, so they can run first. The MVM task depends on both of them.
 Tile recombine depends on the MVM task, and bias add depends on tile recombine.
 
-This is still symbolic graph IR. The next pass schedules this graph for the
-runtime model.
+This is still symbolic graph IR. The island pass groups the graph before
+physical scheduling.
 
 </details>
 
 <details class="doc-section" open markdown="1">
-<summary markdown="block">## Schedule Task Graph</summary>
+<summary markdown="block">## Build Islands And Schedule Task Graph</summary>
 
 
-The next pass is `--sculptor-schedule-task-graph`. It takes the symbolic task
-graph and attaches scheduling information for a target hardware budget.
+The next pass is `--sculptor-build-task-graph-islands`. It assigns every task
+to a stable logical placement island without choosing a core. The timing stage
+then runs before `--sculptor-schedule-task-graph`, which consumes those islands
+and attaches scheduling information for a target hardware budget. The timing
+pass validates the combined control/data execution DAG and records intrinsic
+task latency, critical-path, and island-work estimates before placement.
 
 A schedule is the compiler's plan for where graph work should run. This is the
 point in the pipeline where placement actually happens. The pass chooses which
@@ -753,6 +758,8 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
+    --sculptor-build-task-graph-islands \
+    --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random"
 ```
 
@@ -793,10 +800,10 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
     %0 = sculptor.task_graph.create : !sculptor.task_graph
     %1 = sculptor.task_graph.input %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
     %2 = sculptor.task_graph.output %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-    %3 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %4 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %5 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %6 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
+    %3 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %4 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %5 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %6 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
     %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %8 = sculptor.task.create %0, @task_linearwbias_0_vector_tile_0_1, domain = "digital", task_kind = "digital.vector_tile", task_name = "linearwbias_0_vector_tile_0", source_layer = "linearwbias_0", source_task_ordinal = 1, inputs[%1], outputs[%4], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [3], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>) -> !sculptor.task
     %9 = sculptor.task.create %0, @task_linearwbias_0_mvm_0_0_2, domain = "analog", task_kind = "sculptor.mvm", task_name = "linearwbias_0_mvm_0_0", source_layer = "linearwbias_0", source_task_ordinal = 2, inputs[%4, %3], outputs[%5], deps[%7, %8] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [3, 2], sculptor.runtime.output_slots = [4], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
@@ -824,7 +831,7 @@ The schedule appears as metadata on several parts of the IR:
 - `@generate_task_graph` records graph-level schedule totals, including
   `sculptor.schedule.task_count = 5`, `sculptor.schedule.dependency_count = 4`,
   and `sculptor.schedule.logical_array_to_analog_array = [0]`.
-- The logical array temporary gets `sculptor.schedule.logical_array_index = 0`,
+- The logical array intermediate gets `sculptor.schedule.logical_array_index = 0`,
   which gives the scheduler a stable identity for that logical array resource.
 - Each task records `sculptor.runtime.core_id = 0`, because this example has only
   one core.
@@ -870,6 +877,8 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
+    --sculptor-build-task-graph-islands \
+    --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \
@@ -931,10 +940,10 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
     %0 = sculptor.task_graph.create : !sculptor.task_graph
     %1 = sculptor.task_graph.input %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
     %2 = sculptor.task_graph.output %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-    %3 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %4 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %5 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %6 = sculptor.task_graph.temporary %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
+    %3 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %4 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %5 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %6 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
     %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %8 = sculptor.task.create %0, @task_linearwbias_0_vector_tile_0_1, domain = "digital", task_kind = "digital.vector_tile", task_name = "linearwbias_0_vector_tile_0", source_layer = "linearwbias_0", source_task_ordinal = 1, inputs[%1], outputs[%4], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [3], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>) -> !sculptor.task
     %9 = sculptor.task.create %0, @task_linearwbias_0_mvm_0_0_2, domain = "analog", task_kind = "sculptor.mvm", task_name = "linearwbias_0_mvm_0_0", source_layer = "linearwbias_0", source_task_ordinal = 2, inputs[%4, %3], outputs[%5], deps[%7, %8] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [3, 2], sculptor.runtime.output_slots = [4], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
@@ -994,6 +1003,8 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
+    --sculptor-build-task-graph-islands \
+    --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \
@@ -1084,6 +1095,8 @@ python3 linear_example.py --mode mlir |
     --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" \
     --sculptor-materialize-tasks \
     --sculptor-assemble-task-graph \
+    --sculptor-build-task-graph-islands \
+    --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
     --canonicalize \

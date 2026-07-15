@@ -40,7 +40,8 @@ void configureConversionTarget(ConversionTarget &target,
                                TypeConverter &typeConverter) {
   target.addIllegalDialect<sculptor::SculptorDialect>();
   target.addLegalOp<sculptor::TaskGraphCreateOp, sculptor::TaskGraphInputOp,
-                    sculptor::TaskGraphOutputOp, sculptor::TaskGraphTemporaryOp,
+                    sculptor::TaskGraphOutputOp,
+                    sculptor::TaskGraphIntermediateOp,
                     sculptor::TaskGraphPersistentOp, sculptor::TaskCreateOp>();
   target.addLegalOp<ModuleOp>();
   target.addLegalDialect<arith::ArithDialect, bufferization::BufferizationDialect,

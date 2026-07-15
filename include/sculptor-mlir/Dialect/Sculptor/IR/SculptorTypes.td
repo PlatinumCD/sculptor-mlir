@@ -186,7 +186,7 @@ def Sculptor_TaskResourceType : Sculptor_Type<"TaskResource", "task_resource"> {
   let description = [{
     Represents one graph-owned resource slot carrying a concrete payload type
     used as a task input, task output, graph boundary value, or internal
-    temporary.
+    intermediate.
   }];
 
   let parameters = (ins

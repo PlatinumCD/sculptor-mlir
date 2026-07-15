@@ -52,7 +52,7 @@ static int64_t getDistanceToBoundaryMask(int64_t coreId, unsigned boundaryMask,
 static int64_t getAverageIslandCommunicationBytes(
     const mlir::sculptor::task_schedulers::GreedyHeuristicContext &context) {
   int64_t totalBytes = 0;
-  for (const auto &edge : context.islandCommunicationEdges)
+  for (const auto &edge : context.islandAffinityEdges)
     totalBytes = saturatingAdd(totalBytes, edge.byteSize);
   return std::max<int64_t>(
       1, totalBytes / std::max<unsigned>(1, context.totalPlacementCount));
@@ -138,11 +138,16 @@ static int64_t getShapeRegretAllowance(
 static int64_t getBoundaryRegretPenalty(
     const mlir::sculptor::task_schedulers::GreedyHeuristicContext &context,
     int64_t transferScore) {
-  if (!context.firstTaskIsland || !context.lastTaskIsland ||
+  if (!context.constraints.sharedEndpointBoundary ||
       context.totalPlacementCount == 0)
     return 0;
+  const mlir::sculptor::task_schedulers::SharedMeshBoundaryConstraint
+      &boundary = *context.constraints.sharedEndpointBoundary;
+  if (!boundary.islands)
+    return 0;
 
-  auto firstCoreIt = context.coreByPlacedIsland.find(*context.firstTaskIsland);
+  auto firstCoreIt =
+      context.coreByPlacedIsland.find(boundary.islands->startIsland);
   auto activeCoreIt = context.coreByPlacedIsland.find(context.activeIsland);
   if (firstCoreIt == context.coreByPlacedIsland.end() ||
       activeCoreIt == context.coreByPlacedIsland.end())
@@ -159,7 +164,7 @@ static int64_t getBoundaryRegretPenalty(
       mlir::sculptor::task_schedulers::getMeshBoundaryMask(activeCoreIt->second,
                                                            context.budget);
   bool boundaryCompatible = (activeBoundaryMask & startBoundaryMask) != 0;
-  if (context.activeIsland == *context.lastTaskIsland) {
+  if (context.activeIsland == boundary.islands->terminalIsland) {
     if (boundaryCompatible)
       return 0;
     return mlir::sculptor::task_schedulers::getBoundaryPenalty(
@@ -210,8 +215,7 @@ namespace task_schedulers {
 
 int64_t TransferCostGreedyHeuristic::evaluate(
     const GreedyHeuristicContext &context) const {
-  return computeIslandTransferCost(context.budget,
-                                   context.islandCommunicationEdges,
+  return computeIslandTransferCost(context.budget, context.islandAffinityEdges,
                                    context.coreByPlacedIsland);
 }
 

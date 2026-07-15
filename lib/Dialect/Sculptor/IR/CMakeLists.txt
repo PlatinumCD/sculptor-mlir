@@ -1,6 +1,7 @@
 add_mlir_dialect_library(SculptorIR
   SculptorBase.cpp
   SculptorTypes.cpp
+  SculptorAttrs.cpp
   SculptorOps.cpp
   Ops/SculptorNNOps.cpp
   Ops/SculptorGolemOps.cpp

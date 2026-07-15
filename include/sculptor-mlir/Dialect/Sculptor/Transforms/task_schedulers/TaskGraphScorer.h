@@ -1,7 +1,8 @@
-#ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHSCORER_H
-#define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHSCORER_H
+#ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCORER_H
+#define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCORER_H
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementConstraints.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -36,7 +37,9 @@ public:
   virtual FailureOr<TaskGraphScore> score(ModuleOp module,
                                           func::FuncOp taskGraphFunc,
                                           const HardwareBudget &budget,
-                                          const TaskGraphDAG &dag) const = 0;
+                                          const TaskGraphDAG &dag,
+                                          const LogicalPlacementIslandGraph &islandGraph,
+                                          const PlacementConstraints &constraints) const = 0;
 };
 
 class MeshTaskGraphScorer final : public TaskGraphScorer {
@@ -45,11 +48,13 @@ public:
 
   FailureOr<TaskGraphScore> score(ModuleOp module, func::FuncOp taskGraphFunc,
                                   const HardwareBudget &budget,
-                                  const TaskGraphDAG &dag) const final;
+                                  const TaskGraphDAG &dag,
+                                  const LogicalPlacementIslandGraph &islandGraph,
+                                  const PlacementConstraints &constraints) const final;
 };
 
 } // namespace task_schedulers
 } // namespace sculptor
 } // namespace mlir
 
-#endif // SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHSCORER_H
+#endif // SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCORER_H

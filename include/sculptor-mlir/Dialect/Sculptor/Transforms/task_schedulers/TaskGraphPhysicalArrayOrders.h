@@ -15,7 +15,8 @@ llvm::SmallVector<int64_t, 8>
 buildIdentityPhysicalArrayOrder(const HardwareBudget &budget);
 
 llvm::SmallVector<int64_t, 8>
-buildRandomPhysicalArrayOrder(const HardwareBudget &budget);
+buildRandomPhysicalArrayOrder(const HardwareBudget &budget,
+                              int64_t randomSeed);
 
 llvm::SmallVector<int64_t, 8>
 buildSnakePhysicalArrayOrder(const HardwareBudget &budget);

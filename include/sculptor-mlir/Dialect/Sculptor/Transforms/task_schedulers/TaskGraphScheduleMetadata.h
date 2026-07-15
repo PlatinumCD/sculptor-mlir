@@ -1,0 +1,26 @@
+#ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULEMETADATA_H
+#define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULEMETADATA_H
+
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementConstraints.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Support/LogicalResult.h"
+
+namespace mlir {
+namespace sculptor {
+namespace task_schedulers {
+
+LogicalResult finalizeTaskGraphScheduleMetadata(ModuleOp module,
+                                                func::FuncOp taskGraphFunc,
+                                                const HardwareBudget &budget,
+                                                const TaskGraphDAG &dag,
+                                                const LogicalPlacementIslandGraph &islandGraph,
+                                                const PlacementConstraints &constraints);
+
+} // namespace task_schedulers
+} // namespace sculptor
+} // namespace mlir
+
+#endif // SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULEMETADATA_H

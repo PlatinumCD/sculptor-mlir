@@ -32,9 +32,10 @@ struct SearchState {
 };
 
 static mlir::FailureOr<annealing::Placement> buildGreedyInitialPlacement(
-    const task_schedulers::TaskGraphPlacementProblem &problem) {
+    const task_schedulers::TaskGraphPlacementProblem &problem,
+    const task_schedulers::GreedyScheduleConfig &greedyConfig) {
   auto plan = task_schedulers::buildGreedyPlacementPlan(
-      problem, problem.budget.analogArrays);
+      problem, problem.budget.analogArrays, greedyConfig);
   if (mlir::failed(plan))
     return mlir::failure();
 
@@ -56,7 +57,9 @@ static mlir::FailureOr<annealing::Placement> buildGreedyInitialPlacement(
 
 static mlir::FailureOr<annealing::Placement>
 buildInitialPlacement(const task_schedulers::TaskGraphPlacementProblem &problem,
-                      const task_schedulers::AnnealingScheduleConfig &config) {
+                      const task_schedulers::AnnealingScheduleConfig &config,
+                      const task_schedulers::GreedyScheduleConfig &greedyConfig,
+                      int64_t randomSeed) {
   if (problem.budget.analogArrays.empty()) {
     problem.diagnosticOp->emitError(
         "expected simulated annealing initial placement to have at least one "
@@ -72,14 +75,15 @@ buildInitialPlacement(const task_schedulers::TaskGraphPlacementProblem &problem,
     return placement;
   case task_schedulers::AnnealingInitialSchedule::Random:
     placement.physicalArrayOrder =
-        task_schedulers::buildRandomPhysicalArrayOrder(problem.budget);
+        task_schedulers::buildRandomPhysicalArrayOrder(problem.budget,
+                                                       randomSeed);
     return placement;
   case task_schedulers::AnnealingInitialSchedule::Snake:
     placement.physicalArrayOrder =
         task_schedulers::buildSnakePhysicalArrayOrder(problem.budget);
     return placement;
   case task_schedulers::AnnealingInitialSchedule::Greedy:
-    return buildGreedyInitialPlacement(problem);
+    return buildGreedyInitialPlacement(problem, greedyConfig);
   }
 
   problem.diagnosticOp->emitError(
@@ -131,19 +135,15 @@ static double resolveInitialTemperature(
 
 static mlir::FailureOr<annealing::Placement>
 runSearch(const task_schedulers::TaskGraphPlacementProblem &problem,
-          const task_schedulers::AnnealingScheduleConfig &config) {
-  auto initialPlacement = buildInitialPlacement(problem, config);
+          const task_schedulers::AnnealingScheduleConfig &config,
+          const task_schedulers::GreedyScheduleConfig &greedyConfig,
+          int64_t randomSeed) {
+  auto initialPlacement =
+      buildInitialPlacement(problem, config, greedyConfig, randomSeed);
   if (mlir::failed(initialPlacement))
     return mlir::failure();
 
-  std::optional<unsigned> firstTaskIsland;
-  std::optional<unsigned> lastTaskIsland;
-  if (problem.islandGraph.islands.size() >= 2) {
-    firstTaskIsland = problem.islandGraph.islands.front().islandIndex;
-    lastTaskIsland = problem.islandGraph.islands.back().islandIndex;
-  }
-  task_schedulers::IslandPlacementObjective objective(problem, firstTaskIsland,
-                                                      lastTaskIsland);
+  task_schedulers::IslandPlacementObjective objective(problem);
   auto initialScore =
       estimatePlacementScore(*initialPlacement, problem, objective);
   if (mlir::failed(initialScore))
@@ -151,7 +151,7 @@ runSearch(const task_schedulers::TaskGraphPlacementProblem &problem,
 
   SearchState current{std::move(*initialPlacement), *initialScore};
   SearchState best = current;
-  std::mt19937 randomEngine(static_cast<uint32_t>(problem.budget.randomSeed));
+  std::mt19937 randomEngine(static_cast<uint32_t>(randomSeed));
 
   for (double temperature = resolveInitialTemperature(config, *initialScore);
        temperature > config.finalTemperature;
@@ -190,8 +190,11 @@ namespace annealing_detail {
 
 FailureOr<IslandPlacementPlan>
 buildPlacementPlan(const TaskGraphPlacementProblem &problem,
-                   const AnnealingScheduleConfig &config) {
-  auto placement = runSearch(problem, config);
+                   const AnnealingScheduleConfig &config,
+                   const GreedyScheduleConfig &greedyInitialPlacement,
+                   int64_t randomSeed) {
+  auto placement =
+      runSearch(problem, config, greedyInitialPlacement, randomSeed);
   if (failed(placement))
     return failure();
   return buildPlacementPlanFromPhysicalArrayOrder(

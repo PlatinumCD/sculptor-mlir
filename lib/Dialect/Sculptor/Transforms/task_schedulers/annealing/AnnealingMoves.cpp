@@ -9,6 +9,7 @@
 namespace {
 
 namespace task_schedulers = mlir::sculptor::task_schedulers;
+namespace task_graph = mlir::sculptor::task_graph;
 namespace annealing = task_schedulers::annealing_detail;
 
 using AnnealingPlacement = annealing::Placement;
@@ -24,7 +25,7 @@ struct AnnealingMove {
 
 static unsigned getActivePlacementCount(
     const AnnealingPlacement &current,
-    const task_schedulers::LogicalPlacementIslandGraph &islandGraph) {
+    const task_graph::LogicalPlacementIslandGraph &islandGraph) {
   return static_cast<unsigned>(
       std::min(current.physicalArrayOrder.size(), islandGraph.islands.size()));
 }
@@ -197,7 +198,7 @@ static AnnealingMove chooseBlockSwap(unsigned activePlacementCount,
 
 static AnnealingMove choosePerturbationMove(
     const AnnealingPlacement &current,
-    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
+    const task_graph::LogicalPlacementIslandGraph &islandGraph,
     llvm::ArrayRef<AnnealingMoveKind> enabledMoveKinds, int64_t moveRadius,
     std::mt19937 &randomEngine) {
   unsigned activePlacementCount = getActivePlacementCount(current, islandGraph);
@@ -337,8 +338,8 @@ applyPerturbationMove(mlir::func::FuncOp taskGraphFunc,
 
 static mlir::FailureOr<AnnealingPlacement> perturbPlacementImpl(
     mlir::func::FuncOp taskGraphFunc, const AnnealingPlacement &current,
-    const task_schedulers::TaskGraphDAG &dag,
-    const task_schedulers::LogicalPlacementIslandGraph &islandGraph,
+    const task_graph::TaskGraphDAG &dag,
+    const task_graph::LogicalPlacementIslandGraph &islandGraph,
     llvm::ArrayRef<AnnealingMoveKind> enabledMoveKinds, int64_t moveRadius,
     std::mt19937 &randomEngine) {
   (void)dag;
@@ -357,8 +358,8 @@ namespace annealing_detail {
 
 FailureOr<Placement>
 perturbPlacement(func::FuncOp taskGraphFunc, const Placement &current,
-                 const TaskGraphDAG &dag,
-                 const LogicalPlacementIslandGraph &islandGraph,
+                 const task_graph::TaskGraphDAG &dag,
+                 const task_graph::LogicalPlacementIslandGraph &islandGraph,
                  llvm::ArrayRef<MoveKind> enabledMoveKinds, int64_t moveRadius,
                  std::mt19937 &randomEngine) {
   return perturbPlacementImpl(taskGraphFunc, current, dag, islandGraph,

@@ -1,11 +1,16 @@
 add_mlir_library(MLIRSculptorTransforms
   Passes.cpp
+  AnalyzeTaskGraphTiming.cpp
   AssembleTaskGraph.cpp
+  BuildTaskGraphIslands.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
+  ExportTaskGraphIslandMap.cpp
   ExportTaskGraphSimModel.cpp
   ExportTaskGraphVis.cpp
   ExtractLayers.cpp
+  FinalizeTaskGraphResources.cpp
+  FuseTaskGraph.cpp
   MaterializeTasks.cpp
   ScheduleTaskGraph.cpp
   TaskGraphTaskMetadata.cpp
@@ -13,27 +18,41 @@ add_mlir_library(MLIRSculptorTransforms
   assemblers/TaskGraphGeneratorAssembler.cpp
   assemblers/TaskGraphResourceAssembler.cpp
   assemblers/TaskGraphTaskAssembler.cpp
-  task_schedulers/TaskGraphIslandBuilder.cpp
-  task_schedulers/TaskGraphIslandCommunication.cpp
-  task_schedulers/TaskGraphIslandDigitalAssignment.cpp
+  task_graph/TaskGraphIslandBuilder.cpp
+  task_graph/TaskGraphIslandCommunication.cpp
+  task_graph/TaskGraphIslandDigitalAssignment.cpp
   task_schedulers/TaskGraphPlacementUtils.cpp
   task_schedulers/TaskGraphPlacementPlan.cpp
+  task_schedulers/TaskGraphPlacementConstraints.cpp
+  task_schedulers/TaskGraphHardwareConfig.cpp
   task_schedulers/TaskGraphPlacementObjective.cpp
   task_schedulers/TaskGraphScheduleConfig.cpp
+  task_schedulers/TaskGraphScheduleReport.cpp
   task_schedulers/TaskGraphPhysicalArrayOrders.cpp
-  task_schedulers/TaskGraphResources.cpp
+  task_graph/TaskGraphResources.cpp
   task_schedulers/TaskGraphScheduler.cpp
   task_graph/TaskGraphDAG.cpp
+  task_graph/TaskGraphExecutionGraph.cpp
+  task_graph/TaskGraphDigitalOps.cpp
   task_graph/TaskGraphCleanup.cpp
-  task_graph/TaskGraphScorer.cpp
-  task_graph/TaskGraphScheduleMetadata.cpp
+  task_graph/TaskGraphResourceUtils.cpp
+  task_schedulers/TaskGraphScorer.cpp
+  task_schedulers/TaskGraphScheduleMetadata.cpp
   task_schedulers/MeshGeometry.cpp
   task_graph/TaskGraphRoutineFuser.cpp
+  task_timing/TaskGraphTimingAnalysis.cpp
+  task_timing/TaskGraphTimingIRCodec.cpp
+  task_timing/TaskGraphNetworkTiming.cpp
+  task_timing/TaskGraphTimingProfileBuilder.cpp
+  task_timing/TaskLatencyModel.cpp
+  task_timing/TimingCostModel.cpp
   task_schedulers/greedy/GreedyHeuristic.cpp
   task_schedulers/greedy/GreedyCandidates.cpp
   task_schedulers/greedy/GreedyBoundaryRepair.cpp
   task_schedulers/greedy/GreedySearch.cpp
+  task_schedulers/greedy/GreedyTimingSearch.cpp
   task_schedulers/GreedyTaskScheduler.cpp
+  task_schedulers/GreedyTimingTaskScheduler.cpp
   task_schedulers/RandomTaskScheduler.cpp
   task_schedulers/annealing/AnnealingMoves.cpp
   task_schedulers/annealing/AnnealingSearch.cpp

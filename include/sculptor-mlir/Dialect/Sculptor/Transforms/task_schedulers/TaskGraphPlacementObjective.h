@@ -21,32 +21,25 @@ struct IslandPlacementScore {
 
 int64_t computeIslandTransferCost(
     const HardwareBudget &budget,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> communicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> affinityEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByIsland);
 
 IslandPlacementScore evaluateIslandCorePlacement(
     const HardwareBudget &budget,
-    llvm::ArrayRef<LogicalIslandCommunicationEdge> communicationEdges,
+    llvm::ArrayRef<IslandAffinityEdge> affinityEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByIsland,
-    std::optional<unsigned> firstTaskIsland,
-    std::optional<unsigned> lastTaskIsland);
+    const PlacementConstraints &constraints);
 
 class IslandPlacementObjective {
 public:
-  IslandPlacementObjective(
-      const TaskGraphPlacementProblem &problem,
-      std::optional<unsigned> firstTaskIsland = std::nullopt,
-      std::optional<unsigned> lastTaskIsland = std::nullopt)
-      : problem(problem), firstTaskIsland(firstTaskIsland),
-        lastTaskIsland(lastTaskIsland) {}
+  explicit IslandPlacementObjective(const TaskGraphPlacementProblem &problem)
+      : problem(problem) {}
 
   FailureOr<IslandPlacementScore>
   evaluate(const IslandPlacementPlan &plan) const;
 
 private:
   const TaskGraphPlacementProblem &problem;
-  std::optional<unsigned> firstTaskIsland;
-  std::optional<unsigned> lastTaskIsland;
 };
 
 } // namespace task_schedulers

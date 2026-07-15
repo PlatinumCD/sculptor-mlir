@@ -2,6 +2,7 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULECONFIG_H
 
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Support/LogicalResult.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -9,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <variant>
 
 namespace mlir {
 namespace sculptor {
@@ -58,6 +60,38 @@ struct AnnealingScheduleConfig {
   double coolingRate = 0.9;
   int64_t stepsPerTemperature = 32;
 };
+
+struct RandomSchedulerOptions {
+  int64_t randomSeed = 0;
+};
+
+struct SnakeSchedulerOptions {};
+
+struct GreedySchedulerOptions {
+  GreedyScheduleConfig greedy;
+};
+
+struct AnnealingSchedulerOptions {
+  AnnealingScheduleConfig annealing;
+  GreedyScheduleConfig greedyInitialPlacement;
+  int64_t randomSeed = 0;
+};
+
+using TaskGraphSchedulerOptions =
+    std::variant<RandomSchedulerOptions, SnakeSchedulerOptions,
+                 GreedySchedulerOptions, AnnealingSchedulerOptions>;
+
+FailureOr<TaskGraphSchedulerOptions> buildTaskGraphSchedulerOptions(
+    Operation *diagnosticOp, llvm::StringRef schedule, int64_t randomSeed,
+    llvm::StringRef greedyHeuristic,
+    llvm::StringRef annealingInitialSchedule, llvm::StringRef annealingMoveSet,
+    int64_t annealingMoveRadius, double annealingInitialTemperature,
+    double annealingFinalTemperature, double annealingCoolingRate,
+    int64_t annealingStepsPerTemperature);
+
+void attachTaskGraphSchedulerOptionAttrs(
+    Operation *op, Builder &builder,
+    const TaskGraphSchedulerOptions &options);
 
 llvm::StringRef stringifyGreedyCandidateScope(GreedyCandidateScope scope);
 

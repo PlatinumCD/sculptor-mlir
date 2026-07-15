@@ -1,6 +1,6 @@
 #include "TaskGraphIslandInternals.h"
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTaskKinds.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
 #include "llvm/ADT/DenseSet.h"
 
@@ -11,19 +11,17 @@
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 namespace {
 
-using IslandCommunicationEdge = LogicalIslandCommunicationEdge;
-
-static void addIslandCommunicationEdge(
-    llvm::SmallVectorImpl<IslandCommunicationEdge> &edges,
+static void addIslandAffinityEdge(
+    llvm::SmallVectorImpl<IslandAffinityEdge> &edges,
     unsigned producerIsland, unsigned consumerIsland, int64_t byteSize) {
   if (producerIsland == consumerIsland || byteSize <= 0)
     return;
 
   edges.push_back(
-      IslandCommunicationEdge{producerIsland, consumerIsland, byteSize});
+      IslandAffinityEdge{producerIsland, consumerIsland, byteSize});
 }
 
 static uint64_t getIslandPairKey(unsigned lhs, unsigned rhs) {
@@ -32,42 +30,41 @@ static uint64_t getIslandPairKey(unsigned lhs, unsigned rhs) {
   return (static_cast<uint64_t>(first) << 32) | static_cast<uint64_t>(second);
 }
 
-static llvm::SmallVector<IslandCommunicationEdge, 16>
-compactIslandCommunicationEdges(
-    llvm::ArrayRef<IslandCommunicationEdge> islandEdges) {
+static llvm::SmallVector<IslandAffinityEdge, 16>
+compactIslandAffinityEdges(
+    llvm::ArrayRef<IslandAffinityEdge> islandEdges) {
   llvm::DenseMap<uint64_t, int64_t> bytesByPair;
-  for (const IslandCommunicationEdge &edge : islandEdges) {
-    if (edge.producerIsland == edge.consumerIsland || edge.byteSize <= 0)
+  for (const IslandAffinityEdge &edge : islandEdges) {
+    if (edge.firstIsland == edge.secondIsland || edge.byteSize <= 0)
       continue;
-    bytesByPair[getIslandPairKey(edge.producerIsland, edge.consumerIsland)] +=
+    bytesByPair[getIslandPairKey(edge.firstIsland, edge.secondIsland)] +=
         edge.byteSize;
   }
 
-  llvm::SmallVector<IslandCommunicationEdge, 16> compactedEdges;
+  llvm::SmallVector<IslandAffinityEdge, 16> compactedEdges;
   compactedEdges.reserve(bytesByPair.size());
   for (const auto &entry : bytesByPair) {
     unsigned first = static_cast<unsigned>(entry.first >> 32);
     unsigned second = static_cast<unsigned>(entry.first & 0xffffffffu);
     compactedEdges.push_back(
-        IslandCommunicationEdge{first, second, entry.second});
+        IslandAffinityEdge{first, second, entry.second});
   }
 
-  llvm::sort(compactedEdges, [](const IslandCommunicationEdge &lhs,
-                                const IslandCommunicationEdge &rhs) {
-    if (lhs.producerIsland != rhs.producerIsland)
-      return lhs.producerIsland < rhs.producerIsland;
-    return lhs.consumerIsland < rhs.consumerIsland;
+  llvm::sort(compactedEdges, [](const IslandAffinityEdge &lhs,
+                                const IslandAffinityEdge &rhs) {
+    if (lhs.firstIsland != rhs.firstIsland)
+      return lhs.firstIsland < rhs.firstIsland;
+    return lhs.secondIsland < rhs.secondIsland;
   });
   return compactedEdges;
 }
 
 } // namespace
 
-llvm::SmallVector<LogicalIslandCommunicationEdge, 16>
-buildIslandCommunicationEdges(
+llvm::SmallVector<IslandAffinityEdge, 16> buildIslandAffinityEdges(
     const TaskGraphDAG &dag, llvm::ArrayRef<ResourceEdge> resourceEdges,
     const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
-  llvm::SmallVector<IslandCommunicationEdge, 16> islandEdges;
+  llvm::SmallVector<IslandAffinityEdge, 16> islandEdges;
 
   for (const ResourceEdge &edge : resourceEdges) {
     auto producerIslandIt = islandByTaskIndex.find(edge.producerIndex);
@@ -76,8 +73,8 @@ buildIslandCommunicationEdges(
         consumerIslandIt == islandByTaskIndex.end())
       continue;
 
-    addIslandCommunicationEdge(islandEdges, producerIslandIt->second,
-                               consumerIslandIt->second, edge.byteSize);
+    addIslandAffinityEdge(islandEdges, producerIslandIt->second,
+                          consumerIslandIt->second, edge.byteSize);
   }
 
   llvm::SmallVector<bool, 16> eligible(dag.nodes.size(), false);
@@ -156,15 +153,62 @@ buildIslandCommunicationEdges(
       for (auto rhsIt = std::next(lhsIt); rhsIt != terminals.end(); ++rhsIt) {
         int64_t pairBytes = std::min(lhsIt->second, rhsIt->second);
         pairBytes = (pairBytes + denominator - 1) / denominator;
-        addIslandCommunicationEdge(islandEdges, lhsIt->first, rhsIt->first,
-                                   pairBytes);
+        addIslandAffinityEdge(islandEdges, lhsIt->first, rhsIt->first,
+                              pairBytes);
       }
     }
   }
 
-  return compactIslandCommunicationEdges(islandEdges);
+  return compactIslandAffinityEdges(islandEdges);
 }
 
-} // namespace task_schedulers
+IslandExecutionGraph buildIslandExecutionGraph(
+    const TaskExecutionGraph &executionGraph,
+    const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  IslandExecutionGraph islandGraph;
+  llvm::DenseMap<uint64_t, unsigned> edgeByPair;
+
+  for (const TaskExecutionEdge &edge : executionGraph.edges) {
+    auto producer = islandByTaskIndex.find(edge.producerTask);
+    auto consumer = islandByTaskIndex.find(edge.consumerTask);
+    if (producer == islandByTaskIndex.end() ||
+        consumer == islandByTaskIndex.end() ||
+        producer->second == consumer->second)
+      continue;
+
+    uint64_t key = (static_cast<uint64_t>(producer->second) << 32) |
+                   static_cast<uint64_t>(consumer->second);
+    auto existing = edgeByPair.find(key);
+    if (existing != edgeByPair.end()) {
+      IslandExecutionEdge &islandEdge = islandGraph.edges[existing->second];
+      islandEdge.controlDependency |= edge.controlDependency;
+      islandEdge.dataDependency |= edge.dataDependency;
+      islandEdge.transferredBytes += edge.transferredBytes;
+      continue;
+    }
+
+    unsigned edgeIndex = islandGraph.edges.size();
+    edgeByPair.try_emplace(key, edgeIndex);
+    islandGraph.edges.push_back(IslandExecutionEdge{
+        producer->second, consumer->second, edge.controlDependency,
+        edge.dataDependency, edge.transferredBytes});
+  }
+
+  llvm::sort(islandGraph.edges,
+             [](const IslandExecutionEdge &lhs,
+                const IslandExecutionEdge &rhs) {
+               if (lhs.producerIsland != rhs.producerIsland)
+                 return lhs.producerIsland < rhs.producerIsland;
+               return lhs.consumerIsland < rhs.consumerIsland;
+             });
+  for (const IslandExecutionEdge &edge : islandGraph.edges) {
+    islandGraph.predecessors[edge.consumerIsland].push_back(
+        edge.producerIsland);
+    islandGraph.successors[edge.producerIsland].push_back(edge.consumerIsland);
+  }
+  return islandGraph;
+}
+
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

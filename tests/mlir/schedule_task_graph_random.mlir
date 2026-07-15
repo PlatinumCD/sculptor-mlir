@@ -1,4 +1,4 @@
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=4 arrays-per-core=2 schedule=random" | FileCheck %s
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-schedule-task-graph="cores=4 arrays-per-core=2 schedule=random" | FileCheck %s
 
 module {
   func.func private @generate_task_graph() -> !sculptor.task_graph {

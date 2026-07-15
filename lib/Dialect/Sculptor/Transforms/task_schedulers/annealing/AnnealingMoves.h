@@ -1,7 +1,8 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_ANNEALING_ANNEALINGMOVES_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_ANNEALING_ANNEALINGMOVES_H
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleConfig.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Support/LogicalResult.h"
@@ -26,8 +27,8 @@ using MoveKind = AnnealingMoveKind;
 
 FailureOr<Placement>
 perturbPlacement(func::FuncOp taskGraphFunc, const Placement &current,
-                 const TaskGraphDAG &dag,
-                 const LogicalPlacementIslandGraph &islandGraph,
+                 const task_graph::TaskGraphDAG &dag,
+                 const task_graph::LogicalPlacementIslandGraph &islandGraph,
                  llvm::ArrayRef<MoveKind> enabledMoveKinds, int64_t moveRadius,
                  std::mt19937 &randomEngine);
 

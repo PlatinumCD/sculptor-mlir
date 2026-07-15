@@ -1,21 +1,26 @@
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=random" | FileCheck %s --check-prefix=RANDOM
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=snake" | FileCheck %s --check-prefix=SNAKE
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=snake annealing-move-set=segment-reverse" | FileCheck %s --check-prefix=ANNEALING
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=random annealing-move-set=basic-wide annealing-move-radius=1" | FileCheck %s --check-prefix=ANNEALING-WIDE
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=greedy greedy-heuristic=transfer-cost,boundary-regret,compact-region,lookahead=3,beam=1,scope=diagonal annealing-move-set=basic" | FileCheck %s --check-prefix=ANNEALING-GREEDY
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=move-one-position" | FileCheck %s --check-prefix=MOVE-ONE-POSITION
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=move-one-relocation" | FileCheck %s --check-prefix=MOVE-ONE-RELOCATION
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=swap-two-positions" | FileCheck %s --check-prefix=SWAP-TWO-POSITIONS
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=adjacent-swap" | FileCheck %s --check-prefix=ADJACENT-SWAP
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=segment-relocation" | FileCheck %s --check-prefix=SEGMENT-RELOCATION
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=block-swap" | FileCheck %s --check-prefix=BLOCK-SWAP
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=boundary-regret,lookahead=1,beam=1,scope=cardinal" | FileCheck %s --check-prefix=GREEDY
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,compact-region,lookahead=2,beam=1,scope=cardinal" | FileCheck %s --check-prefix=COMPACT
-// RUN: sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,scope=producer-consumer" | FileCheck %s --check-prefix=PRODUCER-CONSUMER
-// RUN: not sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=unknown" 2>&1 | FileCheck %s --check-prefix=INVALID-GREEDY-TERM
-// RUN: not sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,lookahead=0" 2>&1 | FileCheck %s --check-prefix=INVALID-GREEDY-LOOKAHEAD
-// RUN: not sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=unknown" 2>&1 | FileCheck %s --check-prefix=INVALID-ANNEALING-MOVE
-// RUN: not sculptor-mlir-opt %s --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-cooling-rate=1" 2>&1 | FileCheck %s --check-prefix=INVALID-ANNEALING-COOLING
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=random" | FileCheck %s --check-prefix=RANDOM
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=snake" | FileCheck %s --check-prefix=SNAKE
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=snake annealing-move-set=segment-reverse" | FileCheck %s --check-prefix=ANNEALING
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=random annealing-move-set=basic-wide annealing-move-radius=1" | FileCheck %s --check-prefix=ANNEALING-WIDE
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-initial-schedule=greedy greedy-heuristic=transfer-cost,boundary-regret,compact-region,lookahead=3,beam=1,scope=diagonal annealing-move-set=basic" | FileCheck %s --check-prefix=ANNEALING-GREEDY
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=move-one-position" | FileCheck %s --check-prefix=MOVE-ONE-POSITION
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=move-one-relocation" | FileCheck %s --check-prefix=MOVE-ONE-RELOCATION
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=swap-two-positions" | FileCheck %s --check-prefix=SWAP-TWO-POSITIONS
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=adjacent-swap" | FileCheck %s --check-prefix=ADJACENT-SWAP
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=segment-relocation" | FileCheck %s --check-prefix=SEGMENT-RELOCATION
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=block-swap" | FileCheck %s --check-prefix=BLOCK-SWAP
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=boundary-regret,lookahead=1,beam=1,scope=cardinal" | FileCheck %s --check-prefix=GREEDY
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy-timing greedy-heuristic=boundary-regret,lookahead=1,beam=1,scope=cardinal" | FileCheck %s --check-prefix=GREEDY-TIMING
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,compact-region,lookahead=2,beam=1,scope=cardinal" | FileCheck %s --check-prefix=COMPACT
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,scope=producer-consumer" | FileCheck %s --check-prefix=PRODUCER-CONSUMER
+// RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=unknown" 2>&1 | FileCheck %s --check-prefix=INVALID-GREEDY-TERM
+// RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy greedy-heuristic=transfer-cost,lookahead=0" 2>&1 | FileCheck %s --check-prefix=INVALID-GREEDY-LOOKAHEAD
+// RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-move-set=unknown" 2>&1 | FileCheck %s --check-prefix=INVALID-ANNEALING-MOVE
+// RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=annealing annealing-cooling-rate=1" 2>&1 | FileCheck %s --check-prefix=INVALID-ANNEALING-COOLING
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=snake random-seed=-1 greedy-heuristic=unknown annealing-initial-schedule=unknown annealing-move-set=unknown annealing-cooling-rate=2" | FileCheck %s --check-prefix=OPTION-ISOLATION
+// RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=2 schedule=random random-seed=-1" 2>&1 | FileCheck %s --check-prefix=INVALID-RANDOM-SEED
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-export-task-graph-island-map="output=%t.island-map.csv" -o /dev/null
+// RUN: FileCheck %s --check-prefix=ISLAND-MAP --input-file=%t.island-map.csv
 
 module {
   func.func private @task_matrix() -> !sculptor.logical.array {
@@ -35,9 +40,9 @@ module {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
     %input = sculptor.task_graph.input %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
     %output = sculptor.task_graph.output %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %tmp = sculptor.task_graph.temporary %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %array0 = sculptor.task_graph.temporary %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array1 = sculptor.task_graph.temporary %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %tmp = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    %array0 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %array1 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
     %setup0 = sculptor.task.create %graph, @task_matrix, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "layer0_matrix", source_layer = "layer0", source_task_ordinal = 0, inputs[], outputs[%array0], deps[] : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %setup1 = sculptor.task.create %graph, @task_matrix, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "layer1_matrix", source_layer = "layer1", source_task_ordinal = 0, inputs[], outputs[%array1], deps[] : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %mvm0 = sculptor.task.create %graph, @task_mvm, domain = "analog", task_kind = "sculptor.mvm", task_name = "layer0_mvm", source_layer = "layer0", source_task_ordinal = 1, inputs[%input, %array0], outputs[%tmp], deps[%setup0] : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task) -> !sculptor.task
@@ -49,10 +54,18 @@ module {
 // RANDOM-LABEL: func.func private @generate_task_graph
 // RANDOM-SAME: sculptor.schedule.graph_score = 8 : i64
 // RANDOM-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
+// RANDOM-SAME: sculptor.timing.island_edges = [#sculptor.timed_island_edge<producerIsland = 0 : i64, consumerIsland = 1 : i64, bytes = 8 : i64, estimatedTransferNsPerHop = 2.000000e+00 : f64, estimatedAdditionalHopNs = 1.000000e+00 : f64, criticality = 1.000000e+00 : f64, producerReadyTimeNs = 1.020000e+02 : f64, consumerTimingPressure = 1.000000e+00 : f64>]
 
 // SNAKE-LABEL: func.func private @generate_task_graph
 // SNAKE-SAME: sculptor.schedule.graph_score = 8 : i64
 // SNAKE-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
+
+// OPTION-ISOLATION-LABEL: func.func private @generate_task_graph
+// OPTION-ISOLATION-NOT: sculptor.schedule.annealing_move_set
+// OPTION-ISOLATION-NOT: sculptor.schedule.greedy_heuristic
+// OPTION-ISOLATION-SAME: sculptor.schedule.graph_score = 8 : i64
+
+// INVALID-RANDOM-SEED: expected Sculptor random scheduling seed to be non-negative
 
 // ANNEALING-LABEL: func.func private @generate_task_graph
 // ANNEALING-SAME: sculptor.schedule.annealing_move_set = "segment-reverse"
@@ -102,6 +115,13 @@ module {
 // GREEDY-SAME: sculptor.schedule.greedy_heuristic = "boundary-regret,lookahead=1,beam=1,scope=cardinal"
 // GREEDY-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
 
+// GREEDY-TIMING-LABEL: func.func private @generate_task_graph
+// GREEDY-TIMING-SAME: sculptor.schedule.graph_score = 8 : i64
+// GREEDY-TIMING-SAME: sculptor.schedule.greedy_beam_width = 1 : i64
+// GREEDY-TIMING-SAME: sculptor.schedule.greedy_candidate_scope = "cardinal"
+// GREEDY-TIMING-SAME: sculptor.schedule.greedy_heuristic = "boundary-regret,lookahead=1,beam=1,scope=cardinal"
+// GREEDY-TIMING-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
+
 // COMPACT-LABEL: func.func private @generate_task_graph
 // COMPACT-SAME: sculptor.schedule.graph_score = 8 : i64
 // COMPACT-SAME: sculptor.schedule.greedy_beam_width = 1 : i64
@@ -119,3 +139,10 @@ module {
 // INVALID-GREEDY-LOOKAHEAD: error: expected Sculptor greedy heuristic term 'lookahead' to use a positive integer value
 // INVALID-ANNEALING-MOVE: error: unknown Sculptor annealing move-set term 'unknown'
 // INVALID-ANNEALING-COOLING: error: expected Sculptor annealing cooling rate to be greater than zero and less than one
+
+// ISLAND-MAP: # graph: generate_task_graph
+// ISLAND-MAP-NEXT: task_index,island_id
+// ISLAND-MAP-NEXT: 0,0
+// ISLAND-MAP-NEXT: 1,1
+// ISLAND-MAP-NEXT: 2,0
+// ISLAND-MAP-NEXT: 3,1

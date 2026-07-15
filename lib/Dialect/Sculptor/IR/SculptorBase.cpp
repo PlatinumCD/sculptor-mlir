@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorBase.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
@@ -48,6 +49,7 @@ bool printParameterizedType(Type type, DialectAsmPrinter &printer) {
 // Installs the analog types and operations when the dialect is loaded.
 void SculptorDialect::initialize() {
   registerTypes();
+  registerAttributes();
   registerOps();
 }
 

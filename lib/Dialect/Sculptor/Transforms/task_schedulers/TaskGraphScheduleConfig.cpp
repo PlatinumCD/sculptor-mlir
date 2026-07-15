@@ -1,5 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleConfig.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -80,6 +82,92 @@ static bool parseMoveSetTerm(llvm::StringRef term,
 namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
+
+FailureOr<TaskGraphSchedulerOptions> buildTaskGraphSchedulerOptions(
+    Operation *diagnosticOp, llvm::StringRef schedule, int64_t randomSeed,
+    llvm::StringRef greedyHeuristic, llvm::StringRef annealingInitialSchedule,
+    llvm::StringRef annealingMoveSet, int64_t annealingMoveRadius,
+    double annealingInitialTemperature, double annealingFinalTemperature,
+    double annealingCoolingRate, int64_t annealingStepsPerTemperature) {
+  if (schedule == "random") {
+    if (randomSeed < 0) {
+      diagnosticOp->emitError(
+          "expected Sculptor random scheduling seed to be non-negative");
+      return failure();
+    }
+    return TaskGraphSchedulerOptions{RandomSchedulerOptions{randomSeed}};
+  }
+  if (schedule == "snake")
+    return TaskGraphSchedulerOptions{SnakeSchedulerOptions{}};
+  if (schedule == "greedy" || schedule == "greedy-timing") {
+    auto greedy = parseGreedyScheduleConfig(diagnosticOp, greedyHeuristic);
+    if (failed(greedy))
+      return failure();
+    return TaskGraphSchedulerOptions{
+        GreedySchedulerOptions{std::move(*greedy)}};
+  }
+  if (schedule == "annealing") {
+    if (randomSeed < 0) {
+      diagnosticOp->emitError(
+          "expected Sculptor annealing random seed to be non-negative");
+      return failure();
+    }
+    auto annealing = parseAnnealingScheduleConfig(
+        diagnosticOp, annealingInitialSchedule, annealingMoveSet,
+        annealingMoveRadius, annealingInitialTemperature,
+        annealingFinalTemperature, annealingCoolingRate,
+        annealingStepsPerTemperature);
+    if (failed(annealing))
+      return failure();
+
+    GreedyScheduleConfig greedyInitialPlacement;
+    if (annealing->initialSchedule == AnnealingInitialSchedule::Greedy) {
+      auto greedy = parseGreedyScheduleConfig(diagnosticOp, greedyHeuristic);
+      if (failed(greedy))
+        return failure();
+      greedyInitialPlacement = std::move(*greedy);
+    }
+    return TaskGraphSchedulerOptions{AnnealingSchedulerOptions{
+        std::move(*annealing), std::move(greedyInitialPlacement), randomSeed}};
+  }
+
+  if (schedule.empty())
+    diagnosticOp->emitError("expected task graph schedule name");
+  else
+    diagnosticOp->emitError("unknown task graph schedule '") << schedule << "'";
+  return failure();
+}
+
+static void attachGreedyAttrs(Operation *op, Builder &builder,
+                              const GreedyScheduleConfig &config) {
+  op->setAttr(schedule_attrs::kGreedyLookaheadAttrName,
+              builder.getI64IntegerAttr(config.lookahead));
+  op->setAttr(schedule_attrs::kGreedyBeamWidthAttrName,
+              builder.getI64IntegerAttr(config.beamWidth));
+  op->setAttr(schedule_attrs::kGreedyCandidateScopeAttrName,
+              builder.getStringAttr(
+                  stringifyGreedyCandidateScope(config.candidateScope)));
+  op->setAttr(schedule_attrs::kGreedyHeuristicAttrName,
+              builder.getStringAttr(config.specification));
+}
+
+void attachTaskGraphSchedulerOptionAttrs(
+    Operation *op, Builder &builder, const TaskGraphSchedulerOptions &options) {
+  if (const auto *greedy = std::get_if<GreedySchedulerOptions>(&options)) {
+    attachGreedyAttrs(op, builder, greedy->greedy);
+    return;
+  }
+
+  const auto *annealing = std::get_if<AnnealingSchedulerOptions>(&options);
+  if (!annealing)
+    return;
+  op->setAttr(schedule_attrs::kAnnealingMoveSetAttrName,
+              builder.getStringAttr(annealing->annealing.moveSetSpecification));
+  op->setAttr(schedule_attrs::kAnnealingMoveRadiusAttrName,
+              builder.getI64IntegerAttr(annealing->annealing.moveRadius));
+  if (annealing->annealing.initialSchedule == AnnealingInitialSchedule::Greedy)
+    attachGreedyAttrs(op, builder, annealing->greedyInitialPlacement);
+}
 
 llvm::StringRef stringifyGreedyCandidateScope(GreedyCandidateScope scope) {
   switch (scope) {

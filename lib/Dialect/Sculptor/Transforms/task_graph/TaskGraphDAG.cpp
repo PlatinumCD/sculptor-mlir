@@ -15,7 +15,7 @@ static bool isLogicalArrayResource(mlir::Value value) {
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 
 FailureOr<TaskGraphDAG> parseTaskGraphDAG(func::FuncOp taskGraphFunc) {
   if (!taskGraphFunc.getBody().hasOneBlock()) {
@@ -67,6 +67,6 @@ FailureOr<TaskGraphDAG> parseTaskGraphDAG(func::FuncOp taskGraphFunc) {
   return dag;
 }
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

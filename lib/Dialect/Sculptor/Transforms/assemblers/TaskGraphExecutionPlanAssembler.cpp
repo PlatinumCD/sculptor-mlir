@@ -1,30 +1,24 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyStep.h"
-
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphExecutionPlan.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
-#include <climits>
 #include <cstddef>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -74,57 +68,13 @@ struct FreeAllocation {
   size_t size = 0;
 };
 
-mlir::FailureOr<size_t> getStaticByteSize(mlir::Type valueType) {
-  if (llvm::isa<mlir::sculptor::RuntimeHandleType,
-                mlir::sculptor::LogicalArrayType>(valueType))
-    return static_cast<size_t>(0);
-
-  auto getByteSize =
-      [](mlir::ShapedType shapedType) -> mlir::FailureOr<size_t> {
-    if (!shapedType.hasStaticShape() || !shapedType.getElementType().isF32())
-      return mlir::failure();
-
-    int64_t elementCount = shapedType.getNumElements();
-    if (elementCount < 0)
-      return mlir::failure();
-
-    return static_cast<size_t>(elementCount) * sizeof(float);
-  };
-
-  if (auto floatType = llvm::dyn_cast<mlir::FloatType>(valueType)) {
-    unsigned bitWidth = floatType.getWidth();
-    if (bitWidth == 0)
-      return mlir::failure();
-
-    return llvm::divideCeil(static_cast<size_t>(bitWidth),
-                            static_cast<size_t>(CHAR_BIT));
-  }
-
-  if (auto rankedTensorType = llvm::dyn_cast<mlir::RankedTensorType>(valueType))
-    return getByteSize(rankedTensorType);
-
-  if (auto memRefType = llvm::dyn_cast<mlir::MemRefType>(valueType))
-    return getByteSize(memRefType);
-
-  return mlir::failure();
-}
-
-mlir::FailureOr<size_t> getResourceByteSize(mlir::Value resourceValue) {
-  auto resourceType =
-      llvm::dyn_cast<mlir::sculptor::TaskResourceType>(resourceValue.getType());
-  if (!resourceType)
-    return mlir::failure();
-
-  return getStaticByteSize(resourceType.getValueType());
-}
-
 template <typename OpT>
 mlir::LogicalResult
 recordResource(OpT resourceOp, ExecutablePlan &plan,
                llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-               llvm::SmallVectorImpl<mlir::Value> &temporaryResources) {
-  mlir::FailureOr<size_t> byteSize =
-      getResourceByteSize(resourceOp.getResult());
+               llvm::SmallVectorImpl<mlir::Value> &intermediateResources) {
+  mlir::FailureOr<int64_t> byteSize =
+      mlir::sculptor::getTaskResourceByteSize(resourceOp.getResult());
   if (failed(byteSize)) {
     resourceOp.emitError("expected runtime resources to carry runtime handles, "
                          "float scalars, or static f32 tensor/memref payloads");
@@ -133,10 +83,10 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
 
   ResourceInfo info;
   info.slot = resourceInfoByValue.size();
-  info.byteSize = *byteSize;
-  if constexpr (std::is_same_v<OpT, mlir::sculptor::TaskGraphTemporaryOp>) {
-    info.tempIndex = temporaryResources.size();
-    temporaryResources.push_back(resourceOp.getResult());
+  info.byteSize = static_cast<size_t>(*byteSize);
+  if constexpr (std::is_same_v<OpT, mlir::sculptor::TaskGraphIntermediateOp>) {
+    info.tempIndex = intermediateResources.size();
+    intermediateResources.push_back(resourceOp.getResult());
   }
 
   resourceInfoByValue.try_emplace(resourceOp.getResult(), info);
@@ -153,27 +103,28 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
 mlir::LogicalResult
 collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
                  llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-                 llvm::SmallVectorImpl<mlir::Value> &temporaryResources) {
+                 llvm::SmallVectorImpl<mlir::Value> &intermediateResources) {
   mlir::Block &block = taskGraphFunc.getBody().front();
   for (mlir::Operation &op : block) {
     if (auto inputOp = llvm::dyn_cast<mlir::sculptor::TaskGraphInputOp>(&op)) {
       if (failed(recordResource(inputOp, plan, resourceInfoByValue,
-                                temporaryResources)))
+                                intermediateResources)))
         return mlir::failure();
       continue;
     }
 
-    if (auto outputOp = llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op)) {
+    if (auto outputOp =
+            llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op)) {
       if (failed(recordResource(outputOp, plan, resourceInfoByValue,
-                                temporaryResources)))
+                                intermediateResources)))
         return mlir::failure();
       continue;
     }
 
-    if (auto temporaryOp =
-            llvm::dyn_cast<mlir::sculptor::TaskGraphTemporaryOp>(&op)) {
-      if (failed(recordResource(temporaryOp, plan, resourceInfoByValue,
-                                temporaryResources)))
+    if (auto intermediateOp =
+            llvm::dyn_cast<mlir::sculptor::TaskGraphIntermediateOp>(&op)) {
+      if (failed(recordResource(intermediateOp, plan, resourceInfoByValue,
+                                intermediateResources)))
         return mlir::failure();
       continue;
     }
@@ -181,17 +132,17 @@ collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
     if (auto persistentOp =
             llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op)) {
       if (failed(recordResource(persistentOp, plan, resourceInfoByValue,
-                                temporaryResources)))
+                                intermediateResources)))
         return mlir::failure();
     }
   }
 
   plan.resourceCount = resourceInfoByValue.size();
-  plan.tempCount = temporaryResources.size();
+  plan.tempCount = intermediateResources.size();
   plan.tempBaseSlot = plan.resourceCount;
-  if (!temporaryResources.empty())
+  if (!intermediateResources.empty())
     plan.tempBaseSlot =
-        resourceInfoByValue.lookup(temporaryResources.front()).slot;
+        resourceInfoByValue.lookup(intermediateResources.front()).slot;
 
   return mlir::success();
 }
@@ -251,14 +202,14 @@ void updateIntervalUse(TempInterval &interval, unsigned taskIndex) {
 }
 
 void buildTemporaryIntervals(
-    llvm::ArrayRef<mlir::Value> temporaryResources,
+    llvm::ArrayRef<mlir::Value> intermediateResources,
     const llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
     llvm::SmallVectorImpl<TempInterval> &intervals,
     llvm::DenseMap<uint32_t, uint32_t> &tempIndexBySlot) {
-  intervals.reserve(temporaryResources.size());
-  for (mlir::Value temporaryResource : temporaryResources) {
+  intervals.reserve(intermediateResources.size());
+  for (mlir::Value intermediateResource : intermediateResources) {
     const ResourceInfo &resourceInfo =
-        resourceInfoByValue.lookup(temporaryResource);
+        resourceInfoByValue.lookup(intermediateResource);
     TempInterval interval;
     interval.slot = resourceInfo.slot;
     interval.tempIndex = *resourceInfo.tempIndex;
@@ -351,8 +302,8 @@ chooseTemporaryOffset(size_t byteSize, size_t workspaceSize,
 mlir::LogicalResult packTemporaryWorkspace(
     mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
     llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-    llvm::ArrayRef<mlir::Value> temporaryResources) {
-  if (temporaryResources.empty()) {
+    llvm::ArrayRef<mlir::Value> intermediateResources) {
+  if (intermediateResources.empty()) {
     plan.workspaceSize = 0;
     plan.tempOffsets.clear();
     return mlir::success();
@@ -360,7 +311,7 @@ mlir::LogicalResult packTemporaryWorkspace(
 
   llvm::DenseMap<uint32_t, uint32_t> tempIndexBySlot;
   llvm::SmallVector<TempInterval> intervals;
-  buildTemporaryIntervals(temporaryResources, resourceInfoByValue, intervals,
+  buildTemporaryIntervals(intermediateResources, resourceInfoByValue, intervals,
                           tempIndexBySlot);
   recordTemporaryUses(plan.tasks, tempIndexBySlot, intervals);
   if (failed(verifyTemporaryUses(taskGraphFunc, intervals)))
@@ -370,7 +321,7 @@ mlir::LogicalResult packTemporaryWorkspace(
 
   llvm::SmallVector<ActiveAllocation> activeAllocations;
   llvm::SmallVector<FreeAllocation> freeAllocations;
-  plan.tempOffsets.assign(temporaryResources.size(), 0);
+  plan.tempOffsets.assign(intermediateResources.size(), 0);
   plan.workspaceSize = 0;
 
   for (TempInterval &interval : intervals) {
@@ -419,13 +370,13 @@ buildExecutablePlan(mlir::func::FuncOp taskGraphFunc) {
 
   ExecutablePlan plan;
   llvm::DenseMap<mlir::Value, ResourceInfo> resourceInfoByValue;
-  llvm::SmallVector<mlir::Value> temporaryResources;
+  llvm::SmallVector<mlir::Value> intermediateResources;
 
   if (failed(collectResources(taskGraphFunc, plan, resourceInfoByValue,
-                              temporaryResources)) ||
+                              intermediateResources)) ||
       failed(collectTasks(taskGraphFunc, plan, resourceInfoByValue)) ||
       failed(packTemporaryWorkspace(taskGraphFunc, plan, resourceInfoByValue,
-                                    temporaryResources))) {
+                                    intermediateResources))) {
     return mlir::failure();
   }
 
@@ -442,10 +393,10 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
   }
 
   llvm::DenseMap<mlir::Value, ResourceInfo> resourceInfoByValue;
-  llvm::SmallVector<mlir::Value> temporaryResources;
+  llvm::SmallVector<mlir::Value> intermediateResources;
   ExecutablePlan recomputedPlan;
   if (failed(collectResources(taskGraphFunc, recomputedPlan,
-                              resourceInfoByValue, temporaryResources))) {
+                              resourceInfoByValue, intermediateResources))) {
     return mlir::failure();
   }
 
@@ -470,10 +421,10 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
   taskGraphFunc->setAttr(runtime_attrs::kTaskGraphWorkspaceSizeAttrName,
                          builder.getI64IntegerAttr(plan.workspaceSize));
 
-  for (mlir::Value temporaryResource : temporaryResources) {
+  for (mlir::Value intermediateResource : intermediateResources) {
     const ResourceInfo &resourceInfo =
-        resourceInfoByValue.lookup(temporaryResource);
-    mlir::Operation *resourceOp = temporaryResource.getDefiningOp();
+        resourceInfoByValue.lookup(intermediateResource);
+    mlir::Operation *resourceOp = intermediateResource.getDefiningOp();
     resourceOp->setAttr(runtime_attrs::kResourceTempIndexAttrName,
                         builder.getI64IntegerAttr(*resourceInfo.tempIndex));
     resourceOp->setAttr(
@@ -510,31 +461,6 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
   return mlir::success();
 }
 
-class TaskGraphExecutionPlanAssembler final
-    : public mlir::sculptor::TaskGraphAssemblyStep {
-public:
-  mlir::StringRef getName() const final { return "TaskGraphExecutionPlan"; }
-
-  mlir::LogicalResult assemble(mlir::ModuleOp module,
-                               mlir::func::FuncOp forward) const final {
-    auto taskGraphFunc =
-        mlir::sculptor::assembler_utils::lookupGeneratedTaskGraphFunc(module,
-                                                                    forward);
-    if (!taskGraphFunc) {
-      forward.emitError("expected task graph scaffold to create a generator "
-                        "function");
-      return mlir::failure();
-    }
-
-    if (failed(mlir::sculptor::rebuildTaskGraphExecutionPlan(taskGraphFunc))) {
-      return mlir::failure();
-    }
-
-    mlir::sculptor::assembler_utils::clearAssemblyAttrs(forward, taskGraphFunc);
-    return mlir::success();
-  }
-};
-
 } // namespace
 
 namespace mlir {
@@ -542,17 +468,12 @@ namespace sculptor {
 
 LogicalResult rebuildTaskGraphExecutionPlan(func::FuncOp taskGraphFunc) {
   auto executablePlan = buildExecutablePlan(taskGraphFunc);
-  if (failed(executablePlan) ||
-      failed(annotateTaskGraphWithExecutablePlan(taskGraphFunc,
-                                                *executablePlan))) {
+  if (failed(executablePlan) || failed(annotateTaskGraphWithExecutablePlan(
+                                    taskGraphFunc, *executablePlan))) {
     return failure();
   }
 
   return success();
-}
-
-void registerTaskGraphExecutionPlanAssembler(TaskGraphAssemblySteps &steps) {
-  steps.push_back(std::make_unique<TaskGraphExecutionPlanAssembler>());
 }
 
 } // namespace sculptor

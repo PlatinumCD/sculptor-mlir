@@ -15,6 +15,7 @@ The selected strategy is controlled by the `schedule` option on
 | `random` | Baseline randomized physical-array order with shared island materialization and digital placement. |
 | `snake` | Deterministic mesh traversal that fills local arrays before moving to the next core, with shared island materialization and digital placement. |
 | `greedy` | Island-level lookahead search over configurable candidate core scopes. |
+| `greedy-timing` | Timing-prioritized Greedy search that minimizes predicted completion time before communication pressure, resource load, and legacy placement cost. |
 | `annealing` | Simulated annealing over physical-array orders with configurable initial schedules and perturbation move sets. |
 
 
@@ -35,35 +36,96 @@ The scheduler implementation is split by responsibility:
 | `TaskGraphPlacementObjective.h/.cpp` | Shared island transfer and boundary objective. |
 | `TaskGraphPlacement.h` | Central placement-plan commit and placement attachment API. |
 | `TaskGraphPlacementUtils.cpp` | Physical placement materialization and fallback core propagation. |
-| `task_graph/TaskGraphScheduleMetadata.h/.cpp` | Final schedule metadata, logical-array layout, transfer summaries, graph score, and digital op counts. |
+| `task_schedulers/TaskGraphScheduleMetadata.h/.cpp` | Final schedule metadata, logical-array layout, transfer summaries, graph score, and digital op counts. |
 | `GreedySearch.h`, `greedy/` | Public Greedy planner plus private heuristics, candidate expansion, traversal, and terminal repair. |
 | `annealing/` | Annealing perturbations and cooling/search loop. |
 | `task_graph/TaskGraphRoutineFuser.h/.cpp` | Post-schedule task routine fusion. |
-| `task_graph/TaskGraphScorer.h/.cpp` | Mesh transfer scoring and boundary penalty computation. |
+| `task_schedulers/TaskGraphScorer.h/.cpp` | Mesh transfer scoring and boundary penalty computation. |
 
 <details class="doc-section" open markdown="1">
 <summary markdown="block">## Placement Pass Flow</summary>
 
 
-`sculptor-schedule-task-graph` does more than call a strategy. The strategy
-chooses placements, but the pass owns the full scheduling/finalization flow:
+`sculptor-build-task-graph-islands` owns logical grouping:
+
+1. Parse each task graph function into a `TaskGraphDAG`.
+2. Seed matrix setup and MVM islands.
+3. Assign digital tasks and construct island communication edges.
+4. Attach stable island IDs to the resulting island members.
+
+`sculptor-analyze-task-graph-timing` operates in two modes. Before placement it
+computes the dependency-only profile consumed by timing-aware schedulers.
+Ordinary schedulers do not require this invocation. After placement it detects
+the attached core IDs and mesh dimensions, then adds
+routed communication latency and link contention. Both modes reuse the task
+DAG rather than creating a second graph in the IR. The pass unions explicit
+task dependencies with task-resource producer-consumer edges, topologically
+validates that complete execution view, and computes:
+
+1. task topological index and dependency depth;
+2. control/data predecessor counts and data bytes;
+3. intrinsic analog or digital latency;
+4. earliest start, earliest finish, and remaining critical-path latency;
+5. graph critical-path and execution-depth summaries; and
+6. total, analog, and digital work for every logical island.
+
+An analog compute task is modeled as three sequential phases on its logical
+array:
+
+```text
+load -> execute -> store
+
+load_ns    = ceil(input_bits / analog_io_bits_per_cycle) / digital_clock_ghz
+execute_ns = analog_mvm_latency_ns
+store_ns   = ceil(output_bits / analog_io_bits_per_cycle) / digital_clock_ghz
+latency_ns = load_ns + execute_ns + store_ns
+```
+
+The pass attaches all three phase durations to the task. It does not introduce
+dependencies between different logical arrays, so independent arrays can have
+overlapping load, execute, or store phases. Serialization of repeated work on
+one physical array and shared I/O contention depend on the eventual placement
+and are therefore deferred to placement-aware timing evaluation.
+
+The first invocation produces a placement-independent critical-path lower
+bound. Exact mesh hops and network contention are absent because the physical
+schedule does not exist yet. The scheduler can consume this timing metadata
+together with placement-dependent communication costs.
+
+After placement, the pipeline invokes the timing pass again. Data transfers use
+deterministic XY routing over directed mesh links. A transfer is divided into
+`network_link_bits_per_cycle` flits, incurs
+`network_hop_latency_cycles` forwarding latency per hop, and reserves every
+directed link on its route. A transfer that reaches a busy link waits until the
+link becomes available, so competing routes delay downstream consumers. With
+pipelining enabled, an uncontended transfer takes:
+
+```text
+flits = ceil(resource_bits / network_link_bits_per_cycle)
+latency_cycles = flits + hops * network_hop_latency_cycles - 1
+```
+
+The placement-aware result records each execution edge's source and destination
+core, mesh hops, transfer window, latency, and contention delay. Control-only
+dependencies remain zero-byte, zero-latency ordering edges. This model does not
+yet serialize processor execution, physical-array reuse, shared analog I/O, or
+network backpressure beyond directed-link availability.
+
+`sculptor-schedule-task-graph` consumes those islands and owns physical
+placement and placement metadata:
 
 1. Validate the hardware budget and attach module-level budget metadata.
 2. Parse each task graph function into a `TaskGraphDAG`.
-3. Build logical placement islands once and look up the selected scheduler.
+3. Reconstruct and validate the island graph from the attached island IDs.
 4. Ask the scheduler for an `IslandPlacementPlan` without mutating IR.
 5. Validate and commit that plan through the shared placement materializer.
-6. Fuse same-core task components.
-7. Erase unused task callees and temporary resources.
-8. Rebuild the runtime execution plan.
-9. Reparse the compacted task graph.
-10. Finalize schedule metadata, transfer summaries, graph score, and resource
-   layout.
+6. Attach core IDs and analog-array placement.
+7. Finalize transfer summaries and the placement score on the unfused graph.
 
-That ordering matters. Same-core routine fusion can remove task nodes and graph
-resources, so the pass reparses the graph before final metadata is computed.
-The final score and runtime resource layout describe the graph that will
-actually be consumed by later lowering and runtime emission.
+Topology changes and runtime allocation are deliberately separate. The
+`sculptor-fuse-task-graph` pass runs after scheduling, placement-aware timing is
+recomputed on the fused graph, and `sculptor-finalize-task-graph-resources`
+assigns runtime storage only after fusion has removed internal resources.
 
 </details>
 
@@ -80,9 +142,18 @@ The placement pass receives a hardware budget through pass parameters.
 | `topology` | Interconnect topology used for transfer-cost summaries. The current implementation supports `mesh`. |
 | `mesh-rows` | Number of rows in the mesh topology. |
 | `mesh-cols` | Number of columns in the mesh topology. If set to `0`, it is inferred from `cores` and `mesh-rows`. |
+| `analog-mvm-latency-ns` | Fixed execution latency of one analog MVM. The default is `100` ns. |
+| `analog-io-bits-per-cycle` | Per-array analog load/store bandwidth. The default is `256` bits/cycle. |
+| `analog-io-shared` | Records whether analog loads and stores share bandwidth. Shared-I/O arbitration is not yet serialized. |
+| `digital-clock-ghz` | Clock used to convert digital, analog-I/O, and network cycles to nanoseconds. The default is `1.0`. |
+| `digital-issue-width` | Maximum scalar digital operations issued per cycle. The default is `2`. |
+| `digital-vector-bits-per-cycle` | Maximum vector throughput used for digital work estimation. The default is `256`. |
+| `network-link-bits-per-cycle` | Transfer bandwidth of each directed mesh link. The default is `32`. |
+| `network-hop-latency-cycles` | Forwarding latency incurred for each mesh hop. The default is `1`. |
+| `network-pipelined` | Selects pipelined or store-and-forward traversal across a multi-hop route. The default is `true`. |
 | `schedule` | Name of a registered placement strategy. |
 | `random-seed` | Seed used by randomized schedulers. The default is `0` for reproducible output. |
-| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` scheduler. Terms are comma-separated, such as `transfer-cost,compact-region,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, and `compact-region`; supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
+| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` and `greedy-timing` schedulers. Terms are comma-separated, such as `transfer-cost,compact-region,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, and `compact-region`; supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. For `greedy-timing`, scoring terms are the final tie-breaker after timing objectives. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
 | `annealing-initial-schedule` | Initial placement schedule used by the `annealing` scheduler: `identity`, `random`, `snake`, or `greedy`. The default is `snake`. The `greedy` initializer uses the configured `greedy-heuristic` terms. |
 | `annealing-move-set` | Comma-separated perturbation moves used by the `annealing` scheduler. Supported presets are `basic`, `basic-wide`, and `all`; individual moves are `move-one-position`, `move-one-relocation`, `swap-two-positions`, `adjacent-swap`, `segment-reverse`, `segment-relocation`, and `block-swap`. The default is `basic`. |
 | `annealing-move-radius` | Maximum physical-array-order index distance for single-position annealing moves. `0` means unbounded/global. The default is `0`. |
@@ -122,6 +193,7 @@ coordinates.
 
 ```bash
 sculptor-mlir-opt model.mlir \
+  --sculptor-build-task-graph-islands \
   --sculptor-schedule-task-graph="cores=4 arrays-per-core=2 topology=mesh mesh-rows=2 mesh-cols=2 schedule=snake"
 ```
 
@@ -217,15 +289,15 @@ placements illegal.
 <summary markdown="block">## Shared Routine Fusion</summary>
 
 
-Routine fusion is a post-scheduler cleanup step, not a property of one
-placement strategy. It only fuses tasks that have already been placed on the
-same core and can be represented as a single component task without violating
-dependency order.
+Routine fusion is an explicit post-scheduler pass, not a property of one
+placement strategy. It only fuses directly connected tasks that share both
+`sculptor.schedule.island_id` and `sculptor.runtime.core_id` and can be
+represented as a single component task without violating dependency order.
 
-Internal temporary task graph resources that only connected fused tasks are
-erased. After fusion, the pass rebuilds resource slots, temporary indices,
-temporary offsets, workspace size, and task indices so downstream runtime code
-sees a compact graph.
+Internal intermediate task graph resources that only connected fused tasks are
+erased. The later `sculptor-finalize-task-graph-resources` pass assigns resource
+slots, intermediate indices and offsets, workspace size, and task indices to
+the compact graph.
 
 </details>
 
@@ -318,6 +390,42 @@ With `lookahead=1`, the scheduler scores only the current island. With
 before committing the current placement.
 
 This keeps the scheduler runnable while making the search policy explicit.
+
+</details>
+
+<details class="doc-section" open markdown="1">
+<summary markdown="block">## Timing-Aware Greedy Schedule</summary>
+
+
+`greedy-timing` reuses Greedy's candidate scopes, lookahead, beam search, and
+optional boundary repair, but changes both island ordering and candidate
+ranking. It derives directed island precedence from the task DAG rather than
+the undirected locality graph. Across all unplaced islands it prioritizes
+critical islands, larger remaining critical paths, lower slack, and larger
+work. Placement order is deliberately independent of execution readiness: an
+island can contain both early analog work and a late fan-in, and such an island
+must remain eligible to serve as a spatial anchor.
+
+For each candidate, the search estimates predecessor data-arrival time from
+the profile's edge transfer estimate and the candidate mesh distance. It also
+tracks per-array analog availability and per-core digital availability.
+Each timed edge carries both its one-hop transfer estimate and the incremental
+cost of every additional hop, preserving pipelined and non-pipelined network
+behavior without passing the hardware timing model into the scheduler.
+Candidates are compared lexicographically by:
+
+1. predicted placement makespan;
+2. communication latency exposed beyond endpoint slack, weighted by edge
+   criticality and consumer timing pressure;
+3. maximum accumulated analog-array or digital-core work; and
+4. the configured legacy Greedy heuristic score.
+
+This keeps quantities with different units out of one arbitrary weighted sum.
+The existing byte-hop graph score is still emitted after placement so timing
+and locality results remain directly comparable. Exact routed-link contention
+is evaluated by the placement-aware timing pass after scheduling; the Greedy
+search currently uses a contention-free incremental estimate while exploring
+candidates.
 
 </details>
 
@@ -446,12 +554,11 @@ schedule=<registered-strategy-name>
 <summary markdown="block">## Scheduled Metadata</summary>
 
 
-After scheduling and finalization, the task graph and task functions carry
-runtime-facing metadata.
+Scheduling, fusion, and resource finalization add distinct metadata layers.
 
 | Metadata | Meaning |
 |---|---|
-| Task index | Stable runtime order for task execution. |
+| Island id | Stable logical island membership established before physical placement. |
 | Core id | Runtime core assigned to the task. |
 | Physical array id | Analog array assigned to matrix setup and MVM tasks. |
 | Local array id | Core-local analog array id derived from physical array id. |
@@ -459,7 +566,8 @@ runtime-facing metadata.
 | Transfer summary | Inter-core byte movement and mesh-distance transfer cost. |
 | Graph score | Transfer cost plus any boundary penalty. |
 | Digital op count | Static estimate of digital work attached to scheduled tasks. |
-| Runtime resource layout | Resource slots, temporary indices, temporary offsets, and workspace size after any task fusion. |
+| Task index | Runtime order assigned during resource finalization. |
+| Runtime resource layout | Resource slots, intermediate indices, offsets, and workspace size assigned after task fusion. |
 
 Later lowering and graph emission consume this metadata instead of recomputing
 placement decisions from the task graph.

@@ -1,7 +1,7 @@
 #include "TaskGraphIslandInternals.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTaskKinds.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
@@ -374,6 +374,6 @@ LogicalResult assignRemainingDigitalIslandsByLocalAffinity(
   return mlir::success();
 }
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

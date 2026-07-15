@@ -1,10 +1,12 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphRoutineFuser.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -24,19 +26,20 @@
 
 namespace mlir {
 namespace sculptor {
-namespace task_schedulers {
+namespace task_graph {
 namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_attrs = mlir::sculptor::task_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
+namespace timing_attrs = mlir::sculptor::timing_attrs;
 
 static constexpr llvm::StringLiteral kFusedMixedTaskDomain("digital");
 static constexpr llvm::StringLiteral kFusedMixedTaskKind("mixed.fused");
 
 using TaskFusionPatternFn = LogicalResult (*)(ModuleOp module,
                                               func::FuncOp taskGraphFunc,
-                                              const HardwareBudget &budget,
                                               const TaskGraphDAG &dag,
                                               bool &changed);
 
@@ -45,11 +48,13 @@ struct TaskFusionPattern {
   TaskFusionPatternFn apply;
 };
 
-struct SameCoreFusibleComponent {
+struct IslandFusibleComponent {
   llvm::SmallVector<const TaskGraphNode *, 8> nodes;
   int64_t coreId = 0;
+  int64_t islandId = 0;
   std::string fusedTaskName;
   std::optional<int64_t> physicalArrayId;
+  std::optional<int64_t> localArrayId;
 };
 
 struct ComponentBoundary {
@@ -162,7 +167,8 @@ static bool isMatrixSetupTask(mlir::sculptor::TaskCreateOp taskOp) {
 static bool isComponentFusibleTask(mlir::sculptor::TaskCreateOp taskOp) {
   // Matrix setup produces logical-array resources used by schedule metadata.
   // Keep it explicit and let fused MVM/digital components depend on it.
-  return !isMatrixSetupTask(taskOp) && getOptionalScheduledCore(taskOp);
+  return !isMatrixSetupTask(taskOp) && getOptionalScheduledCore(taskOp) &&
+         getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
 }
 
 static std::optional<int64_t>
@@ -186,9 +192,24 @@ static std::optional<int64_t> getSingleComponentPhysicalArray(
   return physicalArrayId;
 }
 
+static std::optional<int64_t>
+getSingleComponentLocalArray(ArrayRef<const TaskGraphNode *> componentNodes) {
+  std::optional<int64_t> localArrayId;
+  for (const TaskGraphNode *node : componentNodes) {
+    std::optional<int64_t> taskLocalArray = getOptionalI64Attr(
+        node->op.operator->(), runtime_attrs::kTaskLocalArrayIdAttrName);
+    if (!taskLocalArray)
+      continue;
+    if (localArrayId && *localArrayId != *taskLocalArray)
+      return std::nullopt;
+    localArrayId = *taskLocalArray;
+  }
+  return localArrayId;
+}
+
 static std::string
-buildFusedSameCoreComponentTaskName(ArrayRef<const TaskGraphNode *> nodes,
-                                    llvm::StringSet<> &usedTaskNames) {
+buildFusedIslandComponentTaskName(ArrayRef<const TaskGraphNode *> nodes,
+                                  llvm::StringSet<> &usedTaskNames) {
   if (nodes.empty())
     return buildUniqueFusedTaskName("same_core_component", usedTaskNames);
 
@@ -263,9 +284,9 @@ static bool allComponentNodesHaveCore(ArrayRef<const TaskGraphNode *> nodes,
   return true;
 }
 
-static llvm::SmallVector<SameCoreFusibleComponent, 16>
-collectSameCoreFusibleComponents(const TaskGraphDAG &dag) {
-  llvm::SmallVector<SameCoreFusibleComponent, 16> components;
+static llvm::SmallVector<IslandFusibleComponent, 16>
+collectIslandFusibleComponents(const TaskGraphDAG &dag) {
+  llvm::SmallVector<IslandFusibleComponent, 16> components;
   llvm::SmallVector<bool, 64> eligible(dag.nodes.size(), false);
   llvm::SmallVector<bool, 64> visited(dag.nodes.size(), false);
   llvm::StringSet<> usedTaskNames = collectTaskNames(dag);
@@ -278,7 +299,9 @@ collectSameCoreFusibleComponents(const TaskGraphDAG &dag) {
       continue;
 
     std::optional<int64_t> coreId = getOptionalScheduledCore(seed.op);
-    if (!coreId)
+    std::optional<int64_t> islandId = getOptionalI64Attr(
+        seed.op.operator->(), schedule_attrs::kIslandIdAttrName);
+    if (!coreId || !islandId)
       continue;
 
     llvm::SmallVector<unsigned, 16> stack;
@@ -298,6 +321,10 @@ collectSameCoreFusibleComponents(const TaskGraphDAG &dag) {
         std::optional<int64_t> neighborCore =
             getOptionalScheduledCore(neighbor.op);
         if (!neighborCore || *neighborCore != *coreId)
+          return;
+        std::optional<int64_t> neighborIslandId = getOptionalI64Attr(
+            neighbor.op.operator->(), schedule_attrs::kIslandIdAttrName);
+        if (!neighborIslandId || *neighborIslandId != *islandId)
           return;
         visited[neighborIndex] = true;
         stack.push_back(neighborIndex);
@@ -319,13 +346,15 @@ collectSameCoreFusibleComponents(const TaskGraphDAG &dag) {
     if (!allComponentNodesHaveCore(nodes, *coreId))
       continue;
 
-    SameCoreFusibleComponent component;
+    IslandFusibleComponent component;
     component.nodes = std::move(nodes);
     component.coreId = *coreId;
+    component.islandId = *islandId;
     component.physicalArrayId =
         getSingleComponentPhysicalArray(component.nodes);
+    component.localArrayId = getSingleComponentLocalArray(component.nodes);
     component.fusedTaskName =
-        buildFusedSameCoreComponentTaskName(component.nodes, usedTaskNames);
+        buildFusedIslandComponentTaskName(component.nodes, usedTaskNames);
     components.push_back(std::move(component));
   }
 
@@ -358,7 +387,7 @@ static bool isComponentOutputResource(
 }
 
 static FailureOr<ComponentBoundary> computeComponentBoundary(
-    const SameCoreFusibleComponent &component, const TaskGraphDAG &dag,
+    const IslandFusibleComponent &component, const TaskGraphDAG &dag,
     const llvm::DenseMap<Value, const TaskGraphNode *> &producerByResource,
     const llvm::DenseMap<Value, llvm::SmallVector<const TaskGraphNode *, 4>>
         &consumersByResource,
@@ -448,9 +477,9 @@ static LogicalResult collectComponentMappedReturnValues(
 }
 
 static FailureOr<func::FuncOp>
-buildSameCoreComponentCallee(ModuleOp module,
-                             const SameCoreFusibleComponent &component,
-                             const ComponentBoundary &boundary) {
+buildIslandComponentCallee(ModuleOp module,
+                           const IslandFusibleComponent &component,
+                           const ComponentBoundary &boundary) {
   MLIRContext *context = module.getContext();
   Builder builder(context);
 
@@ -624,14 +653,11 @@ static void replaceComponentDependenciesWithFusedTask(
 }
 
 static FailureOr<mlir::sculptor::TaskCreateOp>
-fuseSameCoreComponent(ModuleOp module, func::FuncOp taskGraphFunc,
-                      const SameCoreFusibleComponent &component,
-                      const ComponentBoundary &boundary,
-                      const HardwareBudget &budget) {
-  (void)budget;
-
+fuseIslandComponent(ModuleOp module, func::FuncOp taskGraphFunc,
+                    const IslandFusibleComponent &component,
+                    const ComponentBoundary &boundary) {
   FailureOr<func::FuncOp> fusedFunc =
-      buildSameCoreComponentCallee(module, component, boundary);
+      buildIslandComponentCallee(module, component, boundary);
   if (failed(fusedFunc))
     return failure();
 
@@ -654,9 +680,54 @@ fuseSameCoreComponent(ModuleOp module, func::FuncOp taskGraphFunc,
 
   fusedTask->setAttr(runtime_attrs::kTaskCoreIdAttrName,
                      builder.getI64IntegerAttr(component.coreId));
-  if (component.physicalArrayId)
+  (*fusedFunc)
+      ->setAttr(runtime_attrs::kTaskCoreIdAttrName,
+                builder.getI64IntegerAttr(component.coreId));
+  fusedTask->setAttr(schedule_attrs::kIslandIdAttrName,
+                     builder.getI64IntegerAttr(component.islandId));
+  if (component.physicalArrayId) {
     fusedTask->setAttr(runtime_attrs::kTaskPhysicalArrayIdAttrName,
                        builder.getI64IntegerAttr(*component.physicalArrayId));
+    (*fusedFunc)
+        ->setAttr(runtime_attrs::kTaskPhysicalArrayIdAttrName,
+                  builder.getI64IntegerAttr(*component.physicalArrayId));
+  }
+  if (component.localArrayId) {
+    fusedTask->setAttr(runtime_attrs::kTaskLocalArrayIdAttrName,
+                       builder.getI64IntegerAttr(*component.localArrayId));
+    (*fusedFunc)
+        ->setAttr(runtime_attrs::kTaskLocalArrayIdAttrName,
+                  builder.getI64IntegerAttr(*component.localArrayId));
+  }
+
+  int64_t digitalOps = 0;
+  for (const TaskGraphNode *node : component.nodes) {
+    if (auto taskDigitalOps = node->op->getAttrOfType<IntegerAttr>(
+            runtime_attrs::kTaskDigitalOpsAttrName))
+      digitalOps += taskDigitalOps.getInt();
+  }
+  fusedTask->setAttr(runtime_attrs::kTaskDigitalOpsAttrName,
+                     builder.getI64IntegerAttr(digitalOps));
+
+  auto sumTimingAttr = [&](llvm::StringRef attrName) -> std::optional<double> {
+    double total = 0.0;
+    for (const TaskGraphNode *node : component.nodes) {
+      auto value = node->op->getAttrOfType<FloatAttr>(attrName);
+      if (!value)
+        return std::nullopt;
+      total += value.getValueAsDouble();
+    }
+    return total;
+  };
+  for (llvm::StringRef attrName : {
+           timing_attrs::kAnalogLoadLatencyNsAttrName,
+           timing_attrs::kAnalogExecuteLatencyNsAttrName,
+           timing_attrs::kAnalogStoreLatencyNsAttrName,
+           timing_attrs::kIntrinsicLatencyNsAttrName,
+       }) {
+    if (std::optional<double> total = sumTimingAttr(attrName))
+      fusedTask->setAttr(attrName, builder.getF64FloatAttr(*total));
+  }
 
   llvm::SmallPtrSet<Operation *, 16> componentOps;
   for (const TaskGraphNode *node : component.nodes) {
@@ -679,15 +750,14 @@ fuseSameCoreComponent(ModuleOp module, func::FuncOp taskGraphFunc,
   return fusedTask;
 }
 
-static LogicalResult fuseSameCoreFusibleComponents(ModuleOp module,
-                                                   func::FuncOp taskGraphFunc,
-                                                   const HardwareBudget &budget,
-                                                   const TaskGraphDAG &dag,
-                                                   bool &changed) {
+static LogicalResult fuseIslandComponents(ModuleOp module,
+                                          func::FuncOp taskGraphFunc,
+                                          const TaskGraphDAG &dag,
+                                          bool &changed) {
   changed = false;
 
-  llvm::SmallVector<SameCoreFusibleComponent, 16> components =
-      collectSameCoreFusibleComponents(dag);
+  llvm::SmallVector<IslandFusibleComponent, 16> components =
+      collectIslandFusibleComponents(dag);
   if (components.empty())
     return success();
 
@@ -701,7 +771,7 @@ static LogicalResult fuseSameCoreFusibleComponents(ModuleOp module,
   collectResourceConsumers(dag, consumersByResource);
   collectTaskConsumers(dag, consumersByTaskResult);
 
-  for (const SameCoreFusibleComponent &component : components) {
+  for (const IslandFusibleComponent &component : components) {
     FailureOr<ComponentBoundary> boundary =
         computeComponentBoundary(component, dag, producerByResource,
                                  consumersByResource, consumersByTaskResult);
@@ -710,8 +780,8 @@ static LogicalResult fuseSameCoreFusibleComponents(ModuleOp module,
     if (!hasLegalComponentInsertionWindow(*boundary))
       continue;
 
-    if (failed(fuseSameCoreComponent(module, taskGraphFunc, component,
-                                     *boundary, budget)))
+    if (failed(
+            fuseIslandComponent(module, taskGraphFunc, component, *boundary)))
       return failure();
 
     changed = true;
@@ -723,19 +793,18 @@ static LogicalResult fuseSameCoreFusibleComponents(ModuleOp module,
 
 static llvm::ArrayRef<TaskFusionPattern> getDefaultTaskFusionPatterns() {
   static const TaskFusionPattern patterns[] = {
-      {"same-core-fusible-component", fuseSameCoreFusibleComponents},
+      {"same-island-core-component", fuseIslandComponents},
   };
   return patterns;
 }
 
 static LogicalResult applyPatternToFixedPoint(ModuleOp module,
                                               func::FuncOp taskGraphFunc,
-                                              const HardwareBudget &budget,
                                               const TaskFusionPattern &pattern,
                                               TaskGraphDAG &dag) {
   while (true) {
     bool changed = false;
-    if (failed(pattern.apply(module, taskGraphFunc, budget, dag, changed))) {
+    if (failed(pattern.apply(module, taskGraphFunc, dag, changed))) {
       taskGraphFunc.emitError("failed task fusion pattern '")
           << pattern.name << "'";
       return failure();
@@ -744,7 +813,7 @@ static LogicalResult applyPatternToFixedPoint(ModuleOp module,
     if (!changed)
       return success();
 
-    auto nextDag = parseTaskGraphDAG(taskGraphFunc);
+    auto nextDag = task_graph::parseTaskGraphDAG(taskGraphFunc);
     if (failed(nextDag))
       return failure();
 
@@ -755,17 +824,16 @@ static LogicalResult applyPatternToFixedPoint(ModuleOp module,
 } // namespace
 
 LogicalResult fuseTaskGraphRoutines(ModuleOp module, func::FuncOp taskGraphFunc,
-                                    const HardwareBudget &budget,
                                     const TaskGraphDAG &dag) {
   TaskGraphDAG workingDag = dag;
   for (const TaskFusionPattern &pattern : getDefaultTaskFusionPatterns()) {
-    if (failed(applyPatternToFixedPoint(module, taskGraphFunc, budget, pattern,
+    if (failed(applyPatternToFixedPoint(module, taskGraphFunc, pattern,
                                         workingDag)))
       return failure();
   }
   return success();
 }
 
-} // namespace task_schedulers
+} // namespace task_graph
 } // namespace sculptor
 } // namespace mlir

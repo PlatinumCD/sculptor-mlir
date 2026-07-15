@@ -1,18 +1,16 @@
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScheduleMetadata.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleMetadata.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphScorer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDigitalOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScorer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacement.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphResources.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
 
 #include <optional>
 
@@ -23,7 +21,6 @@ namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
-namespace task_graph_names = mlir::sculptor::task_graph_names;
 
 static std::optional<int64_t> getOptionalI64Attr(Operation *op,
                                                  StringRef attrName) {
@@ -45,11 +42,6 @@ static FailureOr<int64_t> getRequiredI64Attr(Operation *op,
 
 static bool isAnalogTask(sculptor::TaskCreateOp taskOp) {
   return taskOp.getDomain() == "analog";
-}
-
-static bool shouldInferDigitalOpsFromCallee(sculptor::TaskCreateOp taskOp) {
-  return !isAnalogTask(taskOp) ||
-         taskOp.getTaskKind() == task_graph_names::kConvTileMVMTaskKind;
 }
 
 static LogicalResult normalizeTaskPlacement(ModuleOp module,
@@ -96,80 +88,6 @@ static LogicalResult normalizeTaskPlacement(ModuleOp module,
   return attachTaskCorePlacement(module, taskOp, budget, *requiredCoreId);
 }
 
-static int64_t getStaticElementCount(Type type) {
-  auto shapedType = dyn_cast<ShapedType>(type);
-  if (!shapedType || !shapedType.hasStaticShape())
-    return 0;
-  return shapedType.getNumElements();
-}
-
-static int64_t getStaticElementCount(Operation *op) {
-  for (Type resultType : op->getResultTypes()) {
-    int64_t elementCount = getStaticElementCount(resultType);
-    if (elementCount > 0)
-      return elementCount;
-  }
-
-  for (Value operand : llvm::reverse(op->getOperands())) {
-    int64_t elementCount = getStaticElementCount(operand.getType());
-    if (elementCount > 0)
-      return elementCount;
-  }
-
-  return 0;
-}
-
-static bool isScalarDigitalOp(Operation *op) {
-  StringRef dialectNamespace = op->getName().getDialectNamespace();
-  return dialectNamespace == "arith" || dialectNamespace == "math";
-}
-
-static int64_t countScalarDigitalOps(Operation *linalgOp) {
-  int64_t scalarOps = 0;
-  for (Region &region : linalgOp->getRegions()) {
-    region.walk([&](Operation *nestedOp) {
-      if (nestedOp == linalgOp || nestedOp->hasTrait<OpTrait::IsTerminator>())
-        return;
-      if (isScalarDigitalOp(nestedOp))
-        ++scalarOps;
-    });
-  }
-  return scalarOps;
-}
-
-static bool isSingleScalarOpLinalg(Operation *op) {
-  StringRef opName = op->getName().getStringRef();
-  return opName == "linalg.add" || opName == "linalg.sub" ||
-         opName == "linalg.mul" || opName == "linalg.div" ||
-         opName == "linalg.max" || opName == "linalg.min";
-}
-
-static int64_t inferDigitalOpsFromCallee(func::FuncOp callee) {
-  if (!callee || callee.isDeclaration() || !callee.getBody().hasOneBlock())
-    return 0;
-
-  int64_t digitalOps = 0;
-  for (Operation &op : callee.getBody().front().without_terminator()) {
-    StringRef dialectNamespace = op.getName().getDialectNamespace();
-    if (dialectNamespace != "linalg")
-      continue;
-
-    int64_t elementCount = getStaticElementCount(&op);
-    if (elementCount <= 0)
-      continue;
-
-    if (op.getName().getStringRef() == "linalg.generic") {
-      digitalOps += elementCount * countScalarDigitalOps(&op);
-      continue;
-    }
-
-    if (isSingleScalarOpLinalg(&op))
-      digitalOps += elementCount;
-  }
-
-  return digitalOps;
-}
-
 static FailureOr<int64_t>
 getOrAttachTaskDigitalOps(ModuleOp module, sculptor::TaskCreateOp taskOp,
                           Builder &builder) {
@@ -177,21 +95,14 @@ getOrAttachTaskDigitalOps(ModuleOp module, sculptor::TaskCreateOp taskOp,
           runtime_attrs::kTaskDigitalOpsAttrName))
     return digitalOpsAttr.getInt();
 
-  int64_t digitalOps = 0;
-  if (shouldInferDigitalOpsFromCallee(taskOp)) {
-    auto callee =
-        module.lookupSymbol<func::FuncOp>(taskOp.getCalleeAttr().getValue());
-    if (!callee) {
-      return taskOp.emitError("expected task callee '")
-             << taskOp.getCalleeAttr().getValue()
-             << "' to resolve to a function for digital op accounting";
-    }
-    digitalOps = inferDigitalOpsFromCallee(callee);
-  }
+  FailureOr<int64_t> digitalOps =
+      task_graph::estimateTaskDigitalOps(module, taskOp);
+  if (failed(digitalOps))
+    return failure();
 
   taskOp->setAttr(runtime_attrs::kTaskDigitalOpsAttrName,
-                  builder.getI64IntegerAttr(digitalOps));
-  return digitalOps;
+                  builder.getI64IntegerAttr(*digitalOps));
+  return *digitalOps;
 }
 
 static FailureOr<int64_t> computeTotalDigitalOps(ModuleOp module,
@@ -280,17 +191,24 @@ static void attachGraphScoreMetadata(func::FuncOp taskGraphFunc,
 static FailureOr<TaskGraphScore> scoreTaskGraph(ModuleOp module,
                                                 func::FuncOp taskGraphFunc,
                                                 const HardwareBudget &budget,
-                                                const TaskGraphDAG &dag) {
+                                                const TaskGraphDAG &dag,
+                                                const LogicalPlacementIslandGraph &islandGraph,
+                                                const PlacementConstraints &constraints) {
   MeshTaskGraphScorer scorer;
-  return scorer.score(module, taskGraphFunc, budget, dag);
+  return scorer.score(module, taskGraphFunc, budget, dag, islandGraph,
+                      constraints);
 }
 
 static LogicalResult
 attachTransferScheduleMetadata(ModuleOp module, func::FuncOp taskGraphFunc,
                                const HardwareBudget &budget,
-                               const TaskGraphDAG &dag, Builder &builder) {
+                               const TaskGraphDAG &dag,
+                               const LogicalPlacementIslandGraph &islandGraph,
+                               const PlacementConstraints &constraints,
+                               Builder &builder) {
   FailureOr<TaskGraphScore> score =
-      scoreTaskGraph(module, taskGraphFunc, budget, dag);
+      scoreTaskGraph(module, taskGraphFunc, budget, dag, islandGraph,
+                     constraints);
   if (failed(score))
     return failure();
 
@@ -303,7 +221,9 @@ attachTransferScheduleMetadata(ModuleOp module, func::FuncOp taskGraphFunc,
 LogicalResult finalizeTaskGraphScheduleMetadata(ModuleOp module,
                                                 func::FuncOp taskGraphFunc,
                                                 const HardwareBudget &budget,
-                                                const TaskGraphDAG &dag) {
+                                                const TaskGraphDAG &dag,
+                                                const LogicalPlacementIslandGraph &islandGraph,
+                                                const PlacementConstraints &constraints) {
   Builder builder(module.getContext());
   llvm::DenseMap<Value, const TaskGraphNode *> producerByResource;
   if (failed(collectResourceProducers(dag, producerByResource)))
@@ -323,6 +243,7 @@ LogicalResult finalizeTaskGraphScheduleMetadata(ModuleOp module,
     return failure();
 
   if (failed(attachTransferScheduleMetadata(module, taskGraphFunc, budget, dag,
+                                            islandGraph, constraints,
                                             builder)))
     return failure();
 

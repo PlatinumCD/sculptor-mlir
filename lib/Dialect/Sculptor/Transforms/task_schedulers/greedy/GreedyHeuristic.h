@@ -1,8 +1,9 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_GREEDY_GREEDYHEURISTIC_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_GREEDY_GREEDYHEURISTIC_H
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementConstraints.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -19,13 +20,12 @@ namespace task_schedulers {
 
 struct GreedyHeuristicContext {
   const HardwareBudget &budget;
-  llvm::ArrayRef<LogicalIslandCommunicationEdge> islandCommunicationEdges;
+  llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges;
   const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland;
   unsigned activeIsland = 0;
   unsigned activePlacementIndex = 0;
   unsigned totalPlacementCount = 0;
-  std::optional<unsigned> firstTaskIsland;
-  std::optional<unsigned> lastTaskIsland;
+  const PlacementConstraints &constraints;
   std::optional<int64_t> bestTransferCost;
 };
 

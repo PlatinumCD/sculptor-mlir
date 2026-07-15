@@ -20,8 +20,8 @@ public:
         llvm::dyn_cast<mlir::RankedTensorType>(op.getOutput().getType());
     if (!outputType || outputType.getRank() != 2 ||
         !outputType.hasStaticShape() || outputType.getDimSize(0) != 1) {
-      return rewriter.notifyMatchFailure(
-          op, "expected static output tensor<1xn>");
+      return rewriter.notifyMatchFailure(op,
+                                         "expected static output tensor<1xn>");
     }
 
     mlir::FailureOr<mlir::Value> localArrayId =
@@ -40,9 +40,16 @@ public:
     mlir::Value scratch = mlir::sculptor::golem::allocateStoreScratchBuffer(
         rewriter, loc, lanes, elementType);
 
-    mlir::sculptor::golem::emitShimCall(
-        rewriter, loc, mlir::sculptor::golem::kStoreShimName,
-        {scratch, *localArrayId});
+    auto shimScratchType = mlir::MemRefType::get({mlir::ShapedType::kDynamic,
+                                                  mlir::ShapedType::kDynamic,
+                                                  mlir::ShapedType::kDynamic},
+                                                 elementType);
+    mlir::Value shimScratch =
+        rewriter.create<mlir::memref::CastOp>(loc, shimScratchType, scratch);
+
+    mlir::sculptor::golem::emitShimCall(rewriter, loc,
+                                        mlir::sculptor::golem::kStoreShimName,
+                                        {shimScratch, *localArrayId});
 
     mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
     mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);

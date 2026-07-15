@@ -6,6 +6,23 @@ namespace mlir {
 namespace sculptor {
 namespace task_schedulers {
 
+FailureOr<IslandPlacementPlan> TaskGraphScheduler::buildPlacementPlan(
+    const TaskGraphPlacementProblem &problem,
+    const TaskGraphSchedulerOptions &) const {
+  problem.diagnosticOp->emitError("scheduler '")
+      << getName() << "' requires a pre-placement timing profile";
+  return failure();
+}
+
+FailureOr<IslandPlacementPlan> TaskGraphScheduler::buildTimingPlacementPlan(
+    const TaskGraphPlacementProblem &problem,
+    const task_timing::SchedulingTimingProfile &,
+    const TaskGraphSchedulerOptions &) const {
+  problem.diagnosticOp->emitError("scheduler '")
+      << getName() << "' does not accept a timing profile";
+  return failure();
+}
+
 LogicalResult
 registerTaskGraphScheduler(TaskGraphSchedulerRegistry &registry,
                            std::unique_ptr<TaskGraphScheduler> scheduler) {

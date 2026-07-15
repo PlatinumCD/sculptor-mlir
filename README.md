@@ -60,7 +60,11 @@ The compiler is staged around explicit IR boundaries:
 | Expand MVMs | `sculptor.mvm` -> matrix/vector/logical-array operations | `sculptor-expand-mvm-to-golem` |
 | Materialize tasks | task regions -> callable task-stage functions | `sculptor-materialize-tasks` |
 | Assemble graph | outlined work and resources -> symbolic task graph | `sculptor-assemble-task-graph` |
-| Schedule graph | symbolic tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
+| Build islands | symbolic tasks -> stable logical placement islands | `sculptor-build-task-graph-islands` |
+| Analyze timing | logical islands -> task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
+| Schedule graph | island-annotated tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
+| Fuse graph | placed tasks -> same-island, same-core component tasks | `sculptor-fuse-task-graph` |
+| Finalize resources | surviving logical resources -> runtime slots and offsets | `sculptor-finalize-task-graph-resources` |
 | Lower shims | Sculptor execution ops -> backend-facing runtime shim calls | `sculptor-lower-golem-to-llvm-shims` |
 | Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
 

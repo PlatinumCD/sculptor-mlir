@@ -73,14 +73,14 @@ def Sculptor_TaskGraphOutputOp
 }
 
 //===----------------------------------------------------------------------===//
-// sculptor.task_graph.temporary
-// Create an internal graph temporary resource handle
+// sculptor.task_graph.intermediate
+// Create an internal graph intermediate resource handle
 //===----------------------------------------------------------------------===//
 
-def Sculptor_TaskGraphTemporaryOp
-  : Sculptor_Op<"task_graph.temporary"> {
+def Sculptor_TaskGraphIntermediateOp
+  : Sculptor_Op<"task_graph.intermediate"> {
 
-  let summary = "Create an internal graph temporary resource handle";
+  let summary = "Create an internal graph intermediate resource handle";
 
   let arguments = (ins
     Sculptor_TaskGraphType:$graph

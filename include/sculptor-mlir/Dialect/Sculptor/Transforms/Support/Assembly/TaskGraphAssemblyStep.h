@@ -19,7 +19,8 @@ public:
 
   virtual StringRef getName() const = 0;
 
-  virtual LogicalResult assemble(ModuleOp module, func::FuncOp forward) const = 0;
+  virtual LogicalResult assemble(ModuleOp module,
+                                 func::FuncOp forward) const = 0;
 };
 
 using TaskGraphAssemblySteps =
@@ -28,7 +29,6 @@ using TaskGraphAssemblySteps =
 void registerTaskGraphGeneratorAssembler(TaskGraphAssemblySteps &steps);
 void registerTaskGraphResourceAssembler(TaskGraphAssemblySteps &steps);
 void registerTaskGraphTaskAssembler(TaskGraphAssemblySteps &steps);
-void registerTaskGraphExecutionPlanAssembler(TaskGraphAssemblySteps &steps);
 
 } // namespace sculptor
 } // namespace mlir
