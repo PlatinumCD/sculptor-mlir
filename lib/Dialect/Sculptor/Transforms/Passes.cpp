@@ -13,6 +13,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
 
 namespace mlir {
@@ -34,6 +35,7 @@ void registerSculptorPasses() {
   registerFinalizeTaskGraphResourcesPass();
   registerFuseTaskGraphPass();
   registerMaterializeTasksPass();
+  registerPartitionTaskGraphByCorePass();
   registerScheduleTaskGraphPass();
 }
 

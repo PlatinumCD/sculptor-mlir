@@ -1,4 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 
@@ -29,7 +30,29 @@ bool isValidTaskResource(TaskCreateOp taskOp, Value resourceValue) {
   return belongsToSameGraph<TaskGraphInputOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphOutputOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphIntermediateOp>(taskOp, resourceValue) ||
-         belongsToSameGraph<TaskGraphPersistentOp>(taskOp, resourceValue);
+         belongsToSameGraph<TaskGraphPersistentOp>(taskOp, resourceValue) ||
+         belongsToSameGraph<TaskGraphRouteInputOp>(taskOp, resourceValue) ||
+         belongsToSameGraph<TaskGraphRouteOutputOp>(taskOp, resourceValue);
+}
+
+LogicalResult verifyRouteBoundaryOp(Operation *op) {
+  for (StringRef attrName :
+       {StringRef(deployment_attrs::kRouteIdAttrName),
+        StringRef(deployment_attrs::kGlobalResourceIdAttrName)}) {
+    auto attr = op->getAttrOfType<IntegerAttr>(attrName);
+    if (!attr)
+      return op->emitOpError("requires integer attribute '") << attrName << "'";
+    if (attr.getInt() < 0)
+      return op->emitOpError("requires non-negative attribute '")
+             << attrName << "'";
+  }
+
+  auto resourceType = dyn_cast<TaskResourceType>(op->getResult(0).getType());
+  if (!resourceType || !isa<RankedTensorType>(resourceType.getValueType())) {
+    return op->emitOpError(
+        "expected a route boundary to carry a ranked tensor resource");
+  }
+  return success();
 }
 
 LogicalResult verifyReductionMetadata(TaskCreateOp taskOp) {
@@ -92,7 +115,17 @@ LogicalResult verifyTaskResources(TaskCreateOp taskOp, ValuesT resources,
              << name << " to be produced by sculptor.task_graph.input, "
              << "sculptor.task_graph.output, or "
              << "sculptor.task_graph.intermediate, or "
-             << "sculptor.task_graph.persistent in the same graph";
+             << "sculptor.task_graph.persistent, "
+             << "sculptor.task_graph.route_input, or "
+             << "sculptor.task_graph.route_output in the same graph";
+    }
+    if (name == "inputs" && resource.getDefiningOp<TaskGraphRouteOutputOp>()) {
+      return taskOp.emitOpError(
+          "expected route_output resources to be task outputs");
+    }
+    if (name == "outputs" && resource.getDefiningOp<TaskGraphRouteInputOp>()) {
+      return taskOp.emitOpError(
+          "expected route_input resources to be task inputs");
     }
   }
 
@@ -100,6 +133,14 @@ LogicalResult verifyTaskResources(TaskCreateOp taskOp, ValuesT resources,
 }
 
 } // namespace
+
+mlir::LogicalResult mlir::sculptor::TaskGraphRouteInputOp::verify() {
+  return verifyRouteBoundaryOp(getOperation());
+}
+
+mlir::LogicalResult mlir::sculptor::TaskGraphRouteOutputOp::verify() {
+  return verifyRouteBoundaryOp(getOperation());
+}
 
 // Enforces that task nodes reference only well-formed graph-local edges.
 mlir::LogicalResult mlir::sculptor::TaskCreateOp::verify() {

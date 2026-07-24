@@ -144,8 +144,10 @@ reserved cores, and reduction tasks never receive physical-array metadata.
 
 Topology changes and runtime allocation are deliberately separate. The
 `sculptor-fuse-task-graph` pass runs after scheduling, placement-aware timing is
-recomputed on the fused graph, and `sculptor-finalize-task-graph-resources`
-assigns runtime storage only after fusion has removed internal resources.
+recomputed on the fused graph, and
+`sculptor-partition-task-graph-by-core` isolates active cores before any runtime
+storage is assigned. A deployment exporter can then extract one core module and
+run `sculptor-finalize-task-graph-resources` against that core's private memory.
 
 </details>
 
@@ -340,9 +342,10 @@ placement strategy. It only fuses directly connected tasks that share both
 represented as a single component task without violating dependency order.
 
 Internal intermediate task graph resources that only connected fused tasks are
-erased. The later `sculptor-finalize-task-graph-resources` pass assigns resource
-slots, intermediate indices and offsets, workspace size, and task indices to
-the compact graph.
+erased. The later `sculptor-partition-task-graph-by-core` pass turns surviving
+cross-core resources into route boundaries. Resource slots, intermediate
+indices and offsets, workspace size, and local task indices are assigned only
+after an individual core graph is extracted from the deployment.
 
 </details>
 

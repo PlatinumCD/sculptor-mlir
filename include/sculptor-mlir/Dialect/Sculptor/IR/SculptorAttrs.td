@@ -109,4 +109,21 @@ def Sculptor_NetworkEdgeTimingAttr
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+def Sculptor_DeploymentRouteAttr
+    : Sculptor_Attr<"DeploymentRoute", "deployment_route"> {
+  let summary = "one routed tensor edge between deployed cores";
+  let parameters = (ins
+    "IntegerAttr":$id,
+    "IntegerAttr":$sourceCore,
+    "IntegerAttr":$sourceTask,
+    "IntegerAttr":$sourceOutput,
+    "IntegerAttr":$destinationCore,
+    "IntegerAttr":$destinationTask,
+    "IntegerAttr":$destinationInput,
+    "IntegerAttr":$resourceId,
+    "IntegerAttr":$byteSize
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
 #endif // SCULPTOR_ATTRS

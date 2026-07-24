@@ -1,7 +1,58 @@
 // RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --implicit-check-not=!sculptor.logical.array
 // RUN: sculptor-mlir-opt %s --sculptor-finalize-task-graph-resources --sculptor-lower-golem-to-llvm-shims | FileCheck %s --implicit-check-not=!sculptor.logical.array
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core | sculptor-mlir-opt | FileCheck %s --check-prefix=PARTITION --implicit-check-not=!sculptor.logical.array --implicit-check-not=sculptor.runtime.task_index --implicit-check-not=sculptor.runtime.slot
 
-module {
+// PARTITION-LABEL: module attributes
+// PARTITION-SAME: sculptor.deployment.active_core_ids = [0, 1]
+// PARTITION-SAME: sculptor.deployment.model_inputs = [{global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 0 : i64}]
+// PARTITION-SAME: sculptor.deployment.model_outputs = [{global_resource_id = 1 : i64, output_index = 0 : i64, owner_core = 1 : i64}]
+// PARTITION-SAME: sculptor.deployment.routes = [#sculptor.deployment_route<id = 0 : i64, sourceCore = 0 : i64, sourceTask = 1 : i64, sourceOutput = 0 : i64, destinationCore = 1 : i64, destinationTask = 3 : i64, destinationInput = 0 : i64, resourceId = 2 : i64, byteSize = 12 : i64>]
+// PARTITION-SAME: sculptor.schedule.num_cores = 2 : i64
+
+// PARTITION: module @core_0
+// PARTITION-SAME: sculptor.runtime.core_id = 0 : i64
+// PARTITION: func.func private @task_setup_0()
+// PARTITION-SAME: sculptor.runtime.local_array_id = 0 : i64
+// PARTITION-SAME: sculptor.runtime.physical_array_id = 0 : i64
+// PARTITION: func.func private @task_mvm_0(tensor<1x4xf32>) -> tensor<1x3xf32>
+// PARTITION-LABEL: func.func private @generate_task_graph()
+// PARTITION: sculptor.task_graph.input
+// PARTITION-SAME: sculptor.deployment.global_resource_id = 0 : i64
+// PARTITION: sculptor.task_graph.route_output
+// PARTITION-SAME: sculptor.deployment.global_resource_id = 2 : i64
+// PARTITION-SAME: sculptor.deployment.route_id = 0 : i64
+// PARTITION: %[[SETUP0:[0-9a-zA-Z_]+]] = sculptor.task.create
+// PARTITION-SAME: @task_setup_0
+// PARTITION-SAME: deps[]
+// PARTITION-SAME: sculptor.deployment.global_task_id = 0 : i64
+// PARTITION: sculptor.task.create
+// PARTITION-SAME: @task_mvm_0
+// PARTITION-SAME: deps[%[[SETUP0]]]
+// PARTITION-SAME: sculptor.deployment.global_task_id = 1 : i64
+
+// PARTITION: module @core_1
+// PARTITION-SAME: sculptor.runtime.core_id = 1 : i64
+// PARTITION: func.func private @task_setup_1()
+// PARTITION-SAME: sculptor.runtime.local_array_id = 0 : i64
+// PARTITION-SAME: sculptor.runtime.physical_array_id = 1 : i64
+// PARTITION: func.func private @task_mvm_1(tensor<1x3xf32>) -> tensor<1x2xf32>
+// PARTITION-LABEL: func.func private @generate_task_graph()
+// PARTITION: sculptor.task_graph.route_input
+// PARTITION-SAME: sculptor.deployment.global_resource_id = 2 : i64
+// PARTITION-SAME: sculptor.deployment.route_id = 0 : i64
+// PARTITION: sculptor.task_graph.output
+// PARTITION-SAME: sculptor.deployment.global_resource_id = 1 : i64
+// PARTITION: %[[SETUP1:[0-9a-zA-Z_]+]] = sculptor.task.create
+// PARTITION-SAME: @task_setup_1
+// PARTITION-SAME: deps[]
+// PARTITION-SAME: sculptor.deployment.global_task_id = 2 : i64
+// PARTITION: sculptor.task.create
+// PARTITION-SAME: @task_mvm_1
+// PARTITION-SAME: deps[%[[SETUP1]]]
+// PARTITION-SAME: sculptor.deployment.global_task_id = 3 : i64
+// PARTITION-NOT: module @core_
+
+module attributes {sculptor.schedule.num_cores = 2 : i64} {
   // CHECK-LABEL: func.func private @task_setup_0()
   func.func private @task_setup_0() -> !sculptor.logical.array attributes {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64}
   // CHECK-LABEL: func.func private @task_mvm_0(

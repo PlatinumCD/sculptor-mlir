@@ -119,6 +119,56 @@ def Sculptor_TaskGraphPersistentOp
 }
 
 //===----------------------------------------------------------------------===//
+// sculptor.task_graph.route_input
+// Create a tensor resource arriving from another deployed core
+//===----------------------------------------------------------------------===//
+
+def Sculptor_TaskGraphRouteInputOp
+  : Sculptor_Op<"task_graph.route_input"> {
+
+  let summary = "Create an incoming cross-core route resource handle";
+
+  let arguments = (ins
+    Sculptor_TaskGraphType:$graph
+  );
+
+  let results = (outs
+    Sculptor_TaskResourceType:$result
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $graph attr-dict `:` qualified(type($graph)) `->` qualified(type($result))
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sculptor.task_graph.route_output
+// Create a tensor resource sent to another deployed core
+//===----------------------------------------------------------------------===//
+
+def Sculptor_TaskGraphRouteOutputOp
+  : Sculptor_Op<"task_graph.route_output"> {
+
+  let summary = "Create an outgoing cross-core route resource handle";
+
+  let arguments = (ins
+    Sculptor_TaskGraphType:$graph
+  );
+
+  let results = (outs
+    Sculptor_TaskResourceType:$result
+  );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $graph attr-dict `:` qualified(type($graph)) `->` qualified(type($result))
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // sculptor.task.create
 // Create a task node in a task graph
 //===----------------------------------------------------------------------===//

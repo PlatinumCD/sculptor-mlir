@@ -21,7 +21,7 @@ Sculptor provides two named pipelines for the main lowering path.
 | Pipeline | Role |
 |---|---|
 | `sculptor-lower-to-golem` | Lowers recognized model structure into callable Golem task functions. |
-| `sculptor-lower-golem-to-task-graph` | Builds the task graph, places/schedules it, and rewrites Golem array operations to runtime shim calls. |
+| `sculptor-lower-golem-to-task-graph` | Builds and schedules the task graph, lowers Golem array operations to runtime shim calls, and emits an isolated per-core deployment. |
 
 The pipelines are intentionally split at the Golem/task boundary. The first
 pipeline produces task-shaped Golem IR. The second pipeline consumes that shape
@@ -42,8 +42,9 @@ registered scheduler name. The current tree provides several placement
 strategies, including `random`, `snake`, and `greedy`. Registered schedulers use
 min-cut digital placement with local digital-task refinement by default. After
 the selected strategy places matrix setup/MVM groups and related digital work,
-separate passes fuse same-island components and finalize the surviving runtime
-resource layout.
+separate passes fuse same-island components, lower the logical-array ABI, and
+partition active cores. Runtime resources are finalized later on one extracted
+core module at a time.
 
 ### `sculptor-lower-to-golem`
 
@@ -69,7 +70,8 @@ This pipeline turns model-level IR into task-shaped Golem IR.
 
 ### `sculptor-lower-golem-to-task-graph`
 
-This pipeline turns materialized Golem tasks into a scheduled runtime graph.
+This pipeline turns materialized Golem tasks into a deployment containing
+isolated scheduled core graphs.
 
 1. `sculptor-assemble-task-graph`
    Builds `generate_task_graph` with `sculptor.task_graph.*` resources and
@@ -94,9 +96,20 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
    calls. At the same boundary it removes logical-array resources from task
    interfaces, preserves setup ordering as explicit task dependencies, and
    retains physical/local array bindings plus graph-level placement provenance.
-7. `sculptor-finalize-task-graph-resources`
-   Assigns runtime task indices, resource slots, intermediate offsets, and the
-   final workspace size after every topology-changing pass has finished.
+7. `sculptor-partition-task-graph-by-core`
+   Assigns deterministic deployment task/resource IDs, converts cross-core
+   tensor edges into typed route boundaries, clones each core's complete symbol
+   closure, and emits modules only for active cores. Global runtime slots are
+   intentionally absent. A downstream exporter extracts one core module before
+   running `sculptor-finalize-task-graph-resources` independently for that
+   core's private memory.
+
+The outer deployment retains the global scheduling and timing summaries once.
+Each nested core graph contains local structural counts and its required
+hardware context. If a model input directly feeds tasks on several cores, the
+model-input manifest contains one ownership record per consuming core; this
+explicitly requests host-side input replication without inventing a producer
+task or a cross-core tensor route.
 
 ### Main Lowering Passes
 
@@ -113,7 +126,8 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
 | `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
 | `sculptor-fuse-task-graph` | A scheduled task graph with island and core assignments. | Same-island, same-core components outlined as fused task routines. |
 | `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions and graph resources containing logical-array operations. | Calls to LLVM-callable Golem runtime shims plus a task graph whose executable array identity is represented by physical bindings and setup dependencies; the logical-to-physical schedule map remains as reporting metadata. |
-| `sculptor-finalize-task-graph-resources` | A lowered task graph whose topology is final. | Runtime slots, task indices, intermediate offsets, and workspace metadata. |
+| `sculptor-partition-task-graph-by-core` | A scheduled, fused graph after logical-array ABI lowering and before runtime finalization. | A deployment module with active per-core nested modules, route boundaries, a typed global route table, and stable global identities. |
+| `sculptor-finalize-task-graph-resources` | One standalone core graph extracted from a deployment. | Core-private runtime slots, task indices, intermediate offsets, and workspace metadata. |
 
 ### Export And Runtime Passes
 

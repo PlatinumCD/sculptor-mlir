@@ -9,10 +9,10 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
 
 #include "mlir/Pass/PassManager.h"
@@ -292,7 +292,7 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   pm.addPass(std::make_unique<FuseTaskGraphPass>());
   pm.addPass(createTimingPass());
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());
-  pm.addPass(std::make_unique<FinalizeTaskGraphResourcesPass>());
+  pm.addPass(std::make_unique<PartitionTaskGraphByCorePass>());
 }
 
 void registerSculptorPassPipelines() {
@@ -304,7 +304,7 @@ void registerSculptorPassPipelines() {
 
   PassPipelineRegistration<SculptorLowerGolemToTaskGraphPipelineOptions>(
       "sculptor-lower-golem-to-task-graph",
-      "Lower Sculptor Golem task IR to a scheduled task graph and LLVM runtime "
+      "Lower Sculptor Golem task IR to a per-core deployment and LLVM runtime "
       "shims",
       buildSculptorLowerGolemToTaskGraphPipeline);
 }
