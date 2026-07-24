@@ -291,9 +291,8 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
 
   pm.addPass(std::make_unique<FuseTaskGraphPass>());
   pm.addPass(createTimingPass());
-  pm.addPass(std::make_unique<FinalizeTaskGraphResourcesPass>());
-
   pm.addPass(std::make_unique<LowerGolemToLLVMShimsPass>());
+  pm.addPass(std::make_unique<FinalizeTaskGraphResourcesPass>());
 }
 
 void registerSculptorPassPipelines() {

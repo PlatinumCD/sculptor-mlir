@@ -861,9 +861,10 @@ Golem-facing analog operations into stable runtime shim calls.
 
 At this point, the compiler has already chosen the task placement. Shim lowering
 uses that placement to replace logical array operations with calls that name the
-local analog array selected by the schedule. The task graph is still present,
-but the task bodies are now closer to code that can be lowered into LLVM and
-linked with the runtime.
+local analog array selected by the schedule. The same pass updates the task
+graph ABI: logical-array task inputs and outputs become physical array
+attributes plus explicit setup dependencies. The graph therefore continues to
+describe the callable runtime interface after logical array arguments disappear.
 
 The runtime build runs shim lowering and then cleans up the result:
 
@@ -881,14 +882,17 @@ python3 linear_example.py --mode mlir |
     --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
+    --sculptor-finalize-task-graph-resources \
     --canonicalize \
     --cse
 ```
 
 
-The shim-lowered output keeps the same scheduled graph shape. `@forward` is
-still absent; the task graph is now backed by task functions whose Golem array
-operations have been rewritten to runtime shim calls:
+The shim-lowered output preserves task ordering while changing the resource
+interface. `@forward` is still absent; task functions use runtime shim calls,
+matrix setup is retained as a task dependency, and logical-array resources no
+longer occupy runtime slots. The graph-level logical-to-physical placement map
+remains available to simulation and visualization exporters:
 
 ```mlir
 module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arrays_per_core = 1 : i64, sculptor.schedule.mesh_cols = 1 : i64, sculptor.schedule.mesh_rows = 1 : i64, sculptor.schedule.num_analog_arrays = 1 : i64, sculptor.schedule.num_cores = 1 : i64, sculptor.schedule.topology = "mesh"} {
@@ -936,19 +940,18 @@ module attributes {sculptor.schedule.analog_arrays = [0], sculptor.schedule.arra
     %1 = linalg.add ins(%arg0, %expanded : tensor<1x3xf32>, tensor<1x3xf32>) outs(%0 : tensor<1x3xf32>) -> tensor<1x3xf32>
     return %1 : tensor<1x3xf32>
   }
-  func.func private @generate_task_graph() -> !sculptor.task_graph attributes {sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [1], sculptor.runtime.resource_count = 6 : i64, sculptor.runtime.temp_base_slot = 2 : i64, sculptor.runtime.temp_count = 4 : i64, sculptor.runtime.temp_offsets = [0, 0, 16, 0], sculptor.runtime.workspace_size = 32 : i64, sculptor.schedule.analog_arrays = [0], sculptor.schedule.arrays_per_core = 1 : i64, sculptor.schedule.core_transfer_bytes = [0], sculptor.schedule.core_transfer_cost = [0], sculptor.schedule.dependency_count = 4 : i64, sculptor.schedule.inter_core_transfer_bytes = 0 : i64, sculptor.schedule.logical_array_to_analog_array = [0], sculptor.schedule.mesh_cols = 1 : i64, sculptor.schedule.mesh_rows = 1 : i64, sculptor.schedule.num_analog_arrays = 1 : i64, sculptor.schedule.num_cores = 1 : i64, sculptor.schedule.num_logical_arrays = 1 : i64, sculptor.schedule.task_count = 5 : i64, sculptor.schedule.topology = "mesh", sculptor.schedule.total_digital_ops = 3 : i64, sculptor.schedule.total_transfer_cost = 0 : i64} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph attributes {sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [1], sculptor.runtime.resource_count = 5 : i64, sculptor.runtime.temp_base_slot = 2 : i64, sculptor.runtime.temp_count = 3 : i64, sculptor.runtime.temp_offsets = [0, 16, 0], sculptor.runtime.workspace_size = 32 : i64, sculptor.schedule.analog_arrays = [0], sculptor.schedule.arrays_per_core = 1 : i64, sculptor.schedule.core_transfer_bytes = [0], sculptor.schedule.core_transfer_cost = [0], sculptor.schedule.dependency_count = 4 : i64, sculptor.schedule.inter_core_transfer_bytes = 0 : i64, sculptor.schedule.logical_array_to_analog_array = [0], sculptor.schedule.mesh_cols = 1 : i64, sculptor.schedule.mesh_rows = 1 : i64, sculptor.schedule.num_analog_arrays = 1 : i64, sculptor.schedule.num_cores = 1 : i64, sculptor.schedule.num_logical_arrays = 1 : i64, sculptor.schedule.task_count = 5 : i64, sculptor.schedule.topology = "mesh", sculptor.schedule.total_digital_ops = 3 : i64, sculptor.schedule.total_transfer_cost = 0 : i64} {
     %0 = sculptor.task_graph.create : !sculptor.task_graph
     %1 = sculptor.task_graph.input %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
     %2 = sculptor.task_graph.output %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-    %3 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %4 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %5 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
-    %6 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 5 : i64, sculptor.runtime.temp_index = 3 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-    %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
-    %8 = sculptor.task.create %0, @task_linearwbias_0_vector_tile_0_1, domain = "digital", task_kind = "digital.vector_tile", task_name = "linearwbias_0_vector_tile_0", source_layer = "linearwbias_0", source_task_ordinal = 1, inputs[%1], outputs[%4], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [3], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>) -> !sculptor.task
-    %9 = sculptor.task.create %0, @task_linearwbias_0_mvm_0_0_2, domain = "analog", task_kind = "sculptor.mvm", task_name = "linearwbias_0_mvm_0_0", source_layer = "linearwbias_0", source_task_ordinal = 2, inputs[%4, %3], outputs[%5], deps[%7, %8] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [3, 2], sculptor.runtime.output_slots = [4], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
-    %10 = sculptor.task.create %0, @task_linearwbias_0_tile_recombine_3, domain = "digital", task_kind = "digital.tile_recombine", task_name = "linearwbias_0_tile_recombine", source_layer = "linearwbias_0", source_task_ordinal = 3, inputs[%5], outputs[%6], deps[%9] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [4], sculptor.runtime.output_slots = [5], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 3 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task) -> !sculptor.task
-    %11 = sculptor.task.create %0, @task_linearwbias_0_linear_bias_add_4, domain = "digital", task_kind = "digital.bias_add", task_name = "linear_bias_add", source_layer = "linearwbias_0", source_task_ordinal = 4, inputs[%6], outputs[%2], deps[%10] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 3 : i64, sculptor.runtime.input_slots = [5], sculptor.runtime.output_slots = [1], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 4 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task) -> !sculptor.task
+    %4 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %5 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 16 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
+    %6 = sculptor.task_graph.intermediate %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
+    %7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.output_slots = [], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph) -> !sculptor.task
+    %8 = sculptor.task.create %0, @task_linearwbias_0_vector_tile_0_1, domain = "digital", task_kind = "digital.vector_tile", task_name = "linearwbias_0_vector_tile_0", source_layer = "linearwbias_0", source_task_ordinal = 1, inputs[%1], outputs[%4], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [0], sculptor.runtime.output_slots = [2], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>) -> !sculptor.task
+    %9 = sculptor.task.create %0, @task_linearwbias_0_mvm_0_0_2, domain = "analog", task_kind = "sculptor.mvm", task_name = "linearwbias_0_mvm_0_0", source_layer = "linearwbias_0", source_task_ordinal = 2, inputs[%4], outputs[%5], deps[%7, %8] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [2], sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.output_slots = [3], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
+    %10 = sculptor.task.create %0, @task_linearwbias_0_tile_recombine_3, domain = "digital", task_kind = "digital.tile_recombine", task_name = "linearwbias_0_tile_recombine", source_layer = "linearwbias_0", source_task_ordinal = 3, inputs[%5], outputs[%6], deps[%9] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [3], sculptor.runtime.output_slots = [4], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 3 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x4xf32>>, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task) -> !sculptor.task
+    %11 = sculptor.task.create %0, @task_linearwbias_0_linear_bias_add_4, domain = "digital", task_kind = "digital.bias_add", task_name = "linear_bias_add", source_layer = "linearwbias_0", source_task_ordinal = 4, inputs[%6], outputs[%2], deps[%10] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 3 : i64, sculptor.runtime.input_slots = [4], sculptor.runtime.output_slots = [1], sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 4 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task_resource<tensor<1x3xf32>>, !sculptor.task) -> !sculptor.task
     return %0 : !sculptor.task_graph
   }
 }
@@ -975,7 +978,10 @@ bodies. They have been replaced by four shim calls:
 The scheduled local array appears as the `i32` value passed to those shim calls.
 For this example, that value is `0` because the schedule placed the only logical
 array on the only physical array. The task graph remains in the module so later
-passes can still emit runtime graph metadata.
+passes can emit runtime graph metadata, but its resource interface now matches
+the lowered task ABI. `sculptor.schedule.logical_array_to_analog_array` remains
+only as placement provenance; it is no longer represented by a task resource or
+runtime slot.
 
 </details>
 
@@ -1007,6 +1013,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
+    --sculptor-finalize-task-graph-resources \
     --canonicalize \
     --cse \
     --empty-tensor-to-alloc-tensor \
@@ -1063,7 +1070,7 @@ yet been emitted as runtime graph construction code:
 %0 = sculptor.task_graph.create : !sculptor.task_graph
 %1 = sculptor.task_graph.input %0 {sculptor.runtime.byte_size = 16 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x4xf32>>
 %2 = sculptor.task_graph.output %0 {sculptor.runtime.byte_size = 12 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x3xf32>>
-%7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[%3], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.output_slots = [2], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.result_indices = [0], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
+%7 = sculptor.task.create %0, @task_linearwbias_0_matrix_tile_0_0_0, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linearwbias_0_matrix_tile_0_0", source_layer = "linearwbias_0", source_task_ordinal = 0, inputs[], outputs[], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.input_slots = [], sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.output_slots = [], sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph) -> !sculptor.task
 ```
 
 
@@ -1099,6 +1106,7 @@ python3 linear_example.py --mode mlir |
     --sculptor-analyze-task-graph-timing \
     --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 schedule=random" \
     --sculptor-lower-golem-to-llvm-shims \
+    --sculptor-finalize-task-graph-resources \
     --canonicalize \
     --cse \
     --empty-tensor-to-alloc-tensor \

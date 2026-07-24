@@ -18,9 +18,9 @@
 namespace mlir {
 namespace sculptor {
 
-// Lowers Sculptor Golem execution ops to LLVM-callable runtime/backend shims.
-// This is after sculptor.mvm expansion and before final target ISA intrinsic
-// selection.
+// Lowers Sculptor Golem execution ops and their task-graph logical-array ABI to
+// LLVM-callable runtime/backend shims and scheduled physical array bindings.
+// This is after placement and fusion but before runtime resource finalization.
 struct LowerGolemToLLVMShimsPass
     : public mlir::PassWrapper<LowerGolemToLLVMShimsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -33,7 +33,8 @@ struct LowerGolemToLLVMShimsPass
 
   // Summarizes the lowering pass in MLIR pass-help output.
   mlir::StringRef getDescription() const final {
-    return "Lower Sculptor Golem execution ops to LLVM runtime shims";
+    return "Lower Sculptor Golem execution ops and task graph array bindings "
+           "to LLVM runtime shims";
   }
 
   // Declares the dialects that conversion patterns and legality checks may

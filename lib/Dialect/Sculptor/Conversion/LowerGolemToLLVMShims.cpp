@@ -1,9 +1,11 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/LowerTaskGraphABI.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 
-// Converts Sculptor Golem execution ops to LLVM/runtime shim calls. MVM-to-Golem
-// expansion has already happened, and ISA intrinsic selection happens later.
+// Converts Sculptor Golem execution ops and task graph array bindings to
+// LLVM/runtime shim calls. MVM-to-Golem expansion and scheduling have already
+// happened, and ISA intrinsic selection happens later.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -42,11 +44,27 @@ void configureConversionTarget(ConversionTarget &target,
   target.addLegalOp<sculptor::TaskGraphCreateOp, sculptor::TaskGraphInputOp,
                     sculptor::TaskGraphOutputOp,
                     sculptor::TaskGraphIntermediateOp,
-                    sculptor::TaskGraphPersistentOp, sculptor::TaskCreateOp>();
+                    sculptor::TaskGraphPersistentOp>();
+  target.addDynamicallyLegalOp<sculptor::TaskCreateOp>(
+      [](sculptor::TaskCreateOp op) {
+        auto hasLogicalArrayResource = [](ValueRange resources) {
+          for (Value resource : resources) {
+            auto resourceType =
+                dyn_cast<sculptor::TaskResourceType>(resource.getType());
+            if (resourceType &&
+                isa<sculptor::LogicalArrayType>(resourceType.getValueType()))
+              return true;
+          }
+          return false;
+        };
+        return !hasLogicalArrayResource(op.getInputs()) &&
+               !hasLogicalArrayResource(op.getOutputs());
+      });
   target.addLegalOp<ModuleOp>();
-  target.addLegalDialect<arith::ArithDialect, bufferization::BufferizationDialect,
-                         LLVM::LLVMDialect, memref::MemRefDialect,
-                         scf::SCFDialect, tensor::TensorDialect>();
+  target
+      .addLegalDialect<arith::ArithDialect, bufferization::BufferizationDialect,
+                       LLVM::LLVMDialect, memref::MemRefDialect,
+                       scf::SCFDialect, tensor::TensorDialect>();
   target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
     return typeConverter.isSignatureLegal(op.getFunctionType()) &&
            typeConverter.isLegal(&op.getBody());
@@ -72,6 +90,11 @@ void LowerGolemToLLVMShimsPass::runOnOperation() {
 
   TypeConverter typeConverter;
   golem::populateSculptorTypeConversions(typeConverter);
+
+  if (failed(golem::lowerTaskGraphABI(module, typeConverter))) {
+    signalPassFailure();
+    return;
+  }
 
   RewritePatternSet patterns(ctx);
   populateConversionPatterns(patterns, typeConverter, ctx);

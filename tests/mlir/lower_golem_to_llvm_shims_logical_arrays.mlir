@@ -1,4 +1,6 @@
-// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims | FileCheck %s --implicit-check-not=sculptor.array.
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims | FileCheck %s --check-prefixes=CHECK,GRAPH --implicit-check-not=sculptor.array. --implicit-check-not=!sculptor.logical.array
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --check-prefix=FINAL --implicit-check-not=!sculptor.logical.array
+// RUN: sculptor-mlir-opt %s --sculptor-finalize-task-graph-resources --sculptor-lower-golem-to-llvm-shims | FileCheck %s --check-prefix=FINAL --implicit-check-not=!sculptor.logical.array
 
 module {
   // CHECK: func.func private @golem_analog_mvm_store(memref<?x?x?xf32>, i32)
@@ -65,22 +67,44 @@ module {
     return %out : tensor<1x1xf32>
   }
 
-  func.func private @generate_task_graph() -> !sculptor.task_graph {
+  func.func private @generate_task_graph() -> !sculptor.task_graph attributes {sculptor.schedule.logical_array_to_analog_array = [7], sculptor.schedule.num_logical_arrays = 1 : i64} {
+    // GRAPH-LABEL: func.func private @generate_task_graph()
+    // GRAPH-SAME: sculptor.schedule.logical_array_to_analog_array = [7]
+    // GRAPH-SAME: sculptor.schedule.num_logical_arrays = 1 : i64
     %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // GRAPH: %[[INPUT:.*]] = sculptor.task_graph.input
     %input = sculptor.task_graph.input %graph : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    // GRAPH: %[[OUTPUT:.*]] = sculptor.task_graph.output
     %output = sculptor.task_graph.output %graph : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %array0 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array1 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array2 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array3 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array4 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array5 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array6 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %array7 = sculptor.task_graph.intermediate %graph : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %array7 = sculptor.task_graph.intermediate %graph {sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
 
-    %setup7 = sculptor.task.create %graph, @task_matrix7, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "matrix_7", source_layer = "linear_7", source_task_ordinal = 0, inputs[], outputs[%array7], deps[] : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
-    %mvm7 = sculptor.task.create %graph, @task_mvm7, domain = "analog", task_kind = "sculptor.mvm", task_name = "mvm_7", source_layer = "linear_7", source_task_ordinal = 1, inputs[%input, %array7], outputs[%output], deps[%setup7] : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task) -> !sculptor.task
+    // GRAPH: %[[SETUP:.*]] = sculptor.task.create
+    // GRAPH-SAME: @task_matrix7
+    // GRAPH-SAME: inputs[], outputs[], deps[]
+    // GRAPH-SAME: sculptor.runtime.local_array_id = 2 : i64
+    // GRAPH-SAME: sculptor.runtime.physical_array_id = 7 : i64
+    %setup7 = sculptor.task.create %graph, @task_matrix7, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "matrix_7", source_layer = "linear_7", source_task_ordinal = 0, inputs[], outputs[%array7], deps[] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.local_array_id = 2 : i64, sculptor.runtime.physical_array_id = 7 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
+    // GRAPH: sculptor.task.create
+    // GRAPH-SAME: @task_mvm7
+    // GRAPH-SAME: inputs[%[[INPUT]]], outputs[%[[OUTPUT]]], deps[%[[SETUP]]]
+    // GRAPH-SAME: sculptor.runtime.local_array_id = 2 : i64
+    // GRAPH-SAME: sculptor.runtime.physical_array_id = 7 : i64
+    %mvm7 = sculptor.task.create %graph, @task_mvm7, domain = "analog", task_kind = "sculptor.mvm", task_name = "mvm_7", source_layer = "linear_7", source_task_ordinal = 1, inputs[%input, %array7], outputs[%output], deps[] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.local_array_id = 2 : i64, sculptor.runtime.physical_array_id = 7 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>) -> !sculptor.task
 
     return %graph : !sculptor.task_graph
   }
+
+  // FINAL-LABEL: func.func private @generate_task_graph()
+  // FINAL-SAME: sculptor.runtime.input_slots = [0]
+  // FINAL-SAME: sculptor.runtime.output_slots = [1]
+  // FINAL-SAME: sculptor.runtime.resource_count = 2 : i64
+  // FINAL-SAME: sculptor.runtime.temp_count = 0 : i64
+  // FINAL-SAME: sculptor.schedule.logical_array_to_analog_array = [7]
+  // FINAL-SAME: sculptor.schedule.num_logical_arrays = 1 : i64
+  // FINAL: task_name = "matrix_7"
+  // FINAL-SAME: sculptor.runtime.input_slots = []
+  // FINAL-SAME: sculptor.runtime.output_slots = []
+  // FINAL: task_name = "mvm_7"
+  // FINAL-SAME: sculptor.runtime.input_slots = [0]
+  // FINAL-SAME: sculptor.runtime.output_slots = [1]
 }

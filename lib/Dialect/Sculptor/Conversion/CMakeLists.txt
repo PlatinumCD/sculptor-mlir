@@ -12,6 +12,7 @@ add_mlir_library(MLIRSculptorConversion
   golem/LowerExecute.cpp
   golem/LowerMatrix.cpp
   golem/LowerStore.cpp
+  golem/LowerTaskGraphABI.cpp
   golem/LowerVector.cpp
 
   LINK_LIBS PUBLIC

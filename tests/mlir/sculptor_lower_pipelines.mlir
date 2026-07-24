@@ -1,8 +1,10 @@
 // RUN: not sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=2 array-cols=3" --sculptor-lower-golem-to-task-graph="cores=2 arrays-per-core=2" 2>&1 | FileCheck %s
 // RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-fuse-task-graph --sculptor-finalize-task-graph-resources | FileCheck %s --check-prefix=SCHEDULED --implicit-check-not=golem_analog_mvm
-// RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-lower-golem-to-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 analog-mvm-latency-ns=75 analog-io-bits-per-cycle=128 analog-io-shared=false digital-clock-ghz=1.5 digital-issue-width=4 digital-vector-bits-per-cycle=512 network-link-bits-per-cycle=64 network-hop-latency-cycles=2 network-pipelined=false schedule=snake" | FileCheck %s --check-prefix=PIPELINE
+// RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-lower-golem-to-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 analog-mvm-latency-ns=75 analog-io-bits-per-cycle=128 analog-io-shared=false digital-clock-ghz=1.5 digital-issue-width=4 digital-vector-bits-per-cycle=512 network-link-bits-per-cycle=64 network-hop-latency-cycles=2 network-pipelined=false schedule=snake" | FileCheck %s --check-prefix=PIPELINE --implicit-check-not=!sculptor.logical.array
 // RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-lower-golem-to-task-graph="balance-task-graph-reductions=true reduction-width=4 cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" | FileCheck %s --check-prefix=BALANCED-PIPELINE
 // RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-lower-golem-to-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=annealing annealing-initial-schedule=snake annealing-move-set=basic annealing-steps-per-temperature=3 annealing-plateau-patience=2 annealing-minimum-epochs=2 annealing-plateau-acceptance-rate=1 annealing-maximum-evaluations=100 annealing-maximum-runtime-seconds=0" | FileCheck %s --check-prefix=ANNEALING-PIPELINE
+// RUN: sculptor-mlir-opt %s --sculptor-lower-to-golem="array-rows=4 array-cols=4" --sculptor-lower-golem-to-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-export-task-graph-sim-model="output=%t.lowered.json" -o /dev/null
+// RUN: FileCheck %s --check-prefix=LOWERED-EXPORT --input-file=%t.lowered.json --implicit-check-not="!sculptor.logical.array"
 
 module {
   func.func @forward(%arg0: tensor<1x4xf32>) -> tensor<1x3xf32> {
@@ -22,16 +24,31 @@ module {
 // CHECK: expected task graph schedule name
 
 // PIPELINE-LABEL: func.func private @generate_task_graph
+// PIPELINE-SAME: sculptor.runtime.resource_count = 2 : i64
+// PIPELINE-SAME: sculptor.runtime.temp_count = 0 : i64
+// PIPELINE-SAME: sculptor.schedule.logical_array_to_analog_array = [0]
+// PIPELINE-SAME: sculptor.schedule.num_logical_arrays = 1 : i64
 // PIPELINE-SAME: sculptor.timing.critical_path_ns
 // PIPELINE-SAME: sculptor.timing.model = #sculptor.timing_model<analogMVMLatencyNs = 75 : i64
 // PIPELINE-SAME: digitalClockGHz = 1.500000e+00 : f64
 // PIPELINE-SAME: networkPipelined = false>
 // PIPELINE-SAME: sculptor.timing.placement_aware = true
 // PIPELINE: task_name = "tile_set_load_matrix_tile_0_0"
+// PIPELINE-SAME: inputs[], outputs[], deps[]
 // PIPELINE-SAME: sculptor.schedule.island_id = 0 : i64
 // PIPELINE: task_kind = "mixed.fused"
 // PIPELINE-SAME: sculptor.schedule.island_id = 0 : i64
 // PIPELINE-SAME: sculptor.timing.intrinsic_latency_ns = 76.333333333333343 : f64
+
+// LOWERED-EXPORT: "resources": [
+// LOWERED-EXPORT: "kind": "input"
+// LOWERED-EXPORT: "kind": "output"
+// LOWERED-EXPORT: "kind": "sculptor.matrix_setup"
+// LOWERED-EXPORT: "inputs": []
+// LOWERED-EXPORT: "outputs": []
+// LOWERED-EXPORT: "num_logical_arrays": 1
+// LOWERED-EXPORT: "logical_array_to_analog_array": [
+// LOWERED-EXPORT-NEXT: 0
 
 // ANNEALING-PIPELINE-LABEL: func.func private @generate_task_graph
 // ANNEALING-PIPELINE-SAME: sculptor.schedule.annealing_epochs = 2 : i64

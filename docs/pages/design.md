@@ -89,12 +89,14 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
 5. `sculptor-fuse-task-graph`
    Fuses connected tasks only when they share both a logical island and a core,
    then removes task callees and intermediate resources made dead by fusion.
-6. `sculptor-finalize-task-graph-resources`
-   Assigns runtime task indices, resource slots, intermediate offsets, and the
-   final workspace size after topology-changing passes have finished.
-7. `sculptor-lower-golem-to-llvm-shims`
+6. `sculptor-lower-golem-to-llvm-shims`
    Rewrites scheduled Golem array operations into LLVM-callable runtime shim
-   calls.
+   calls. At the same boundary it removes logical-array resources from task
+   interfaces, preserves setup ordering as explicit task dependencies, and
+   retains physical/local array bindings plus graph-level placement provenance.
+7. `sculptor-finalize-task-graph-resources`
+   Assigns runtime task indices, resource slots, intermediate offsets, and the
+   final workspace size after every topology-changing pass has finished.
 
 ### Main Lowering Passes
 
@@ -110,8 +112,8 @@ This pipeline turns materialized Golem tasks into a scheduled runtime graph.
 | `sculptor-analyze-task-graph-timing` | An island-annotated task graph. | Task-level execution order and latency metadata plus graph critical-path and island-work summaries. |
 | `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
 | `sculptor-fuse-task-graph` | A scheduled task graph with island and core assignments. | Same-island, same-core components outlined as fused task routines. |
-| `sculptor-finalize-task-graph-resources` | A scheduled graph whose topology is final. | Runtime slots, task indices, intermediate offsets, and workspace metadata. |
-| `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions containing Golem array operations. | Calls to LLVM-callable Golem runtime shims. |
+| `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions and graph resources containing logical-array operations. | Calls to LLVM-callable Golem runtime shims plus a task graph whose executable array identity is represented by physical bindings and setup dependencies; the logical-to-physical schedule map remains as reporting metadata. |
+| `sculptor-finalize-task-graph-resources` | A lowered task graph whose topology is final. | Runtime slots, task indices, intermediate offsets, and workspace metadata. |
 
 ### Export And Runtime Passes
 

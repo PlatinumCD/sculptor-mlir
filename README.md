@@ -64,8 +64,8 @@ The compiler is staged around explicit IR boundaries:
 | Analyze timing | logical islands -> task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
 | Schedule graph | island-annotated tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
 | Fuse graph | placed tasks -> same-island, same-core component tasks | `sculptor-fuse-task-graph` |
-| Finalize resources | surviving logical resources -> runtime slots and offsets | `sculptor-finalize-task-graph-resources` |
-| Lower shims | Sculptor execution ops -> backend-facing runtime shim calls | `sculptor-lower-golem-to-llvm-shims` |
+| Lower shims and graph ABI | logical arrays -> physical array bindings, explicit setup dependencies, and backend-facing runtime shim calls | `sculptor-lower-golem-to-llvm-shims` |
+| Finalize resources | surviving runtime resources -> slots and offsets | `sculptor-finalize-task-graph-resources` |
 | Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
 
 ## Repository Layout
