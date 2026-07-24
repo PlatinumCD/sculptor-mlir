@@ -4,10 +4,12 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 namespace mlir {
 namespace sculptor {
@@ -66,25 +68,73 @@ static bool isSingleScalarOpLinalg(Operation *op) {
          opName == "linalg.max" || opName == "linalg.min";
 }
 
-static int64_t inferDigitalOpsFromCallee(func::FuncOp callee) {
+static FailureOr<int64_t> getStaticIterationCount(linalg::LinalgOp linalgOp) {
+  int64_t iterationCount = 1;
+  for (int64_t loopRange : linalgOp.getStaticLoopRanges()) {
+    if (ShapedType::isDynamic(loopRange)) {
+      linalgOp.emitError(
+          "cannot infer digital operations from a dynamic loop range");
+      return failure();
+    }
+    if (loopRange < 0) {
+      linalgOp.emitError(
+          "cannot infer digital operations from a negative loop range");
+      return failure();
+    }
+
+    std::optional<int64_t> product =
+        llvm::checkedMul(iterationCount, loopRange);
+    if (!product) {
+      linalgOp.emitError("digital operation iteration count overflow");
+      return failure();
+    }
+    iterationCount = *product;
+  }
+  return iterationCount;
+}
+
+static LogicalResult addDigitalOps(Operation *anchor, int64_t amount,
+                                   int64_t &total) {
+  std::optional<int64_t> sum = llvm::checkedAdd(total, amount);
+  if (!sum) {
+    anchor->emitError("digital operation count overflow");
+    return failure();
+  }
+  total = *sum;
+  return success();
+}
+
+static FailureOr<int64_t> inferDigitalOpsFromCallee(func::FuncOp callee) {
   if (!callee || callee.isDeclaration() || !callee.getBody().hasOneBlock())
-    return 0;
+    return int64_t{0};
 
   int64_t digitalOps = 0;
   for (Operation &op : callee.getBody().front().without_terminator()) {
     if (op.getName().getDialectNamespace() != "linalg")
       continue;
 
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(&op)) {
+      FailureOr<int64_t> iterationCount = getStaticIterationCount(
+          cast<linalg::LinalgOp>(genericOp.getOperation()));
+      if (failed(iterationCount))
+        return failure();
+      std::optional<int64_t> genericOps =
+          llvm::checkedMul(*iterationCount, countScalarDigitalOps(&op));
+      if (!genericOps) {
+        op.emitError("digital operation count overflow");
+        return failure();
+      }
+      if (failed(addDigitalOps(&op, *genericOps, digitalOps)))
+        return failure();
+      continue;
+    }
+
     int64_t elementCount = getStaticElementCount(&op);
     if (elementCount <= 0)
       continue;
-
-    if (op.getName().getStringRef() == "linalg.generic") {
-      digitalOps += elementCount * countScalarDigitalOps(&op);
-      continue;
-    }
-    if (isSingleScalarOpLinalg(&op))
-      digitalOps += elementCount;
+    if (isSingleScalarOpLinalg(&op) &&
+        failed(addDigitalOps(&op, elementCount, digitalOps)))
+      return failure();
   }
   return digitalOps;
 }

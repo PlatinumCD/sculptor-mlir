@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyStep.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphAssemblyUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
@@ -24,6 +25,7 @@
 namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace task_graph_attrs = mlir::sculptor::task_graph_attrs;
 namespace task_metadata = mlir::sculptor::task_metadata;
 
 mlir::FailureOr<task_metadata::TaskFunctionMetadata>
@@ -453,6 +455,10 @@ public:
       if (!outputResultIndices.empty())
         task->setAttr(runtime_attrs::kTaskResultIndicesAttrName,
                       rewriter.getI64ArrayAttr(outputResultIndices));
+      if (taskMetadata->reduction) {
+        task->setAttr(task_graph_attrs::kTaskReductionAttrName,
+                      taskMetadata->reduction);
+      }
       taskByCall[call.getOperation()] = task.getResult();
     }
 

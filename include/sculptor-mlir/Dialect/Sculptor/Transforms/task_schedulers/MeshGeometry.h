@@ -3,7 +3,10 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
 
+#include "llvm/ADT/SmallVector.h"
+
 #include <cstdint>
+#include <utility>
 
 namespace mlir {
 namespace sculptor {
@@ -21,6 +24,10 @@ int64_t getMeshCol(int64_t coreId, const HardwareBudget &budget);
 
 int64_t getMeshDistance(int64_t sourceCore, int64_t destinationCore,
                         const HardwareBudget &budget);
+
+llvm::SmallVector<std::pair<int64_t, int64_t>, 16>
+buildMeshXYRoute(int64_t sourceCore, int64_t destinationCore,
+                 const HardwareBudget &budget);
 
 unsigned getMeshBoundaryMask(int64_t coreId, const HardwareBudget &budget);
 

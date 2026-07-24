@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AnalyzeTaskGraphTiming.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/BalanceTaskGraphReductions.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
@@ -40,6 +41,17 @@ struct SculptorLowerToGolemPipelineOptions
 
 struct SculptorLowerGolemToTaskGraphPipelineOptions
     : public PassPipelineOptions<SculptorLowerGolemToTaskGraphPipelineOptions> {
+  PassOptions::Option<bool> balanceTaskGraphReductions{
+      *this, "balance-task-graph-reductions",
+      llvm::cl::desc(
+          "Rewrite marked high-fan-in task reductions into parallel lanes"),
+      llvm::cl::init(false)};
+
+  PassOptions::Option<int64_t> reductionWidth{
+      *this, "reduction-width",
+      llvm::cl::desc("Number of parallel first-stage reduction lanes"),
+      llvm::cl::init(2)};
+
   PassOptions::Option<int64_t> cores{
       *this, "cores",
       llvm::cl::desc("Number of available analog/digital cores"),
@@ -152,20 +164,56 @@ struct SculptorLowerGolemToTaskGraphPipelineOptions
 
   PassOptions::Option<double> annealingFinalTemperature{
       *this, "annealing-final-temperature",
-      llvm::cl::desc("Final temperature used by the annealing task scheduler"),
+      llvm::cl::desc("Minimum temperature used after annealing has cooled"),
       llvm::cl::init(1.0)};
 
   PassOptions::Option<double> annealingCoolingRate{
       *this, "annealing-cooling-rate",
       llvm::cl::desc("Multiplicative cooling rate used by the annealing task "
                      "scheduler"),
-      llvm::cl::init(0.9)};
+      llvm::cl::init(0.95)};
 
   PassOptions::Option<int64_t> annealingStepsPerTemperature{
       *this, "annealing-steps-per-temperature",
       llvm::cl::desc("Number of perturbation attempts per annealing "
                      "temperature"),
-      llvm::cl::init(32)};
+      llvm::cl::init(64)};
+
+  PassOptions::Option<int64_t> annealingPlateauPatience{
+      *this, "annealing-plateau-patience",
+      llvm::cl::desc("Consecutive epochs without meaningful best-score "
+                     "improvement required to declare a plateau"),
+      llvm::cl::init(10)};
+
+  PassOptions::Option<double> annealingImprovementThreshold{
+      *this, "annealing-improvement-threshold",
+      llvm::cl::desc("Minimum relative best-score improvement that resets "
+                     "annealing plateau patience"),
+      llvm::cl::init(0.001)};
+
+  PassOptions::Option<int64_t> annealingMinimumEpochs{
+      *this, "annealing-minimum-epochs",
+      llvm::cl::desc("Minimum number of annealing epochs before plateau "
+                     "termination is allowed"),
+      llvm::cl::init(10)};
+
+  PassOptions::Option<double> annealingPlateauAcceptanceRate{
+      *this, "annealing-plateau-acceptance-rate",
+      llvm::cl::desc("Maximum accepted-worse-move rate at which a stagnant "
+                     "annealing search is considered plateaued"),
+      llvm::cl::init(0.01)};
+
+  PassOptions::Option<int64_t> annealingMaximumEvaluations{
+      *this, "annealing-maximum-evaluations",
+      llvm::cl::desc("Maximum candidate placements evaluated by annealing, "
+                     "or 0 for no evaluation limit"),
+      llvm::cl::init(100000)};
+
+  PassOptions::Option<double> annealingMaximumRuntimeSeconds{
+      *this, "annealing-maximum-runtime-seconds",
+      llvm::cl::desc("Maximum annealing search time in seconds, or 0 for no "
+                     "internal runtime limit"),
+      llvm::cl::init(420.0)};
 };
 
 void buildSculptorLowerToGolemPipeline(
@@ -186,6 +234,11 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
     OpPassManager &pm,
     const SculptorLowerGolemToTaskGraphPipelineOptions &options) {
   pm.addPass(std::make_unique<AssembleTaskGraphPass>());
+  if (options.balanceTaskGraphReductions) {
+    auto pass = std::make_unique<BalanceTaskGraphReductionsPass>();
+    pass->reductionWidth = options.reductionWidth;
+    pm.addPass(std::move(pass));
+  }
   pm.addPass(std::make_unique<BuildTaskGraphIslandsPass>());
 
   auto createTimingPass = [&options]() {
@@ -222,6 +275,18 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
   scheduleTaskGraphPass->annealingCoolingRate = options.annealingCoolingRate;
   scheduleTaskGraphPass->annealingStepsPerTemperature =
       options.annealingStepsPerTemperature;
+  scheduleTaskGraphPass->annealingPlateauPatience =
+      options.annealingPlateauPatience;
+  scheduleTaskGraphPass->annealingImprovementThreshold =
+      options.annealingImprovementThreshold;
+  scheduleTaskGraphPass->annealingMinimumEpochs =
+      options.annealingMinimumEpochs;
+  scheduleTaskGraphPass->annealingPlateauAcceptanceRate =
+      options.annealingPlateauAcceptanceRate;
+  scheduleTaskGraphPass->annealingMaximumEvaluations =
+      options.annealingMaximumEvaluations;
+  scheduleTaskGraphPass->annealingMaximumRuntimeSeconds =
+      options.annealingMaximumRuntimeSeconds;
   pm.addPass(std::move(scheduleTaskGraphPass));
 
   pm.addPass(std::make_unique<FuseTaskGraphPass>());

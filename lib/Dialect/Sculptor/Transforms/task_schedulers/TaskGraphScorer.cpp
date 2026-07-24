@@ -129,7 +129,6 @@ FailureOr<TaskGraphScore> MeshTaskGraphScorer::score(
     unsigned lastBoundaryMask = getMeshBoundaryMask(*lastCore, budget);
     if ((firstBoundaryMask & lastBoundaryMask) == 0) {
       result.boundaryPenalty = getBoundaryPenalty(result.totalTransferCost);
-      result.score += result.boundaryPenalty;
     }
   }
 

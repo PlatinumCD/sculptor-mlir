@@ -2,6 +2,7 @@ add_mlir_library(MLIRSculptorTransforms
   Passes.cpp
   AnalyzeTaskGraphTiming.cpp
   AssembleTaskGraph.cpp
+  BalanceTaskGraphReductions.cpp
   BuildTaskGraphIslands.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
@@ -30,6 +31,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_schedulers/TaskGraphScheduleReport.cpp
   task_schedulers/TaskGraphPhysicalArrayOrders.cpp
   task_graph/TaskGraphResources.cpp
+  task_graph/TaskGraphReductionBalancer.cpp
   task_schedulers/TaskGraphScheduler.cpp
   task_graph/TaskGraphDAG.cpp
   task_graph/TaskGraphExecutionGraph.cpp

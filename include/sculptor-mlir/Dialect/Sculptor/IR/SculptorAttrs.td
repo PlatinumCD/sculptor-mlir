@@ -1,11 +1,44 @@
 #ifndef SCULPTOR_ATTRS
 #define SCULPTOR_ATTRS
 
+include "mlir/IR/EnumAttr.td"
+
 include "sculptor-mlir/Dialect/Sculptor/IR/SculptorBase.td"
 
 class Sculptor_Attr<string name, string attrMnemonic>
     : AttrDef<Sculptor_Dialect, name> {
   let mnemonic = attrMnemonic;
+}
+
+def Sculptor_TaskReductionKindAdd
+    : I32EnumAttrCase<"Add", 0, "add">;
+def Sculptor_TaskReductionKindMax
+    : I32EnumAttrCase<"Max", 1, "max">;
+def Sculptor_TaskReductionKindMin
+    : I32EnumAttrCase<"Min", 2, "min">;
+
+def Sculptor_TaskReductionKind
+    : I32EnumAttr<"TaskReductionKind", "Task reduction kind", [
+        Sculptor_TaskReductionKindAdd,
+        Sculptor_TaskReductionKindMax,
+        Sculptor_TaskReductionKindMin
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_TaskReductionAttr
+    : Sculptor_Attr<"TaskReduction", "task_reduction"> {
+  let summary = "associative task-graph reduction metadata";
+  let description = [{
+    Marks a pure, elementwise task reduction whose input order may be
+    reassociated. The task-graph reduction balancing pass uses this metadata
+    instead of guessing reduction semantics from task names or callee bodies.
+  }];
+  let parameters = (ins
+    EnumParameter<Sculptor_TaskReductionKind>:$kind,
+    "BoolAttr":$reassociate
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
 }
 
 def Sculptor_TimingModelAttr

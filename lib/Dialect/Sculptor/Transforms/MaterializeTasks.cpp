@@ -4,7 +4,9 @@
 // built around an explicit v1 contract before the mutating materialization
 // steps are added.
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskMetadata.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 
@@ -316,7 +318,9 @@ emitTaskFunctionDeclaration(mlir::ModuleOp module,
       taskFunc,
       {getTaskDomainAttr(builder, taskRegion.taskKind), taskRegion.taskKind,
        taskRegion.taskName, taskRegion.sourceLayerSymbol,
-       builder.getI64IntegerAttr(taskRegion.ordinal)});
+       builder.getI64IntegerAttr(taskRegion.ordinal),
+       region->getAttrOfType<mlir::sculptor::TaskReductionAttr>(
+           mlir::sculptor::task_graph_attrs::kTaskReductionAttrName)});
   return taskFunc;
 }
 

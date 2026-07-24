@@ -166,8 +166,11 @@ static bool isMatrixSetupTask(mlir::sculptor::TaskCreateOp taskOp) {
 
 static bool isComponentFusibleTask(mlir::sculptor::TaskCreateOp taskOp) {
   // Matrix setup produces logical-array resources used by schedule metadata.
-  // Keep it explicit and let fused MVM/digital components depend on it.
-  return !isMatrixSetupTask(taskOp) && getOptionalScheduledCore(taskOp) &&
+  // Reduction tasks also remain explicit because their tree/lane metadata is a
+  // placement contract used to reload digital-only islands after fusion.
+  return !isMatrixSetupTask(taskOp) &&
+         taskOp.getTaskKind() != task_graph_names::kReductionTaskKind &&
+         getOptionalScheduledCore(taskOp) &&
          getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
 }
 

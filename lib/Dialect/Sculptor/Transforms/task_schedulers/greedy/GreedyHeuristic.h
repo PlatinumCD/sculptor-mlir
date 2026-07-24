@@ -21,6 +21,7 @@ namespace task_schedulers {
 struct GreedyHeuristicContext {
   const HardwareBudget &budget;
   llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges;
+  llvm::ArrayRef<task_graph::IslandExecutionEdge> islandExecutionEdges;
   const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland;
   unsigned activeIsland = 0;
   unsigned activePlacementIndex = 0;
@@ -55,12 +56,18 @@ public:
   int64_t evaluate(const GreedyHeuristicContext &context) const final;
 };
 
+class LinkPressureGreedyHeuristic final : public GreedyHeuristic {
+public:
+  llvm::StringRef getName() const final { return "link-pressure"; }
+  int64_t evaluate(const GreedyHeuristicContext &context) const final;
+};
+
 class CompositeGreedyHeuristic final : public GreedyHeuristic {
 public:
   CompositeGreedyHeuristic(std::string name, bool boundaryRegret,
-                           bool compactRegion)
+                           bool compactRegion, bool linkPressure)
       : name(std::move(name)), boundaryRegret(boundaryRegret),
-        compactRegion(compactRegion) {}
+        compactRegion(compactRegion), linkPressure(linkPressure) {}
 
   llvm::StringRef getName() const final { return name; }
   int64_t evaluate(const GreedyHeuristicContext &context) const final;
@@ -69,6 +76,7 @@ private:
   std::string name;
   bool boundaryRegret = false;
   bool compactRegion = false;
+  bool linkPressure = false;
 };
 
 } // namespace task_schedulers

@@ -1,4 +1,6 @@
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 
 #include "llvm/ADT/StringRef.h"
 
@@ -28,6 +30,56 @@ bool isValidTaskResource(TaskCreateOp taskOp, Value resourceValue) {
          belongsToSameGraph<TaskGraphOutputOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphIntermediateOp>(taskOp, resourceValue) ||
          belongsToSameGraph<TaskGraphPersistentOp>(taskOp, resourceValue);
+}
+
+LogicalResult verifyReductionMetadata(TaskCreateOp taskOp) {
+  Attribute rawReduction =
+      taskOp->getAttr(task_graph_attrs::kTaskReductionAttrName);
+  if (!rawReduction)
+    return success();
+
+  auto reduction = dyn_cast<TaskReductionAttr>(rawReduction);
+  if (!reduction) {
+    return taskOp.emitOpError("expected '")
+           << task_graph_attrs::kTaskReductionAttrName
+           << "' to be a #sculptor.task_reduction attribute";
+  }
+  if (taskOp.getDomain() != "digital") {
+    return taskOp.emitOpError(
+        "expected a marked task reduction to use the digital domain");
+  }
+  if (!reduction.getReassociate().getValue()) {
+    return taskOp.emitOpError(
+        "expected task reduction metadata to permit reassociation");
+  }
+  if (taskOp.getInputs().size() < 2 || taskOp.getOutputs().size() != 1) {
+    return taskOp.emitOpError(
+        "expected a marked task reduction to have at least two inputs and "
+        "exactly one output");
+  }
+
+  auto outputResource =
+      dyn_cast<TaskResourceType>(taskOp.getOutputs().front().getType());
+  auto outputType =
+      outputResource ? dyn_cast<RankedTensorType>(outputResource.getValueType())
+                     : RankedTensorType{};
+  if (!outputType || !outputType.hasStaticShape() ||
+      outputType.getRank() == 0 ||
+      !isa<FloatType>(outputType.getElementType())) {
+    return taskOp.emitOpError(
+        "expected a marked task reduction to use a non-scalar, statically "
+        "shaped floating-point tensor resource");
+  }
+
+  for (Value input : taskOp.getInputs()) {
+    auto inputResource = dyn_cast<TaskResourceType>(input.getType());
+    if (!inputResource || inputResource.getValueType() != outputType) {
+      return taskOp.emitOpError(
+          "expected every task reduction input to match the output tensor "
+          "type");
+    }
+  }
+  return success();
 }
 
 // Verifies one resource segment while sharing the diagnostic wording.
@@ -76,6 +128,9 @@ mlir::LogicalResult mlir::sculptor::TaskCreateOp::verify() {
     return failure();
 
   if (failed(verifyTaskResources(*this, getOutputs(), "outputs")))
+    return failure();
+
+  if (failed(verifyReductionMetadata(*this)))
     return failure();
 
   return mlir::success();

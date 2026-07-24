@@ -9,9 +9,11 @@
 #include "mlir/Support/LogicalResult.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace mlir {
 namespace sculptor {
@@ -38,11 +40,20 @@ struct TaskGraphPlacementProblem {
   const PlacementConstraints &constraints;
 };
 
-// Indexed by LogicalPlacementIslandGraph::islands. Repeated physical arrays
-// are legal so order-based schedulers retain their existing round-robin
-// behavior when a graph contains more islands than available arrays.
+struct LogicalIslandPlacement {
+  int64_t coreId = -1;
+  std::optional<int64_t> physicalArrayId;
+};
+
+// Indexed by LogicalPlacementIslandGraph::islands. Analog islands own an array;
+// digital-only reduction islands own an exclusive core.
 struct IslandPlacementPlan {
-  llvm::SmallVector<int64_t, 16> physicalArrayByIsland;
+  llvm::SmallVector<LogicalIslandPlacement, 16> placements;
+};
+
+struct IslandPlacementResources {
+  llvm::SmallVector<int64_t, 16> analogPhysicalArrayOrder;
+  llvm::DenseMap<unsigned, int64_t> reductionCoreByIsland;
 };
 
 LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
@@ -51,6 +62,15 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
 FailureOr<IslandPlacementPlan> buildPlacementPlanFromPhysicalArrayOrder(
     const TaskGraphPlacementProblem &problem,
     llvm::ArrayRef<int64_t> physicalArrayOrder);
+
+FailureOr<IslandPlacementResources>
+buildIslandPlacementResources(const TaskGraphPlacementProblem &problem,
+                              llvm::ArrayRef<int64_t> physicalArrayOrder);
+
+FailureOr<IslandPlacementPlan> buildPlacementPlanFromAnalogPlacements(
+    const TaskGraphPlacementProblem &problem,
+    const IslandPlacementResources &resources,
+    const llvm::DenseMap<unsigned, int64_t> &physicalArrayByAnalogIsland);
 
 } // namespace task_schedulers
 } // namespace sculptor

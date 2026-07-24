@@ -91,20 +91,56 @@ struct ScheduleTaskGraphPass
 
   Option<double> annealingFinalTemperature{
       *this, "annealing-final-temperature",
-      llvm::cl::desc("Final temperature used by the annealing task scheduler"),
+      llvm::cl::desc("Minimum temperature used after annealing has cooled"),
       llvm::cl::init(1.0)};
 
   Option<double> annealingCoolingRate{
       *this, "annealing-cooling-rate",
       llvm::cl::desc("Multiplicative cooling rate used by the annealing task "
                      "scheduler"),
-      llvm::cl::init(0.9)};
+      llvm::cl::init(0.95)};
 
   Option<int64_t> annealingStepsPerTemperature{
       *this, "annealing-steps-per-temperature",
       llvm::cl::desc("Number of perturbation attempts per annealing "
                      "temperature"),
-      llvm::cl::init(32)};
+      llvm::cl::init(64)};
+
+  Option<int64_t> annealingPlateauPatience{
+      *this, "annealing-plateau-patience",
+      llvm::cl::desc("Consecutive epochs without meaningful best-score "
+                     "improvement required to declare a plateau"),
+      llvm::cl::init(10)};
+
+  Option<double> annealingImprovementThreshold{
+      *this, "annealing-improvement-threshold",
+      llvm::cl::desc("Minimum relative best-score improvement that resets "
+                     "annealing plateau patience"),
+      llvm::cl::init(0.001)};
+
+  Option<int64_t> annealingMinimumEpochs{
+      *this, "annealing-minimum-epochs",
+      llvm::cl::desc("Minimum number of annealing epochs before plateau "
+                     "termination is allowed"),
+      llvm::cl::init(10)};
+
+  Option<double> annealingPlateauAcceptanceRate{
+      *this, "annealing-plateau-acceptance-rate",
+      llvm::cl::desc("Maximum accepted-worse-move rate at which a stagnant "
+                     "annealing search is considered plateaued"),
+      llvm::cl::init(0.01)};
+
+  Option<int64_t> annealingMaximumEvaluations{
+      *this, "annealing-maximum-evaluations",
+      llvm::cl::desc("Maximum candidate placements evaluated by annealing, "
+                     "or 0 for no evaluation limit"),
+      llvm::cl::init(100000)};
+
+  Option<double> annealingMaximumRuntimeSeconds{
+      *this, "annealing-maximum-runtime-seconds",
+      llvm::cl::desc("Maximum annealing search time in seconds, or 0 for no "
+                     "internal runtime limit"),
+      llvm::cl::init(420.0)};
 
   Option<std::string> summaryOutput{
       *this, "summary-output",
@@ -178,19 +214,50 @@ struct ScheduleTaskGraphPass
             llvm::cl::init(0.0)),
         annealingFinalTemperature(
             *this, "annealing-final-temperature",
-            llvm::cl::desc(
-                "Final temperature used by the annealing task scheduler"),
+            llvm::cl::desc("Minimum temperature used after annealing has "
+                           "cooled"),
             llvm::cl::init(1.0)),
         annealingCoolingRate(
             *this, "annealing-cooling-rate",
             llvm::cl::desc("Multiplicative cooling rate used by the annealing "
                            "task scheduler"),
-            llvm::cl::init(0.9)),
+            llvm::cl::init(0.95)),
         annealingStepsPerTemperature(
             *this, "annealing-steps-per-temperature",
             llvm::cl::desc("Number of perturbation attempts per annealing "
                            "temperature"),
-            llvm::cl::init(32)),
+            llvm::cl::init(64)),
+        annealingPlateauPatience(
+            *this, "annealing-plateau-patience",
+            llvm::cl::desc("Consecutive epochs without meaningful best-score "
+                           "improvement required to declare a plateau"),
+            llvm::cl::init(10)),
+        annealingImprovementThreshold(
+            *this, "annealing-improvement-threshold",
+            llvm::cl::desc("Minimum relative best-score improvement that "
+                           "resets annealing plateau patience"),
+            llvm::cl::init(0.001)),
+        annealingMinimumEpochs(
+            *this, "annealing-minimum-epochs",
+            llvm::cl::desc("Minimum number of annealing epochs before plateau "
+                           "termination is allowed"),
+            llvm::cl::init(10)),
+        annealingPlateauAcceptanceRate(
+            *this, "annealing-plateau-acceptance-rate",
+            llvm::cl::desc("Maximum accepted-worse-move rate at which a "
+                           "stagnant annealing search is considered "
+                           "plateaued"),
+            llvm::cl::init(0.01)),
+        annealingMaximumEvaluations(
+            *this, "annealing-maximum-evaluations",
+            llvm::cl::desc("Maximum candidate placements evaluated by "
+                           "annealing, or 0 for no evaluation limit"),
+            llvm::cl::init(100000)),
+        annealingMaximumRuntimeSeconds(
+            *this, "annealing-maximum-runtime-seconds",
+            llvm::cl::desc("Maximum annealing search time in seconds, or 0 "
+                           "for no internal runtime limit"),
+            llvm::cl::init(420.0)),
         summaryOutput(
             *this, "summary-output",
             llvm::cl::desc("Optional CSV path where the scheduler appends a "
@@ -211,6 +278,12 @@ struct ScheduleTaskGraphPass
     annealingFinalTemperature = pass.annealingFinalTemperature;
     annealingCoolingRate = pass.annealingCoolingRate;
     annealingStepsPerTemperature = pass.annealingStepsPerTemperature;
+    annealingPlateauPatience = pass.annealingPlateauPatience;
+    annealingImprovementThreshold = pass.annealingImprovementThreshold;
+    annealingMinimumEpochs = pass.annealingMinimumEpochs;
+    annealingPlateauAcceptanceRate = pass.annealingPlateauAcceptanceRate;
+    annealingMaximumEvaluations = pass.annealingMaximumEvaluations;
+    annealingMaximumRuntimeSeconds = pass.annealingMaximumRuntimeSeconds;
     summaryOutput = pass.summaryOutput;
   }
 

@@ -1,5 +1,6 @@
 #include "AnnealingMoves.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
@@ -26,8 +27,13 @@ struct AnnealingMove {
 static unsigned getActivePlacementCount(
     const AnnealingPlacement &current,
     const task_graph::LogicalPlacementIslandGraph &islandGraph) {
+  size_t analogIslandCount =
+      llvm::count_if(islandGraph.islands,
+                     [](const task_graph::LogicalPlacementIsland &island) {
+                       return task_graph::isAnalogIsland(island);
+                     });
   return static_cast<unsigned>(
-      std::min(current.physicalArrayOrder.size(), islandGraph.islands.size()));
+      std::min(current.physicalArrayOrder.size(), analogIslandCount));
 }
 
 static unsigned chooseDifferentIndex(unsigned firstIndex, unsigned upperBound,
@@ -336,12 +342,13 @@ applyPerturbationMove(mlir::func::FuncOp taskGraphFunc,
   return mlir::failure();
 }
 
-static mlir::FailureOr<AnnealingPlacement> perturbPlacementImpl(
-    mlir::func::FuncOp taskGraphFunc, const AnnealingPlacement &current,
-    const task_graph::TaskGraphDAG &dag,
-    const task_graph::LogicalPlacementIslandGraph &islandGraph,
-    llvm::ArrayRef<AnnealingMoveKind> enabledMoveKinds, int64_t moveRadius,
-    std::mt19937 &randomEngine) {
+static mlir::FailureOr<AnnealingPlacement>
+perturbPlacementImpl(mlir::func::FuncOp taskGraphFunc,
+                     const AnnealingPlacement &current,
+                     const task_graph::TaskGraphDAG &dag,
+                     const task_graph::LogicalPlacementIslandGraph &islandGraph,
+                     llvm::ArrayRef<AnnealingMoveKind> enabledMoveKinds,
+                     int64_t moveRadius, std::mt19937 &randomEngine) {
   (void)dag;
 
   AnnealingMove move = choosePerturbationMove(

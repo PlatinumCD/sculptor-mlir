@@ -25,6 +25,33 @@ int64_t getMeshDistance(int64_t sourceCore, int64_t destinationCore,
   return rowDistance + colDistance;
 }
 
+llvm::SmallVector<std::pair<int64_t, int64_t>, 16>
+buildMeshXYRoute(int64_t sourceCore, int64_t destinationCore,
+                 const HardwareBudget &budget) {
+  llvm::SmallVector<std::pair<int64_t, int64_t>, 16> route;
+  int64_t current = sourceCore;
+  int64_t currentRow = getMeshRow(current, budget);
+  int64_t currentCol = getMeshCol(current, budget);
+  int64_t destinationRow = getMeshRow(destinationCore, budget);
+  int64_t destinationCol = getMeshCol(destinationCore, budget);
+
+  while (currentCol != destinationCol) {
+    int64_t next = current + (currentCol < destinationCol ? 1 : -1);
+    route.push_back({current, next});
+    current = next;
+    currentCol += currentCol < destinationCol ? 1 : -1;
+  }
+  while (currentRow != destinationRow) {
+    int64_t next =
+        current + (currentRow < destinationRow ? budget.meshCols
+                                               : -budget.meshCols);
+    route.push_back({current, next});
+    current = next;
+    currentRow += currentRow < destinationRow ? 1 : -1;
+  }
+  return route;
+}
+
 unsigned getMeshBoundaryMask(int64_t coreId, const HardwareBudget &budget) {
   int64_t row = getMeshRow(coreId, budget);
   int64_t col = getMeshCol(coreId, budget);

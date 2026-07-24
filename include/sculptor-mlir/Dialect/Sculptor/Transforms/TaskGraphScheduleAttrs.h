@@ -33,6 +33,32 @@ inline constexpr llvm::StringLiteral
     kAnnealingMoveSetAttrName("sculptor.schedule.annealing_move_set");
 inline constexpr llvm::StringLiteral
     kAnnealingMoveRadiusAttrName("sculptor.schedule.annealing_move_radius");
+inline constexpr llvm::StringLiteral kAnnealingPlateauPatienceAttrName(
+    "sculptor.schedule.annealing_plateau_patience");
+inline constexpr llvm::StringLiteral kAnnealingImprovementThresholdAttrName(
+    "sculptor.schedule.annealing_improvement_threshold");
+inline constexpr llvm::StringLiteral kAnnealingMinimumEpochsAttrName(
+    "sculptor.schedule.annealing_minimum_epochs");
+inline constexpr llvm::StringLiteral kAnnealingPlateauAcceptanceRateAttrName(
+    "sculptor.schedule.annealing_plateau_acceptance_rate");
+inline constexpr llvm::StringLiteral kAnnealingMaximumEvaluationsAttrName(
+    "sculptor.schedule.annealing_maximum_evaluations");
+inline constexpr llvm::StringLiteral kAnnealingMaximumRuntimeSecondsAttrName(
+    "sculptor.schedule.annealing_maximum_runtime_seconds");
+inline constexpr llvm::StringLiteral
+    kAnnealingEpochsAttrName("sculptor.schedule.annealing_epochs");
+inline constexpr llvm::StringLiteral
+    kAnnealingEvaluationsAttrName("sculptor.schedule.annealing_evaluations");
+inline constexpr llvm::StringLiteral kAnnealingInitialScoreAttrName(
+    "sculptor.schedule.annealing_initial_score");
+inline constexpr llvm::StringLiteral
+    kAnnealingBestScoreAttrName("sculptor.schedule.annealing_best_score");
+inline constexpr llvm::StringLiteral kAnnealingStopReasonAttrName(
+    "sculptor.schedule.annealing_stop_reason");
+inline constexpr llvm::StringLiteral kAnnealingSearchSecondsAttrName(
+    "sculptor.schedule.annealing_search_seconds");
+inline constexpr llvm::StringLiteral kAnnealingUphillAcceptanceRateAttrName(
+    "sculptor.schedule.annealing_uphill_acceptance_rate");
 inline constexpr llvm::StringLiteral
     kTaskCountAttrName("sculptor.schedule.task_count");
 inline constexpr llvm::StringLiteral

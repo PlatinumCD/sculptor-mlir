@@ -104,11 +104,6 @@ buildIndexAttrs(mlir::OpBuilder &builder, llvm::ArrayRef<int64_t> values) {
   return attrs;
 }
 
-static mlir::Value buildIndexConstant(mlir::OpBuilder &builder,
-                                      mlir::Location loc, int64_t value) {
-  return builder.create<mlir::arith::ConstantIndexOp>(loc, value);
-}
-
 static mlir::Value buildF32Constant(mlir::OpBuilder &builder,
                                     mlir::Location loc, double value) {
   auto type = builder.getF32Type();
@@ -725,8 +720,7 @@ matchBlockFunctionSignature(mlir::func::FuncOp func,
       return mlir::failure();
   } else if (isDecoder(match)) {
     if (!nn_layer_match::hasLayerType(func, "transformer_decoder_block") ||
-        func.getNumArguments() < 1 ||
-        blockOp.getInput() != func.getArgument(0))
+        func.getNumArguments() < 1 || blockOp.getInput() != func.getArgument(0))
       return mlir::failure();
 
     if (blockOp.getHasCrossAttention()) {
@@ -801,9 +795,9 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
       return mlir::failure();
 
     if (match.hasCrossAttention) {
-      auto memoryTy =
-          tensor_type::getPositiveStaticF32Tensor(blockOp->getMemory().getType(),
-                                                  /*expectedRank=*/3);
+      auto memoryTy = tensor_type::getPositiveStaticF32Tensor(
+          blockOp->getMemory().getType(),
+          /*expectedRank=*/3);
       if (mlir::failed(memoryTy) ||
           memoryTy->getShape()[0] != match.batchSize ||
           memoryTy->getShape()[2] != match.hiddenSize)
@@ -1094,6 +1088,22 @@ buildCrossKVSplitRegion(TransformerBlockLowering &match, mlir::Value kv,
   return {region.getResult(0), region.getResult(1)};
 }
 
+static mlir::Value buildHeadExpandedView(TransformerBlockLowering &match,
+                                         mlir::Value sequence,
+                                         int64_t sequenceLength,
+                                         mlir::OpBuilder &builder) {
+  mlir::Location loc = match.blockOp.getLoc();
+  mlir::RankedTensorType expandedTy = mlir::RankedTensorType::get(
+      {match.batchSize, sequenceLength, match.numHeads, match.headDim},
+      match.elementType);
+  llvm::SmallVector<mlir::ReassociationIndices, 3> reassociation = {
+      {0}, {1}, {2, 3}};
+  return builder
+      .create<mlir::tensor::ExpandShapeOp>(loc, expandedTy, sequence,
+                                           reassociation)
+      .getResult();
+}
+
 static mlir::Value
 buildAttentionScoresRegion(TransformerBlockLowering &match, mlir::Value query,
                            mlir::Value key, int64_t queryLength,
@@ -1113,48 +1123,86 @@ buildAttentionScoresRegion(TransformerBlockLowering &match, mlir::Value query,
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(body);
 
-  mlir::Value init = builder.create<EmptyOp>(loc, scoreTy.getShape(),
-                                             scoreTy.getElementType());
+  mlir::Value queryHeads =
+      buildHeadExpandedView(match, body->getArgument(0), queryLength, builder);
+  mlir::Value keyHeads =
+      buildHeadExpandedView(match, body->getArgument(1), keyLength, builder);
+
+  mlir::MLIRContext *context = builder.getContext();
+  mlir::AffineExpr b = builder.getAffineDimExpr(0);
+  mlir::AffineExpr h = builder.getAffineDimExpr(1);
+  mlir::AffineExpr q = builder.getAffineDimExpr(2);
+  mlir::AffineExpr k = builder.getAffineDimExpr(3);
+  mlir::AffineExpr d = builder.getAffineDimExpr(4);
+  mlir::AffineMap queryMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, q, h, d}, context);
+  mlir::AffineMap keyMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, k, h, d}, context);
+  mlir::AffineMap scoreMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, h, q, k}, context);
+  llvm::SmallVector<mlir::utils::IteratorType, 5> contractionIterators = {
+      mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
+      mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
+      mlir::utils::IteratorType::reduction};
+
+  mlir::Value zero = buildF32Constant(builder, loc, 0.0);
+  mlir::Value scoreInit = builder.create<EmptyOp>(loc, scoreTy.getShape(),
+                                                  scoreTy.getElementType());
+  mlir::Value scoreFill =
+      builder.create<mlir::linalg::FillOp>(loc, zero, scoreInit).getResult(0);
+  mlir::Value rawScores =
+      builder
+          .create<mlir::linalg::GenericOp>(
+              loc, scoreTy, mlir::ValueRange{queryHeads, keyHeads},
+              mlir::ValueRange{scoreFill},
+              llvm::SmallVector<mlir::AffineMap, 3>{queryMap, keyMap, scoreMap},
+              contractionIterators,
+              [](mlir::OpBuilder &builder, mlir::Location nestedLoc,
+                 mlir::ValueRange args) {
+                mlir::Value product = builder.create<mlir::arith::MulFOp>(
+                    nestedLoc, args[0], args[1]);
+                mlir::Value sum = builder.create<mlir::arith::AddFOp>(
+                    nestedLoc, args[2], product);
+                builder.create<mlir::linalg::YieldOp>(nestedLoc, sum);
+              })
+          .getResult(0);
+
   double scale = 1.0 / std::sqrt(static_cast<double>(match.headDim));
-  mlir::Value scores = init;
-  for (int64_t batch = 0; batch < match.batchSize; ++batch) {
-    for (int64_t head = 0; head < match.numHeads; ++head) {
-      for (int64_t queryIndex = 0; queryIndex < queryLength; ++queryIndex) {
-        for (int64_t keyIndex = 0; keyIndex < keyLength; ++keyIndex) {
-          mlir::Value sum = buildF32Constant(builder, loc, 0.0);
-          for (int64_t dim = 0; dim < match.headDim; ++dim) {
-            int64_t feature = head * match.headDim + dim;
-            mlir::Value queryValue = builder.create<mlir::tensor::ExtractOp>(
-                loc, body->getArgument(0),
-                mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                                 buildIndexConstant(builder, loc, queryIndex),
-                                 buildIndexConstant(builder, loc, feature)});
-            mlir::Value keyValue = builder.create<mlir::tensor::ExtractOp>(
-                loc, body->getArgument(1),
-                mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                                 buildIndexConstant(builder, loc, keyIndex),
-                                 buildIndexConstant(builder, loc, feature)});
-            mlir::Value product =
-                builder.create<mlir::arith::MulFOp>(loc, queryValue, keyValue);
-            sum = builder.create<mlir::arith::AddFOp>(loc, sum, product);
-          }
-          if (causal && keyIndex > queryIndex) {
-            sum = buildF32Constant(builder, loc,
-                                   -std::numeric_limits<float>::infinity());
-          } else {
-            mlir::Value scaleValue = buildF32Constant(builder, loc, scale);
-            sum = builder.create<mlir::arith::MulFOp>(loc, sum, scaleValue);
-          }
-          scores = builder.create<mlir::tensor::InsertOp>(
-              loc, sum, scores,
-              mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                               buildIndexConstant(builder, loc, head),
-                               buildIndexConstant(builder, loc, queryIndex),
-                               buildIndexConstant(builder, loc, keyIndex)});
-        }
-      }
-    }
-  }
+  mlir::Value scaledInit = builder.create<EmptyOp>(loc, scoreTy.getShape(),
+                                                   scoreTy.getElementType());
+  mlir::AffineMap identityMap = builder.getMultiDimIdentityMap(4);
+  llvm::SmallVector<mlir::utils::IteratorType, 4> parallelIterators(
+      scoreTy.getRank(), mlir::utils::IteratorType::parallel);
+  mlir::Value scores =
+      builder
+          .create<mlir::linalg::GenericOp>(
+              loc, scoreTy, mlir::ValueRange{rawScores},
+              mlir::ValueRange{scaledInit},
+              llvm::SmallVector<mlir::AffineMap, 2>{identityMap, identityMap},
+              parallelIterators,
+              [causal, scale](mlir::OpBuilder &builder,
+                              mlir::Location nestedLoc, mlir::ValueRange args) {
+                mlir::Value scaleValue =
+                    buildF32Constant(builder, nestedLoc, scale);
+                mlir::Value result = builder.create<mlir::arith::MulFOp>(
+                    nestedLoc, args[0], scaleValue);
+                if (causal) {
+                  mlir::Value queryIndex =
+                      builder.create<mlir::linalg::IndexOp>(nestedLoc, 2);
+                  mlir::Value keyIndex =
+                      builder.create<mlir::linalg::IndexOp>(nestedLoc, 3);
+                  mlir::Value masked = builder.create<mlir::arith::CmpIOp>(
+                      nestedLoc, mlir::arith::CmpIPredicate::ugt, keyIndex,
+                      queryIndex);
+                  mlir::Value negInf =
+                      buildF32Constant(builder, nestedLoc,
+                                       -std::numeric_limits<float>::infinity());
+                  result = builder.create<mlir::arith::SelectOp>(
+                      nestedLoc, masked, negInf, result);
+                }
+                builder.create<mlir::linalg::YieldOp>(nestedLoc, result);
+              })
+          .getResult(0);
 
   builder.create<mlir::sculptor::YieldOp>(loc, scores);
   return region.getResult(0);
@@ -1297,41 +1345,47 @@ buildAttentionApplyRegion(TransformerBlockLowering &match,
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(body);
 
-  mlir::Value init =
+  mlir::Value valueHeads =
+      buildHeadExpandedView(match, body->getArgument(1), keyLength, builder);
+  mlir::MLIRContext *context = builder.getContext();
+  mlir::AffineExpr b = builder.getAffineDimExpr(0);
+  mlir::AffineExpr h = builder.getAffineDimExpr(1);
+  mlir::AffineExpr q = builder.getAffineDimExpr(2);
+  mlir::AffineExpr d = builder.getAffineDimExpr(3);
+  mlir::AffineExpr k = builder.getAffineDimExpr(4);
+  mlir::AffineMap probabilityMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, h, q, k}, context);
+  mlir::AffineMap valueMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, k, h, d}, context);
+  mlir::AffineMap headMap = mlir::AffineMap::get(
+      /*dimCount=*/5, /*symbolCount=*/0, {b, h, q, d}, context);
+  llvm::SmallVector<mlir::utils::IteratorType, 5> contractionIterators = {
+      mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
+      mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
+      mlir::utils::IteratorType::reduction};
+
+  mlir::Value zero = buildF32Constant(builder, loc, 0.0);
+  mlir::Value headInit =
       builder.create<EmptyOp>(loc, headTy.getShape(), headTy.getElementType());
-  mlir::Value heads = init;
-  for (int64_t batch = 0; batch < match.batchSize; ++batch) {
-    for (int64_t head = 0; head < match.numHeads; ++head) {
-      for (int64_t queryIndex = 0; queryIndex < queryLength; ++queryIndex) {
-        for (int64_t dim = 0; dim < match.headDim; ++dim) {
-          mlir::Value sum = buildF32Constant(builder, loc, 0.0);
-          for (int64_t keyIndex = 0; keyIndex < keyLength; ++keyIndex) {
-            int64_t feature = head * match.headDim + dim;
-            mlir::Value probability = builder.create<mlir::tensor::ExtractOp>(
-                loc, body->getArgument(0),
-                mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                                 buildIndexConstant(builder, loc, head),
-                                 buildIndexConstant(builder, loc, queryIndex),
-                                 buildIndexConstant(builder, loc, keyIndex)});
-            mlir::Value value = builder.create<mlir::tensor::ExtractOp>(
-                loc, body->getArgument(1),
-                mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                                 buildIndexConstant(builder, loc, keyIndex),
-                                 buildIndexConstant(builder, loc, feature)});
-            mlir::Value product =
-                builder.create<mlir::arith::MulFOp>(loc, probability, value);
-            sum = builder.create<mlir::arith::AddFOp>(loc, sum, product);
-          }
-          heads = builder.create<mlir::tensor::InsertOp>(
-              loc, sum, heads,
-              mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                               buildIndexConstant(builder, loc, head),
-                               buildIndexConstant(builder, loc, queryIndex),
-                               buildIndexConstant(builder, loc, dim)});
-        }
-      }
-    }
-  }
+  mlir::Value headFill =
+      builder.create<mlir::linalg::FillOp>(loc, zero, headInit).getResult(0);
+  mlir::Value heads =
+      builder
+          .create<mlir::linalg::GenericOp>(
+              loc, headTy, mlir::ValueRange{body->getArgument(0), valueHeads},
+              mlir::ValueRange{headFill},
+              llvm::SmallVector<mlir::AffineMap, 3>{probabilityMap, valueMap,
+                                                    headMap},
+              contractionIterators,
+              [](mlir::OpBuilder &builder, mlir::Location nestedLoc,
+                 mlir::ValueRange args) {
+                mlir::Value product = builder.create<mlir::arith::MulFOp>(
+                    nestedLoc, args[0], args[1]);
+                mlir::Value sum = builder.create<mlir::arith::AddFOp>(
+                    nestedLoc, args[2], product);
+                builder.create<mlir::linalg::YieldOp>(nestedLoc, sum);
+              })
+          .getResult(0);
 
   builder.create<mlir::sculptor::YieldOp>(loc, heads);
   return region.getResult(0);
@@ -1353,28 +1407,22 @@ static mlir::Value buildHeadRecombineRegion(TransformerBlockLowering &match,
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(body);
 
-  mlir::Value output = builder.create<EmptyOp>(loc, outputTy.getShape(),
-                                               outputTy.getElementType());
-  for (int64_t batch = 0; batch < match.batchSize; ++batch) {
-    for (int64_t head = 0; head < match.numHeads; ++head) {
-      for (int64_t step = 0; step < sequenceLength; ++step) {
-        for (int64_t dim = 0; dim < match.headDim; ++dim) {
-          int64_t feature = head * match.headDim + dim;
-          mlir::Value value = builder.create<mlir::tensor::ExtractOp>(
-              loc, body->getArgument(0),
-              mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                               buildIndexConstant(builder, loc, head),
-                               buildIndexConstant(builder, loc, step),
-                               buildIndexConstant(builder, loc, dim)});
-          output = builder.create<mlir::tensor::InsertOp>(
-              loc, value, output,
-              mlir::ValueRange{buildIndexConstant(builder, loc, batch),
-                               buildIndexConstant(builder, loc, step),
-                               buildIndexConstant(builder, loc, feature)});
-        }
-      }
-    }
-  }
+  mlir::RankedTensorType transposedTy = mlir::RankedTensorType::get(
+      {match.batchSize, sequenceLength, match.numHeads, match.headDim},
+      match.elementType);
+  mlir::Value transposeInit = builder.create<EmptyOp>(
+      loc, transposedTy.getShape(), transposedTy.getElementType());
+  mlir::Value transposed = builder
+                               .create<mlir::linalg::TransposeOp>(
+                                   loc, body->getArgument(0), transposeInit,
+                                   llvm::ArrayRef<int64_t>{0, 2, 1, 3})
+                               ->getResult(0);
+  llvm::SmallVector<mlir::ReassociationIndices, 3> reassociation = {
+      {0}, {1}, {2, 3}};
+  mlir::Value output = builder
+                           .create<mlir::tensor::CollapseShapeOp>(
+                               loc, outputTy, transposed, reassociation)
+                           .getResult();
 
   builder.create<mlir::sculptor::YieldOp>(loc, output);
   return region.getResult(0);
@@ -1739,8 +1787,7 @@ static mlir::Value buildPreNormMLPSection(TransformerBlockLowering &match,
       match, activated, match.mlpDown, match.mlpHiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_mlp_down", builder);
   return buildResidualAddRegion(match, input, down,
-                                "transformer_block_mlp_residual_add",
-                                builder);
+                                "transformer_block_mlp_residual_add", builder);
 }
 
 static mlir::LogicalResult
@@ -1874,8 +1921,8 @@ lowerTransformerBlockToMVM(mlir::func::FuncOp func,
 
   mlir::Value state;
   if (match->normMode == "pre") {
-    state = buildPreNormSelfAttentionSection(
-        *match, match->blockOp.getInput(), match->causal, rewriter);
+    state = buildPreNormSelfAttentionSection(*match, match->blockOp.getInput(),
+                                             match->causal, rewriter);
     state = buildPreNormMLPSection(*match, state, rewriter);
   } else {
     state = buildSelfAttentionSection(*match, match->blockOp.getInput(),

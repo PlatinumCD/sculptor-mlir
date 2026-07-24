@@ -22,6 +22,7 @@ inline constexpr llvm::StringLiteral kVectorTileTaskKind("digital.vector_tile");
 inline constexpr llvm::StringLiteral
     kTileRecombineTaskKind("digital.tile_recombine");
 inline constexpr llvm::StringLiteral kBiasAddTaskKind("digital.bias_add");
+inline constexpr llvm::StringLiteral kReductionTaskKind("digital.reduction");
 
 inline constexpr llvm::StringLiteral kForwardSourceLayer("forward");
 

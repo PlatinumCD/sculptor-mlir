@@ -11,18 +11,36 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace mlir {
 namespace sculptor {
 namespace task_graph {
 
+enum class LogicalPlacementIslandKind {
+  Analog,
+  Reduction,
+};
+
 struct LogicalPlacementIsland {
   unsigned islandIndex = 0;
-  unsigned matrixSetupTaskIndex = 0;
+  LogicalPlacementIslandKind kind = LogicalPlacementIslandKind::Analog;
+  std::optional<unsigned> matrixSetupTaskIndex;
+  std::optional<int64_t> reductionTreeId;
+  std::optional<int64_t> reductionLane;
+  std::optional<int64_t> reductionWidth;
   llvm::SmallVector<unsigned, 4> mvmTaskIndices;
   llvm::SmallVector<unsigned, 16> digitalTaskIndices;
   llvm::SmallVector<unsigned, 16> taskIndices;
 };
+
+inline bool isAnalogIsland(const LogicalPlacementIsland &island) {
+  return island.kind == LogicalPlacementIslandKind::Analog;
+}
+
+inline bool isReductionIsland(const LogicalPlacementIsland &island) {
+  return island.kind == LogicalPlacementIslandKind::Reduction;
+}
 
 struct IslandExecutionEdge {
   unsigned producerIsland = 0;

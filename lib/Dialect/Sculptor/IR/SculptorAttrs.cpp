@@ -5,6 +5,8 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrsEnums.cpp.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.cpp.inc"
 

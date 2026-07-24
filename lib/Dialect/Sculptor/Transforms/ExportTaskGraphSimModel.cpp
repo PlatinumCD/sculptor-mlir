@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
@@ -32,6 +33,7 @@ namespace {
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
+namespace task_graph_attrs = mlir::sculptor::task_graph_attrs;
 namespace timing_attrs = mlir::sculptor::timing_attrs;
 
 bool isAnalogArrayOp(mlir::Operation *op) {
@@ -123,6 +125,10 @@ struct TaskModel {
   int64_t coreId = 0;
   int64_t digitalOps = 0;
   std::optional<int64_t> islandId;
+  std::optional<int64_t> reductionTreeId;
+  std::optional<int64_t> reductionLevel;
+  std::optional<int64_t> reductionLane;
+  std::optional<int64_t> reductionWidth;
   std::optional<int64_t> physicalArrayId;
   std::optional<int64_t> localArrayId;
   TaskTimingModel timing;
@@ -565,6 +571,14 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
     task.digitalOps = *digitalOps;
     task.islandId =
         getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
+    task.reductionTreeId = getOptionalI64Attr(
+        taskOp, task_graph_attrs::kTaskReductionTreeIdAttrName);
+    task.reductionLevel = getOptionalI64Attr(
+        taskOp, task_graph_attrs::kTaskReductionLevelAttrName);
+    task.reductionLane = getOptionalI64Attr(
+        taskOp, task_graph_attrs::kTaskReductionLaneAttrName);
+    task.reductionWidth = getOptionalI64Attr(
+        taskOp, task_graph_attrs::kTaskReductionWidthAttrName);
     task.timing.topologicalIndex =
         getOptionalI64Attr(taskOp, timing_attrs::kTopologicalIndexAttrName);
     task.timing.dependencyDepth =
@@ -938,6 +952,10 @@ void emitTasks(llvm::json::OStream &json, llvm::ArrayRef<TaskModel> tasks) {
                        static_cast<int64_t>(task.sourceTaskOrdinal));
         json.attribute("core_id", task.coreId);
         emitOptionalI64Attr(json, "island_id", task.islandId);
+        emitOptionalI64Attr(json, "reduction_tree_id", task.reductionTreeId);
+        emitOptionalI64Attr(json, "reduction_level", task.reductionLevel);
+        emitOptionalI64Attr(json, "reduction_lane", task.reductionLane);
+        emitOptionalI64Attr(json, "reduction_width", task.reductionWidth);
         emitOptionalI64Attr(json, "physical_array_id", task.physicalArrayId);
         emitOptionalI64Attr(json, "local_array_id", task.localArrayId);
         json.attribute("digital_ops", task.digitalOps);

@@ -18,6 +18,7 @@
 namespace {
 
 namespace task_schedulers = mlir::sculptor::task_schedulers;
+namespace task_graph = mlir::sculptor::task_graph;
 
 using TaskGraphNode = task_schedulers::TaskGraphNode;
 using CorePhysicalArraySlots =
@@ -71,15 +72,16 @@ static int64_t evaluateGreedyHeuristic(
     const task_schedulers::GreedyHeuristic &heuristic,
     const task_schedulers::HardwareBudget &budget,
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    llvm::ArrayRef<task_graph::IslandExecutionEdge> islandExecutionEdges,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland,
     unsigned activeIsland, unsigned activePlacementIndex,
     unsigned totalPlacementCount,
     const task_schedulers::PlacementConstraints &constraints,
     std::optional<int64_t> bestTransferCost) {
   return heuristic.evaluate(task_schedulers::GreedyHeuristicContext{
-      budget, islandAffinityEdges, coreByPlacedIsland, activeIsland,
-      activePlacementIndex, totalPlacementCount, constraints,
-      bestTransferCost});
+      budget, islandAffinityEdges, islandExecutionEdges,
+      coreByPlacedIsland, activeIsland, activePlacementIndex,
+      totalPlacementCount, constraints, bestTransferCost});
 }
 
 static void
@@ -195,9 +197,10 @@ static GreedyTransferOpportunity computeGreedyTransferOpportunity(
     ++usedSlotsByCore[candidateCore];
     coreByPlacedIsland[island] = candidateCore;
     int64_t score = evaluateGreedyHeuristic(
-        transferCost, budget, islandAffinityEdges, coreByPlacedIsland,
-        island, placementIndex, totalPlacementCount, constraints,
-        std::nullopt);
+        transferCost, budget, islandAffinityEdges,
+        llvm::ArrayRef<task_graph::IslandExecutionEdge>{},
+        coreByPlacedIsland, island, placementIndex, totalPlacementCount,
+        constraints, std::nullopt);
     coreByPlacedIsland.erase(island);
     --usedSlotsByCore[candidateCore];
 
@@ -230,9 +233,10 @@ static void retainBestGreedyImmediateCandidates(
     ++usedSlotsByCore[candidateCore];
     coreByPlacedIsland[island] = candidateCore;
     int64_t score = evaluateGreedyHeuristic(
-        transferCost, budget, islandAffinityEdges, coreByPlacedIsland,
-        island, placementIndex, totalPlacementCount, constraints,
-        std::nullopt);
+        transferCost, budget, islandAffinityEdges,
+        llvm::ArrayRef<task_graph::IslandExecutionEdge>{},
+        coreByPlacedIsland, island, placementIndex, totalPlacementCount,
+        constraints, std::nullopt);
     coreByPlacedIsland.erase(island);
     --usedSlotsByCore[candidateCore];
     scoredCandidates.push_back(GreedyCandidateScore{candidateCore, score});
@@ -432,10 +436,10 @@ static void appendGreedyCandidateCores(
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     llvm::ArrayRef<unsigned> usedSlotsByCore,
     const llvm::DenseMap<unsigned, int64_t> &coreByPlacedIsland) {
-  if (placementIndex == 0 && coreByPlacedIsland.empty()) {
-    if (hasAvailableCoreSlot(/*coreId=*/0, physicalArraysByCore,
+  if (placementIndex == 0) {
+    if (hasAvailableCoreSlot(currentCore, physicalArraysByCore,
                              usedSlotsByCore))
-      candidateCores.push_back(0);
+      candidateCores.push_back(currentCore);
     return;
   }
 
@@ -484,6 +488,7 @@ static llvm::SmallVector<GreedyPlacementState, 16> expandStateImpl(
     const task_schedulers::GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    llvm::ArrayRef<task_graph::IslandExecutionEdge> islandExecutionEdges,
     const task_schedulers::PlacementConstraints &constraints) {
   llvm::SmallVector<GreedyPlacementState, 16> expandedStates;
   if (request.totalPlacementCount == 0 ||
@@ -525,7 +530,7 @@ static llvm::SmallVector<GreedyPlacementState, 16> expandStateImpl(
       continue;
 
     expandedState.score = evaluateGreedyHeuristic(
-        heuristic, budget, islandAffinityEdges,
+        heuristic, budget, islandAffinityEdges, islandExecutionEdges,
         expandedState.coreByPlacedIsland, request.island,
         request.placementIndex, request.totalPlacementCount, constraints,
         transferOpportunity.bestTransferCost);
@@ -578,10 +583,11 @@ llvm::SmallVector<PlacementState, 16> expandState(
     const GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    llvm::ArrayRef<task_graph::IslandExecutionEdge> islandExecutionEdges,
     const PlacementConstraints &constraints) {
   return expandStateImpl(state, request, budget, config, heuristic,
                          physicalArraysByCore, islandAffinityEdges,
-                         constraints);
+                         islandExecutionEdges, constraints);
 }
 
 } // namespace greedy_detail

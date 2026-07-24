@@ -29,8 +29,7 @@ public:
     if (capacity <= 0)
       return;
 
-    FlowEdge forward{to, static_cast<unsigned>(adjacency[to].size()),
-                     capacity};
+    FlowEdge forward{to, static_cast<unsigned>(adjacency[to].size()), capacity};
     FlowEdge reverse{from, static_cast<unsigned>(adjacency[from].size()), 0};
     adjacency[from].push_back(forward);
     adjacency[to].push_back(reverse);
@@ -165,6 +164,8 @@ static mlir::LogicalResult assignPrePlacementMinCutComponentIsland(
 
     unsigned boundaryIndex =
         producerInComponent ? edge.consumerIndex : edge.producerIndex;
+    if (isReductionTask(dag.nodes[boundaryIndex].op))
+      continue;
     auto islandIt = islandByTaskIndex.find(boundaryIndex);
     if (islandIt == islandByTaskIndex.end())
       continue;
@@ -340,6 +341,8 @@ LogicalResult assignRemainingDigitalIslandsByLocalAffinity(
 
         auto islandIt = islandByTaskIndex.find(otherIndex);
         if (islandIt == islandByTaskIndex.end())
+          continue;
+        if (isReductionTask(dag.nodes[otherIndex].op))
           continue;
 
         if (!sameNonEmptySourceLayer(node.op, dag.nodes[otherIndex].op))

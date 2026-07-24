@@ -1,4 +1,4 @@
-// RUN: sculptor-mlir-opt %s --sculptor-expand-mvm-to-golem="array-rows=2 array-cols=3" | FileCheck %s --implicit-check-not=sculptor.mvm
+// RUN: sculptor-mlir-opt %s --sculptor-expand-mvm-to-golem="array-rows=2 array-cols=3" | FileCheck %s --implicit-check-not=sculptor.mvm --implicit-check-not=sculptor.task.reduction
 
 module {
   // CHECK-LABEL: func.func @tile_set_load

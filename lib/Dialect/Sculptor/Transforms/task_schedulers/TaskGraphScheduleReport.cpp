@@ -97,6 +97,44 @@ LogicalResult appendScheduleSummary(
       failed(transferCostPerByte))
     return failure();
 
+  int64_t annealingEpochs = 0;
+  int64_t annealingEvaluations = 0;
+  int64_t annealingInitialScore = 0;
+  int64_t annealingBestScore = 0;
+  double annealingUphillAcceptanceRate = 0.0;
+  double annealingSearchSeconds = 0.0;
+  StringAttr annealingStopReason;
+  if (scheduleName == "annealing") {
+    auto epochs = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kAnnealingEpochsAttrName);
+    auto evaluations = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kAnnealingEvaluationsAttrName);
+    auto initialScore = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kAnnealingInitialScoreAttrName);
+    auto bestScore = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kAnnealingBestScoreAttrName);
+    auto uphillAcceptanceRate = getFloatSummaryAttr(
+        taskGraphFunc,
+        schedule_attrs::kAnnealingUphillAcceptanceRateAttrName);
+    auto searchSeconds = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kAnnealingSearchSecondsAttrName);
+    annealingStopReason = taskGraphFunc->getAttrOfType<StringAttr>(
+        schedule_attrs::kAnnealingStopReasonAttrName);
+    if (failed(epochs) || failed(evaluations) || failed(initialScore) ||
+        failed(bestScore) || failed(uphillAcceptanceRate) ||
+        failed(searchSeconds) || !annealingStopReason) {
+      if (!annealingStopReason)
+        taskGraphFunc.emitError("expected annealing stop-reason attribute");
+      return failure();
+    }
+    annealingEpochs = *epochs;
+    annealingEvaluations = *evaluations;
+    annealingInitialScore = *initialScore;
+    annealingBestScore = *bestScore;
+    annealingUphillAcceptanceRate = *uphillAcceptanceRate;
+    annealingSearchSeconds = *searchSeconds;
+  }
+
   std::error_code ec;
   llvm::raw_fd_ostream os(outputPath, ec, llvm::sys::fs::OF_Append);
   if (ec) {
@@ -118,7 +156,18 @@ LogicalResult appendScheduleSummary(
   os << ',' << *taskCount << ',' << *dependencyCount << ',' << *numLogicalArrays
      << ',' << *totalDigitalOps << ',' << *interCoreTransferBytes << ','
      << *totalTransferCost << ',' << *transferCostPerByte << ','
-     << *boundaryPenalty << ',' << *graphScore << '\n';
+     << *boundaryPenalty << ',' << *graphScore;
+
+  if (scheduleName == "annealing") {
+    os << ',';
+    writeCsvString(os, annealingStopReason.getValue());
+    os << ',' << annealingEpochs << ',' << annealingEvaluations << ','
+       << annealingInitialScore << ',' << annealingBestScore << ','
+       << annealingUphillAcceptanceRate << ',' << annealingSearchSeconds;
+  } else {
+    os << ",,,,,,,";
+  }
+  os << '\n';
   return success();
 }
 

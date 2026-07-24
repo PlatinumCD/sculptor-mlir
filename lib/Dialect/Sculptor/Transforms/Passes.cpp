@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Passes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AnalyzeTaskGraphTiming.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/BalanceTaskGraphReductions.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
@@ -21,6 +22,7 @@ namespace sculptor {
 void registerSculptorPasses() {
   registerAnalyzeTaskGraphTimingPass();
   registerAssembleTaskGraphPass();
+  registerBalanceTaskGraphReductionsPass();
   registerBuildTaskGraphIslandsPass();
   registerCanonicalizeLayersPass();
   registerConvertLayersPass();

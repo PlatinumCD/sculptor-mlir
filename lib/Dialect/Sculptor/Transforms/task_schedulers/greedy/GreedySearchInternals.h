@@ -64,6 +64,7 @@ llvm::SmallVector<PlacementState, 16> expandState(
     const GreedyHeuristic &heuristic,
     const CorePhysicalArraySlots &physicalArraysByCore,
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
+    llvm::ArrayRef<task_graph::IslandExecutionEdge> islandExecutionEdges,
     const PlacementConstraints &constraints);
 
 void repairBoundaryRegretPlacement(

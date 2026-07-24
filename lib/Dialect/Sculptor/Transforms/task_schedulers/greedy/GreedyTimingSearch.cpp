@@ -63,7 +63,9 @@ struct TimingSearchContext {
   const TimingSearchModel &model;
   const task_schedulers::GreedyHeuristic &legacyHeuristic;
   const greedy::CorePhysicalArraySlots &physicalArraysByCore;
+  const task_schedulers::IslandPlacementResources &placementResources;
   llvm::ArrayRef<IslandAffinityEdge> affinityEdges;
+  unsigned analogIslandCount = 0;
 };
 
 static mlir::FailureOr<TimingSearchModel> buildTimingSearchModel(
@@ -79,10 +81,12 @@ static mlir::FailureOr<TimingSearchModel> buildTimingSearchModel(
   }
 
   for (const auto &island : problem.islandGraph.islands) {
-    if (island.matrixSetupTaskIndex >= problem.dag.nodes.size() ||
-        !model.timingByIsland.contains(island.islandIndex)) {
+    if (!model.timingByIsland.contains(island.islandIndex) ||
+        (task_graph::isAnalogIsland(island) &&
+         (!island.matrixSetupTaskIndex ||
+          *island.matrixSetupTaskIndex >= problem.dag.nodes.size()))) {
       problem.diagnosticOp->emitError(
-          "expected each logical island to have setup and timing metadata");
+          "expected each logical island to have valid timing metadata");
       return mlir::failure();
     }
   }
@@ -291,15 +295,15 @@ expandTimingState(const TimingPlacementState &state,
     return timingStates;
 
   unsigned placementIndex = state.placement.islandPlacements.size();
-  greedy::ExpansionRequest request{
-      timing->islandId, placementIndex,
-      static_cast<unsigned>(context.problem.islandGraph.islands.size()),
-      /*pruneCandidates=*/false};
+  greedy::ExpansionRequest request{timing->islandId, placementIndex,
+                                   context.analogIslandCount,
+                                   /*pruneCandidates=*/false};
 
   llvm::SmallVector<greedy::PlacementState, 16> placementStates =
       greedy::expandState(state.placement, request, context.problem.budget,
                           context.config, context.legacyHeuristic,
                           context.physicalArraysByCore, context.affinityEdges,
+                          context.problem.islandGraph.executionGraph.edges,
                           context.problem.constraints);
   timingStates.reserve(placementStates.size());
   for (greedy::PlacementState &placementState : placementStates) {
@@ -328,22 +332,8 @@ buildFinalPlacementPlan(const TimingPlacementState &state,
   for (const greedy::IslandPlacement &placement : placements)
     physicalArrayByIsland[placement.island] = placement.physicalArrayId;
 
-  task_schedulers::IslandPlacementPlan plan;
-  plan.physicalArrayByIsland.reserve(
-      context.problem.islandGraph.islands.size());
-  for (const auto &island : context.problem.islandGraph.islands) {
-    auto physicalArray = physicalArrayByIsland.find(island.islandIndex);
-    if (physicalArray == physicalArrayByIsland.end()) {
-      context.problem.diagnosticOp->emitError(
-          "expected greedy-timing to place every logical island");
-      return mlir::failure();
-    }
-    plan.physicalArrayByIsland.push_back(physicalArray->second);
-  }
-  if (mlir::failed(
-          task_schedulers::validatePlacementPlan(context.problem, plan)))
-    return mlir::failure();
-  return plan;
+  return task_schedulers::buildPlacementPlanFromAnalogPlacements(
+      context.problem, context.placementResources, physicalArrayByIsland);
 }
 
 } // namespace
@@ -376,20 +366,33 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
   auto model = buildTimingSearchModel(problem, timingProfile);
   if (failed(model))
     return failure();
+  auto placementResources =
+      buildIslandPlacementResources(problem, physicalArrayOrder);
+  if (failed(placementResources))
+    return failure();
   auto physicalArraysByCore = greedy::buildCorePhysicalArraySlots(
-      problem.diagnosticOp, problem.budget, physicalArrayOrder);
+      problem.diagnosticOp, problem.budget,
+      placementResources->analogPhysicalArrayOrder);
   if (failed(physicalArraysByCore))
     return failure();
 
   CompositeGreedyHeuristic legacyHeuristic(
-      config.specification, config.boundaryRegret, config.compactRegion);
+      config.specification, config.boundaryRegret, config.compactRegion,
+      config.linkPressure);
+  unsigned analogIslandCount = static_cast<unsigned>(
+      llvm::count_if(problem.islandGraph.islands,
+                     [](const task_graph::LogicalPlacementIsland &island) {
+                       return task_graph::isAnalogIsland(island);
+                     }));
   TimingSearchContext context{problem,
                               timingProfile,
                               config,
                               *model,
                               legacyHeuristic,
                               *physicalArraysByCore,
-                              problem.islandGraph.affinityGraph.edges};
+                              *placementResources,
+                              problem.islandGraph.affinityGraph.edges,
+                              analogIslandCount};
   TimingPlacementState initialState;
   initialState.placement.usedSlotsByCore.assign(
       static_cast<size_t>(problem.budget.numCores), 0);
@@ -397,10 +400,29 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
       static_cast<size_t>(problem.budget.numCores), 0.0);
   initialState.digitalWorkByCore.assign(
       static_cast<size_t>(problem.budget.numCores), 0.0);
+  if (!placementResources->analogPhysicalArrayOrder.empty()) {
+    initialState.placement.currentCore =
+        placementResources->analogPhysicalArrayOrder.front() /
+        problem.budget.arraysPerCore;
+  }
+  for (const auto &entry : placementResources->reductionCoreByIsland) {
+    initialState.placement.coreByPlacedIsland[entry.first] = entry.second;
+    const IslandTimingProfile *timing =
+        model->timingByIsland.lookup(entry.first);
+    if (!timing)
+      continue;
+    initialState.finishByIsland[entry.first] = timing->earliestFinishNs;
+    initialState.digitalReadyByCore[entry.second] =
+        std::max(initialState.digitalReadyByCore[entry.second],
+                 timing->earliestFinishNs);
+    initialState.digitalWorkByCore[entry.second] += timing->digitalWorkNs;
+    initialState.score.maximumResourceWorkNs =
+        std::max(initialState.score.maximumResourceWorkNs,
+                 initialState.digitalWorkByCore[entry.second]);
+  }
 
   auto isComplete = [&](const TimingPlacementState &state) {
-    return state.placement.islandPlacements.size() ==
-           problem.islandGraph.islands.size();
+    return state.placement.islandPlacements.size() == analogIslandCount;
   };
   auto expand = [&](const TimingPlacementState &state, bool) {
     return expandTimingState(state, context);
@@ -438,7 +460,8 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
         "failed to find a timing-aware greedy island placement");
     return failure();
   }
-  return buildFinalPlacementPlan(*finalState, context, physicalArrayOrder);
+  return buildFinalPlacementPlan(*finalState, context,
+                                 placementResources->analogPhysicalArrayOrder);
 }
 
 } // namespace task_schedulers

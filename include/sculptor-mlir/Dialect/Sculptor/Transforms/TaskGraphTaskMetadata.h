@@ -1,6 +1,8 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASKGRAPHTASKMETADATA_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASKGRAPHTASKMETADATA_H
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Support/LogicalResult.h"
@@ -15,6 +17,7 @@ struct TaskFunctionMetadata {
   mlir::StringAttr taskName;
   mlir::StringAttr sourceLayer;
   mlir::IntegerAttr sourceTaskOrdinal;
+  mlir::sculptor::TaskReductionAttr reduction;
 };
 
 void setTaskFunctionMetadata(mlir::func::FuncOp func,

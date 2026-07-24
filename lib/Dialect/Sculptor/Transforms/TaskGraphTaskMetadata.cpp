@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskMetadata.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -33,6 +34,9 @@ void setTaskFunctionMetadata(mlir::func::FuncOp func,
   func->setAttr(task_attrs::kSourceLayerAttrName, metadata.sourceLayer);
   func->setAttr(task_attrs::kSourceTaskOrdinalAttrName,
                 metadata.sourceTaskOrdinal);
+  if (metadata.reduction) {
+    func->setAttr(task_graph_attrs::kTaskReductionAttrName, metadata.reduction);
+  }
 }
 
 bool hasTaskFunctionMetadata(mlir::func::FuncOp func) {
@@ -63,8 +67,10 @@ getTaskFunctionMetadata(mlir::func::CallOp call, mlir::func::FuncOp callee) {
       mlir::failed(taskName) || mlir::failed(sourceLayer))
     return mlir::failure();
 
-  return TaskFunctionMetadata{*domain, *taskKind, *taskName, *sourceLayer,
-                              sourceTaskOrdinal};
+  auto reduction = callee->getAttrOfType<mlir::sculptor::TaskReductionAttr>(
+      task_graph_attrs::kTaskReductionAttrName);
+  return TaskFunctionMetadata{*domain,      *taskKind,         *taskName,
+                              *sourceLayer, sourceTaskOrdinal, reduction};
 }
 
 } // namespace task_metadata

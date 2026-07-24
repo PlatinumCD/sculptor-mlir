@@ -207,6 +207,59 @@ static int64_t getCompactRegionPenalty(
   return std::min(getCompactRegionShapePenalty(context), regretAllowance);
 }
 
+static uint64_t getDirectedLinkKey(int64_t sourceCore,
+                                   int64_t destinationCore) {
+  return (static_cast<uint64_t>(sourceCore) << 32) |
+         static_cast<uint64_t>(destinationCore);
+}
+
+static int64_t getAverageDataEdgeBytes(
+    const mlir::sculptor::task_schedulers::GreedyHeuristicContext &context) {
+  int64_t totalBytes = 0;
+  int64_t edgeCount = 0;
+  for (const auto &edge : context.islandExecutionEdges) {
+    if (!edge.dataDependency || edge.transferredBytes <= 0)
+      continue;
+    totalBytes = saturatingAdd(totalBytes, edge.transferredBytes);
+    ++edgeCount;
+  }
+  return edgeCount == 0 ? 1 : std::max<int64_t>(1, totalBytes / edgeCount);
+}
+
+static int64_t getLinkPressurePenalty(
+    const mlir::sculptor::task_schedulers::GreedyHeuristicContext &context) {
+  llvm::DenseMap<uint64_t, int64_t> bytesByDirectedLink;
+  long double pressure = 0.0L;
+  int64_t normalizationBytes = getAverageDataEdgeBytes(context);
+
+  for (const auto &edge : context.islandExecutionEdges) {
+    if (!edge.dataDependency || edge.transferredBytes <= 0)
+      continue;
+    auto producerCore =
+        context.coreByPlacedIsland.find(edge.producerIsland);
+    auto consumerCore =
+        context.coreByPlacedIsland.find(edge.consumerIsland);
+    if (producerCore == context.coreByPlacedIsland.end() ||
+        consumerCore == context.coreByPlacedIsland.end() ||
+        producerCore->second == consumerCore->second)
+      continue;
+
+    auto route = mlir::sculptor::task_schedulers::buildMeshXYRoute(
+        producerCore->second, consumerCore->second, context.budget);
+    for (auto [sourceCore, destinationCore] : route) {
+      uint64_t link = getDirectedLinkKey(sourceCore, destinationCore);
+      int64_t existingBytes = bytesByDirectedLink.lookup(link);
+      pressure += static_cast<long double>(edge.transferredBytes) *
+                  static_cast<long double>(existingBytes) /
+                  static_cast<long double>(normalizationBytes);
+      bytesByDirectedLink[link] =
+          saturatingAdd(existingBytes, edge.transferredBytes);
+    }
+  }
+
+  return clampToInt64(pressure);
+}
+
 } // namespace
 
 namespace mlir {
@@ -235,6 +288,13 @@ int64_t CompactRegionGreedyHeuristic::evaluate(
                        getCompactRegionPenalty(context, transferScore));
 }
 
+int64_t LinkPressureGreedyHeuristic::evaluate(
+    const GreedyHeuristicContext &context) const {
+  TransferCostGreedyHeuristic transferCost;
+  int64_t transferScore = transferCost.evaluate(context);
+  return saturatingAdd(transferScore, getLinkPressurePenalty(context));
+}
+
 int64_t CompositeGreedyHeuristic::evaluate(
     const GreedyHeuristicContext &context) const {
   TransferCostGreedyHeuristic transferCost;
@@ -249,6 +309,9 @@ int64_t CompositeGreedyHeuristic::evaluate(
   if (compactRegion)
     score =
         saturatingAdd(score, getCompactRegionPenalty(context, transferScore));
+
+  if (linkPressure)
+    score = saturatingAdd(score, getLinkPressurePenalty(context));
 
   return score;
 }

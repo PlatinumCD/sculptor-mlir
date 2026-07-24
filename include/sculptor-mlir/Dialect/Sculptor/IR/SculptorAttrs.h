@@ -4,6 +4,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrsEnums.h.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h.inc"
 

@@ -1,6 +1,7 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHTASKKINDS_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHTASKKINDS_H
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 
@@ -26,6 +27,12 @@ inline bool isMatrixSetupTask(sculptor::TaskCreateOp taskOp) {
 inline bool isAnalogComputeTask(sculptor::TaskCreateOp taskOp) {
   return hasTaskKind(taskOp, task_graph_names::kMVMTaskKind) ||
          hasTaskKind(taskOp, task_graph_names::kConvTileMVMTaskKind);
+}
+
+inline bool isReductionTask(sculptor::TaskCreateOp taskOp) {
+  return hasTaskKind(taskOp, task_graph_names::kReductionTaskKind) &&
+         taskOp->hasAttr(task_graph_attrs::kTaskReductionTreeIdAttrName) &&
+         taskOp->hasAttr(task_graph_attrs::kTaskReductionLaneAttrName);
 }
 
 inline bool sameNonEmptySourceLayer(sculptor::TaskCreateOp lhs,

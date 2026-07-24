@@ -81,9 +81,8 @@ IslandPlacementObjective::evaluate(const IslandPlacementPlan &plan) const {
 
   llvm::DenseMap<unsigned, int64_t> coreByIsland;
   for (auto indexedIsland : llvm::enumerate(problem.islandGraph.islands)) {
-    int64_t physicalArrayId = plan.physicalArrayByIsland[indexedIsland.index()];
     coreByIsland[indexedIsland.value().islandIndex] =
-        physicalArrayId / problem.budget.arraysPerCore;
+        plan.placements[indexedIsland.index()].coreId;
   }
 
   return evaluateIslandCorePlacement(problem.budget,

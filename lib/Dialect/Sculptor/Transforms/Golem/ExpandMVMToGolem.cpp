@@ -4,7 +4,9 @@
 // prepares fixed-size resource tiles for MVM matrix constants inside
 // layer/helper functions while leaving forward alone.
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/ConstantUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 
@@ -19,11 +21,14 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -58,11 +63,29 @@ struct MatrixPartitionSpec {
   int64_t gridCols = 0;
 };
 
+struct MatrixOperand {
+  mlir::arith::ConstantOp constant;
+  mlir::RankedTensorType type;
+  mlir::DenseF32ResourceElementsAttr resource;
+};
+
 struct MatrixTileExtent {
   int64_t physicalRows = 0;
   int64_t physicalCols = 0;
   int64_t validRows = 0;
   int64_t validCols = 0;
+};
+
+struct LogicalArrayGrid {
+  int64_t gridRows = 0;
+  int64_t gridCols = 0;
+  llvm::SmallVector<mlir::Value> values;
+};
+
+struct FunctionExpansionState {
+  llvm::StringMap<MatrixPartitionSpec> matrixSpecs;
+  llvm::StringMap<LogicalArrayGrid> logicalArrays;
+  llvm::SmallVector<mlir::arith::ConstantOp> matrixConstants;
 };
 
 static int64_t ceilDiv(int64_t value, int64_t divisor) {
@@ -157,9 +180,8 @@ getStaticRank2F32Tensor(mlir::Type type) {
   return tensorTy;
 }
 
-static mlir::FailureOr<MatrixPartitionSpec>
-buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp, int64_t arrayRows,
-                         int64_t arrayCols) {
+static mlir::FailureOr<MatrixOperand>
+matchMatrixOperand(mlir::sculptor::MVMOp mvmOp) {
   mlir::Value matrix = mvmOp.getMatrix();
   auto matrixConst = matrix.getDefiningOp<mlir::arith::ConstantOp>();
   if (!matrixConst)
@@ -180,22 +202,32 @@ buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp, int64_t arrayRows,
                            "dense f32 resource"),
            mlir::failure();
 
+  return MatrixOperand{matrixConst, *matrixType, denseResourceAttr};
+}
+
+static mlir::FailureOr<MatrixPartitionSpec>
+buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp,
+                         const MatrixOperand &matrixOperand, int64_t arrayRows,
+                         int64_t arrayCols) {
+  auto matrixConst = matrixOperand.constant;
+
   auto values =
       mlir::sculptor::converter_constant::getF32ConstantValues(matrixConst);
   if (failed(values))
     return mvmOp.emitError("failed to read dense f32 matrix resource"),
            mlir::failure();
 
-  if (static_cast<int64_t>(values->size()) != (*matrixType).getNumElements())
+  if (static_cast<int64_t>(values->size()) !=
+      matrixOperand.type.getNumElements())
     return mvmOp.emitError("dense f32 matrix resource element count does not "
                            "match the tensor type"),
            mlir::failure();
 
-  auto shape = (*matrixType).getShape();
+  auto shape = matrixOperand.type.getShape();
   MatrixPartitionSpec spec;
   spec.constant = matrixConst;
-  spec.type = *matrixType;
-  spec.sourceResource = denseResourceAttr.getRawHandle().getKey().str();
+  spec.type = matrixOperand.type;
+  spec.sourceResource = matrixOperand.resource.getRawHandle().getKey().str();
   spec.taskPrefix = getTaskNamePrefix(mvmOp.getOperation());
   spec.values = std::move(*values);
   spec.gridRows = ceilDiv(shape[0], arrayRows);
@@ -208,84 +240,79 @@ static int64_t getTileIndex(const MatrixPartitionSpec &spec, int64_t tileRow,
   return tileRow * spec.gridCols + tileCol;
 }
 
-static bool hasMatchingTileGrid(mlir::Operation *op, int64_t gridRows,
-                                int64_t gridCols) {
-  auto tileGrid = op->getAttrOfType<mlir::ArrayAttr>(kTileGridAttr);
-  if (!tileGrid || tileGrid.size() != 2)
-    return false;
+static std::optional<std::pair<int64_t, int64_t>>
+getI64PairAttr(mlir::Operation *op, llvm::StringRef attrName) {
+  auto values = op->getAttrOfType<mlir::ArrayAttr>(attrName);
+  if (!values || values.size() != 2)
+    return std::nullopt;
 
-  auto rowAttr = llvm::dyn_cast<mlir::IntegerAttr>(tileGrid[0]);
-  auto colAttr = llvm::dyn_cast<mlir::IntegerAttr>(tileGrid[1]);
-  return rowAttr && colAttr && rowAttr.getInt() == gridRows &&
-         colAttr.getInt() == gridCols;
+  auto first = llvm::dyn_cast<mlir::IntegerAttr>(values[0]);
+  auto second = llvm::dyn_cast<mlir::IntegerAttr>(values[1]);
+  if (!first || !second)
+    return std::nullopt;
+  return std::make_pair(first.getInt(), second.getInt());
 }
 
-static bool hasMatchingTileCoordinate(mlir::Operation *op, int64_t tileRow,
-                                      int64_t tileCol) {
-  auto tile = op->getAttrOfType<mlir::ArrayAttr>(kTileAttr);
-  if (!tile || tile.size() != 2)
-    return false;
-
-  auto rowAttr = llvm::dyn_cast<mlir::IntegerAttr>(tile[0]);
-  auto colAttr = llvm::dyn_cast<mlir::IntegerAttr>(tile[1]);
-  return rowAttr && colAttr && rowAttr.getInt() == tileRow &&
-         colAttr.getInt() == tileCol;
-}
-
-static bool hasMatchingSourceResource(mlir::Operation *op,
-                                      llvm::StringRef sourceResource) {
+static mlir::LogicalResult
+recordLogicalArray(mlir::Operation *op, mlir::Value logicalArray,
+                   llvm::StringMap<LogicalArrayGrid> &logicalArrays) {
   auto sourceAttr = op->getAttrOfType<mlir::StringAttr>(kSourceResourceAttr);
-  return sourceAttr && sourceAttr.getValue() == sourceResource;
+  auto tile = getI64PairAttr(op, kTileAttr);
+  auto grid = getI64PairAttr(op, kTileGridAttr);
+  if (!sourceAttr || !tile || !grid)
+    return mlir::success();
+
+  int64_t gridRows = grid->first;
+  int64_t gridCols = grid->second;
+  int64_t tileRow = tile->first;
+  int64_t tileCol = tile->second;
+  if (gridRows <= 0 || gridCols <= 0 || tileRow < 0 || tileCol < 0 ||
+      tileRow >= gridRows || tileCol >= gridCols)
+    return op->emitError("invalid cached logical-array tile metadata");
+
+  auto [it, inserted] = logicalArrays.try_emplace(sourceAttr.getValue());
+  LogicalArrayGrid &cached = it->second;
+  if (inserted) {
+    cached.gridRows = gridRows;
+    cached.gridCols = gridCols;
+    cached.values.resize(gridRows * gridCols);
+  } else if (cached.gridRows != gridRows || cached.gridCols != gridCols) {
+    return op->emitError(
+        "inconsistent logical-array tile grids for one matrix resource");
+  }
+
+  int64_t index = tileRow * gridCols + tileCol;
+  if (!cached.values[index])
+    cached.values[index] = logicalArray;
+  return mlir::success();
 }
 
-static bool hasMatchingMatrixTileAttrs(mlir::Operation *op,
-                                       llvm::StringRef sourceResource,
-                                       int64_t tileRow, int64_t tileCol,
-                                       int64_t gridRows, int64_t gridCols) {
-  return hasMatchingSourceResource(op, sourceResource) &&
-         hasMatchingTileCoordinate(op, tileRow, tileCol) &&
-         hasMatchingTileGrid(op, gridRows, gridCols);
-}
-
-static mlir::Value findExistingLogicalArray(mlir::func::FuncOp func,
-                                            llvm::StringRef sourceResource,
-                                            int64_t tileRow, int64_t tileCol,
-                                            int64_t gridRows,
-                                            int64_t gridCols) {
-  mlir::Value found;
-  func.walk([&](mlir::sculptor::TaskRegionOp region) {
-    if (found)
-      return;
+static mlir::LogicalResult
+indexExistingLogicalArrays(mlir::func::FuncOp func,
+                           llvm::StringMap<LogicalArrayGrid> &logicalArrays) {
+  mlir::WalkResult result = func.walk([&](mlir::sculptor::TaskRegionOp region) {
     if (region.getKind() != task_graph_names::kMatrixSetupTaskKind ||
-        region.getNumResults() != 1)
-      return;
-    if (!llvm::isa<mlir::sculptor::LogicalArrayType>(
+        region.getNumResults() != 1 ||
+        !llvm::isa<mlir::sculptor::LogicalArrayType>(
             region.getResult(0).getType()))
-      return;
-
-    if (hasMatchingMatrixTileAttrs(region.getOperation(), sourceResource,
-                                   tileRow, tileCol, gridRows, gridCols))
-      found = region.getResult(0);
+      return mlir::WalkResult::advance();
+    if (failed(recordLogicalArray(region.getOperation(), region.getResult(0),
+                                  logicalArrays)))
+      return mlir::WalkResult::interrupt();
+    return mlir::WalkResult::advance();
   });
-  if (found)
-    return found;
+  if (result.wasInterrupted())
+    return mlir::failure();
 
-  func.walk([&](mlir::sculptor::ArraySetOp arraySet) {
-    if (found)
-      return;
-    auto sourceAttr =
-        arraySet->getAttrOfType<mlir::StringAttr>(kSourceResourceAttr);
-    if (!sourceAttr)
-      return;
-
-    if (sourceAttr.getValue() == sourceResource &&
-        hasMatchingTileCoordinate(arraySet.getOperation(), tileRow, tileCol) &&
-        hasMatchingTileGrid(arraySet.getOperation(), gridRows, gridCols)) {
-      found = arraySet.getArray();
-    }
+  result = func.walk([&](mlir::sculptor::ArraySetOp arraySet) {
+    if (failed(recordLogicalArray(arraySet.getOperation(), arraySet.getArray(),
+                                  logicalArrays)))
+      return mlir::WalkResult::interrupt();
+    return mlir::WalkResult::advance();
   });
-
-  return found;
+  if (result.wasInterrupted())
+    return mlir::failure();
+  return mlir::success();
 }
 
 static llvm::SmallVector<float>
@@ -594,33 +621,42 @@ static mlir::Value createArrayExecutionRegion(
 }
 
 static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
-getOrCreateLogicalArrays(mlir::func::FuncOp func, MatrixPartitionSpec &spec,
+getOrCreateLogicalArrays(MatrixPartitionSpec &spec,
+                         llvm::StringMap<LogicalArrayGrid> &logicalArrayCache,
                          int64_t arrayRows, int64_t arrayCols,
                          mlir::RewriterBase &rewriter) {
-  llvm::SmallVector<mlir::Value> logicalArrays(spec.gridRows * spec.gridCols);
+  auto [it, inserted] = logicalArrayCache.try_emplace(spec.sourceResource);
+  LogicalArrayGrid &cached = it->second;
+  if (inserted) {
+    cached.gridRows = spec.gridRows;
+    cached.gridCols = spec.gridCols;
+    cached.values.resize(spec.gridRows * spec.gridCols);
+  } else if (cached.gridRows != spec.gridRows ||
+             cached.gridCols != spec.gridCols) {
+    return spec.constant.emitError(
+               "inconsistent logical-array cache grid for matrix resource"),
+           mlir::failure();
+  }
+
   mlir::Operation *insertAfter = spec.constant.getOperation();
 
   for (int64_t tileRow = 0; tileRow < spec.gridRows; ++tileRow) {
     for (int64_t tileCol = 0; tileCol < spec.gridCols; ++tileCol) {
       int64_t index = getTileIndex(spec, tileRow, tileCol);
-      mlir::Value existing =
-          findExistingLogicalArray(func, spec.sourceResource, tileRow, tileCol,
-                                   spec.gridRows, spec.gridCols);
-      if (existing) {
-        logicalArrays[index] = existing;
-        insertAfter = existing.getDefiningOp();
+      if (cached.values[index]) {
+        insertAfter = cached.values[index].getDefiningOp();
         continue;
       }
 
       rewriter.setInsertionPointAfter(insertAfter);
       mlir::Value setupResult = createMatrixSetupRegion(
           spec, tileRow, tileCol, arrayRows, arrayCols, rewriter);
-      logicalArrays[index] = setupResult;
+      cached.values[index] = setupResult;
       insertAfter = setupResult.getDefiningOp();
     }
   }
 
-  return logicalArrays;
+  return cached.values;
 }
 
 static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
@@ -718,6 +754,15 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMResult(
       mvmOp.getLoc(), mlir::TypeRange{*resultType},
       mlir::ValueRange(partialTiles), "digital.tile_recombine",
       buildTileRecombineName(rewriter, mvmOp));
+  // One-row recombination is an associative sum of equal-shaped partials.
+  // Multi-row recombination also concatenates rows and is not one reduction.
+  if (spec.gridRows == 1 && spec.gridCols > 1) {
+    recombineRegion->setAttr(
+        mlir::sculptor::task_graph_attrs::kTaskReductionAttrName,
+        mlir::sculptor::TaskReductionAttr::get(
+            rewriter.getContext(), mlir::sculptor::TaskReductionKind::Add,
+            rewriter.getBoolAttr(true)));
+  }
 
   mlir::Block *body = new mlir::Block();
   recombineRegion.getBody().push_back(body);
@@ -791,6 +836,10 @@ private:
   int64_t arrayCols;
 
   mlir::LogicalResult walkFunction(mlir::func::FuncOp func) {
+    FunctionExpansionState state;
+    if (failed(indexExistingLogicalArrays(func, state.logicalArrays)))
+      return mlir::failure();
+
     llvm::SmallVector<mlir::sculptor::MVMOp> mvmOps;
     func.walk([&](mlir::sculptor::MVMOp mvmOp) { mvmOps.push_back(mvmOp); });
 
@@ -798,45 +847,79 @@ private:
       if (!mvmOp || !mvmOp->getBlock())
         continue;
 
-      if (failed(handleMVMOp(func, mvmOp)))
+      if (failed(handleMVMOp(state, mvmOp)))
         return mlir::failure();
+    }
+
+    llvm::SmallPtrSet<mlir::Operation *, 16> seenConstants;
+    for (mlir::arith::ConstantOp constant : state.matrixConstants) {
+      if (constant && seenConstants.insert(constant.getOperation()).second &&
+          constant->use_empty())
+        constant.erase();
     }
 
     return mlir::success();
   }
 
-  mlir::LogicalResult handleMVMOp(mlir::func::FuncOp func,
+  mlir::FailureOr<MatrixPartitionSpec *>
+  getOrCreateMatrixSpec(FunctionExpansionState &state,
+                        mlir::sculptor::MVMOp op) {
+    auto matrixOperand = matchMatrixOperand(op);
+    if (failed(matrixOperand))
+      return mlir::failure();
+    state.matrixConstants.push_back(matrixOperand->constant);
+
+    llvm::StringRef sourceResource =
+        matrixOperand->resource.getRawHandle().getKey();
+    auto existing = state.matrixSpecs.find(sourceResource);
+    if (existing != state.matrixSpecs.end()) {
+      if (existing->second.type != matrixOperand->type)
+        return op.emitError(
+                   "one matrix resource has inconsistent tensor types"),
+               mlir::failure();
+      return &existing->second;
+    }
+
+    auto spec =
+        buildMatrixPartitionSpec(op, *matrixOperand, arrayRows, arrayCols);
+    if (failed(spec))
+      return mlir::failure();
+    auto [it, inserted] =
+        state.matrixSpecs.try_emplace(sourceResource, std::move(*spec));
+    (void)inserted;
+    return &it->second;
+  }
+
+  mlir::LogicalResult handleMVMOp(FunctionExpansionState &state,
                                   mlir::sculptor::MVMOp op) {
-    auto spec = buildMatrixPartitionSpec(op, arrayRows, arrayCols);
+    auto spec = getOrCreateMatrixSpec(state, op);
     if (failed(spec))
       return mlir::failure();
 
     mlir::IRRewriter rewriter(op.getContext());
-    auto logicalArrays =
-        getOrCreateLogicalArrays(func, *spec, arrayRows, arrayCols, rewriter);
+    auto logicalArrays = getOrCreateLogicalArrays(
+        **spec, state.logicalArrays, arrayRows, arrayCols, rewriter);
     if (failed(logicalArrays))
       return mlir::failure();
 
     rewriter.setInsertionPoint(op);
-    auto vectorTiles = createVectorTiles(op, *spec, arrayCols, rewriter);
+    auto vectorTiles = createVectorTiles(op, **spec, arrayCols, rewriter);
     if (failed(vectorTiles))
       return mlir::failure();
 
     auto partialTiles =
-        createArrayLoads(op, *spec, *logicalArrays, *vectorTiles, arrayRows,
+        createArrayLoads(op, **spec, *logicalArrays, *vectorTiles, arrayRows,
                          arrayCols, rewriter);
     if (failed(partialTiles))
       return mlir::failure();
 
-    auto recombined = createRecombinedMVMResult(op, *spec, *partialTiles,
+    auto recombined = createRecombinedMVMResult(op, **spec, *partialTiles,
                                                 arrayRows, arrayCols, rewriter);
     if (failed(recombined))
       return mlir::failure();
 
     op.getResult().replaceAllUsesWith(*recombined);
     rewriter.eraseOp(op);
-    if (spec->constant->use_empty())
-      rewriter.eraseOp(spec->constant);
     return mlir::success();
   }
 };

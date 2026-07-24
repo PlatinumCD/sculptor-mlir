@@ -53,7 +53,10 @@ void ScheduleTaskGraphPass::runOnOperation() {
       module.getOperation(), schedule, randomSeed, greedyHeuristic,
       annealingInitialSchedule, annealingMoveSet, annealingMoveRadius,
       annealingInitialTemperature, annealingFinalTemperature,
-      annealingCoolingRate, annealingStepsPerTemperature);
+      annealingCoolingRate, annealingStepsPerTemperature,
+      annealingPlateauPatience, annealingImprovementThreshold,
+      annealingMinimumEpochs, annealingPlateauAcceptanceRate,
+      annealingMaximumEvaluations, annealingMaximumRuntimeSeconds);
   if (failed(schedulerOptions)) {
     signalPassFailure();
     return;

@@ -27,8 +27,8 @@ The scheduler implementation is split by responsibility:
 | `task_schedulers/TaskGraphTypes.h` | Hardware budget and parsed DAG node types. |
 | `task_schedulers/TaskGraphScheduleConfig.h/.cpp` | One-time parsing of Greedy and annealing options into typed configuration. |
 | `task_graph/TaskGraphDAG.h/.cpp` | Task graph parser. |
-| `TaskGraphIslands.h` | Logical placement island data model and island graph builder. |
-| `TaskGraphIslandBuilder.cpp` | Matrix/MVM island seeding and island graph coordination. |
+| `TaskGraphIslands.h` | Analog and reduction placement-island data model and island graph builder. |
+| `TaskGraphIslandBuilder.cpp` | Matrix/MVM island seeding, reduction-island seeding, and island graph coordination. |
 | `TaskGraphIslandDigitalAssignment.cpp` | Pre-placement min-cut digital assignment and local-affinity fallback assignment. |
 | `TaskGraphIslandCommunication.cpp` | Island-level communication edge construction and compaction. |
 | `TaskGraphIslandInternals.h` | Private island-builder helpers shared by the island implementation files. |
@@ -46,10 +46,23 @@ The scheduler implementation is split by responsibility:
 <summary markdown="block">## Placement Pass Flow</summary>
 
 
+`sculptor-balance-task-graph-reductions` optionally reshapes marked,
+reassociable fan-in operations before island construction. For an original
+fan-in `F` and `reduction-width=W`, reductions with `F <= W` are unchanged. A
+larger reduction is divided as evenly as possible among `W` first-stage lanes,
+and one final reduction combines the lane results. Generated tasks carry stable
+tree, level, lane, and width metadata. For example, `F=32,W=4` produces four
+fan-in-8 lane tasks followed by one fan-in-4 final task.
+`require-change=true` makes the pass fail when it finds no eligible marked
+reduction. Production pipelines normally leave this disabled; experiment
+runners enable it to prevent stale or incompatible checkpoints from silently
+producing an unchanged comparison graph.
+
 `sculptor-build-task-graph-islands` owns logical grouping:
 
 1. Parse each task graph function into a `TaskGraphDAG`.
-2. Seed matrix setup and MVM islands.
+2. Seed matrix setup/MVM analog islands and `(reduction tree, lane)` reduction
+   islands.
 3. Assign digital tasks and construct island communication edges.
 4. Attach stable island IDs to the resulting island members.
 
@@ -119,8 +132,15 @@ placement and placement metadata:
 3. Reconstruct and validate the island graph from the attached island IDs.
 4. Ask the scheduler for an `IslandPlacementPlan` without mutating IR.
 5. Validate and commit that plan through the shared placement materializer.
-6. Attach core IDs and analog-array placement.
+6. Attach core IDs to every island and analog-array placement only to analog
+   islands.
 7. Finalize transfer summaries and the placement score on the unfused graph.
+
+When reduction islands are present, scheduling reserves a reusable pool of
+`W` cores, where `W` is the largest generated reduction width in the graph.
+Reduction lane `i` always maps to pool core `i` for every reduction tree. The
+final task belongs to lane `0`. Analog islands cannot consume arrays on these
+reserved cores, and reduction tasks never receive physical-array metadata.
 
 Topology changes and runtime allocation are deliberately separate. The
 `sculptor-fuse-task-graph` pass runs after scheduling, placement-aware timing is
@@ -153,15 +173,26 @@ The placement pass receives a hardware budget through pass parameters.
 | `network-pipelined` | Selects pipelined or store-and-forward traversal across a multi-hop route. The default is `true`. |
 | `schedule` | Name of a registered placement strategy. |
 | `random-seed` | Seed used by randomized schedulers. The default is `0` for reproducible output. |
-| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` and `greedy-timing` schedulers. Terms are comma-separated, such as `transfer-cost,compact-region,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, and `compact-region`; supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. For `greedy-timing`, scoring terms are the final tie-breaker after timing objectives. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
+| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` and `greedy-timing` schedulers. Terms are comma-separated, such as `transfer-cost,link-pressure,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, `compact-region`, and `link-pressure`; supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. For `greedy-timing`, scoring terms are the final tie-breaker after timing objectives. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
 | `annealing-initial-schedule` | Initial placement schedule used by the `annealing` scheduler: `identity`, `random`, `snake`, or `greedy`. The default is `snake`. The `greedy` initializer uses the configured `greedy-heuristic` terms. |
 | `annealing-move-set` | Comma-separated perturbation moves used by the `annealing` scheduler. Supported presets are `basic`, `basic-wide`, and `all`; individual moves are `move-one-position`, `move-one-relocation`, `swap-two-positions`, `adjacent-swap`, `segment-reverse`, `segment-relocation`, and `block-swap`. The default is `basic`. |
 | `annealing-move-radius` | Maximum physical-array-order index distance for single-position annealing moves. `0` means unbounded/global. The default is `0`. |
 | `annealing-initial-temperature` | Initial annealing temperature. If set to `0`, the scheduler infers it from the initial placement score. The default is `0`. |
-| `annealing-final-temperature` | Final annealing temperature. The default is `1`. |
-| `annealing-cooling-rate` | Multiplicative cooling factor applied after each temperature stage. The default is `0.9`. |
-| `annealing-steps-per-temperature` | Number of perturbation attempts per temperature stage. The default is `32`. |
-| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. |
+| `annealing-final-temperature` | Minimum annealing temperature. Cooling stops at this floor while plateau detection continues. The default is `1`. |
+| `annealing-cooling-rate` | Multiplicative cooling factor applied after each temperature epoch. The default is `0.95`. |
+| `annealing-steps-per-temperature` | Number of perturbation attempts in each temperature epoch. The default is `64`. |
+| `annealing-plateau-patience` | Consecutive epochs without a meaningful best-score improvement required to declare a plateau. The default is `10`. |
+| `annealing-improvement-threshold` | Minimum relative best-score improvement that resets plateau patience. The default is `0.001` (0.1%). |
+| `annealing-minimum-epochs` | Minimum epochs completed before plateau termination is allowed. The default is `10`. |
+| `annealing-plateau-acceptance-rate` | Maximum fraction of worse proposals accepted in the last epoch for a stagnant search to be considered plateaued. The default is `0.01` (1%). |
+| `annealing-maximum-evaluations` | Hard candidate-evaluation limit, or `0` to disable it. The default is `100000`. |
+| `annealing-maximum-runtime-seconds` | Internal wall-clock limit, or `0` to disable it. The default is `420` seconds. |
+| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. Annealing rows also include their stop reason, epoch and evaluation counts, initial and best scores, final uphill acceptance rate, and search time. |
+
+`reduction-width` belongs to `sculptor-balance-task-graph-reductions`, not to
+the scheduling pass. It controls reduction parallelism and therefore the size
+of the dedicated reduction-core pool. Its default is `2`, and it must be at
+least `2`.
 
 The total analog array budget is:
 
@@ -193,6 +224,7 @@ coordinates.
 
 ```bash
 sculptor-mlir-opt model.mlir \
+  --sculptor-balance-task-graph-reductions="reduction-width=4" \
   --sculptor-build-task-graph-islands \
   --sculptor-schedule-task-graph="cores=4 arrays-per-core=2 topology=mesh mesh-rows=2 mesh-cols=2 schedule=snake"
 ```
@@ -216,27 +248,39 @@ The scheduler sees the graph as `TaskGraphDAG`:
 | `logicalArrayResources` | Task graph resources whose payload type is `!sculptor.logical.array`. |
 | `dependencyCount` | Number of explicit task dependencies. |
 
-The main placement unit is a logical island. Each island starts from one matrix
-setup group: a `sculptor.matrix_setup` task and the direct `sculptor.mvm` tasks
-that consume the logical array produced by that setup. The setup and its MVM
-tasks must use the same physical analog array:
+The main placement unit is a logical island. There are two island kinds.
+
+An analog island starts from one matrix setup group: a
+`sculptor.matrix_setup` task and the direct `sculptor.mvm` tasks that consume
+the logical array produced by that setup. The setup and its MVM tasks must use
+the same physical analog array:
 
 ```text
 matrix setup -> logical array -> one or more MVM tasks
 ```
 
-The island builder then assigns eligible digital components to those islands
+The island builder then assigns eligible ordinary digital components to analog
+islands
 before physical placement. Clear same-source-layer components between analog
 anchors are assigned by a byte-only min-cut. Components that do not have an
 unambiguous analog boundary use the producer/consumer fallback.
 
-Every strategy returns the same `IslandPlacementPlan`: one physical-array id
-per logical island, in island order. The shared commit helper validates and
-materializes that plan in three steps:
+A reduction island is digital-only. It groups generated reduction tasks by
+`(reduction_tree_id, reduction_lane)`. The first-stage lane-0 task and final
+task therefore share one island and core, while other lanes use distinct
+islands and cores. Ordinary digital tasks are not absorbed into reduction
+islands.
+
+Every strategy returns the same `IslandPlacementPlan`: one placement record per
+logical island, in island order. Every record has a core ID; only an analog
+island also has a physical-array ID. The shared commit helper validates and
+materializes that plan in four steps:
 
 1. Attach analog placement to the matrix setup and its associated MVM tasks.
-2. Place unambiguous same-source-layer core-only tasks on that same core.
-3. Place any remaining core-only tasks from already placed graph neighbors.
+2. Attach core-only placement to generated reduction tasks.
+3. Place unambiguous same-source-layer core-only tasks on their analog island's
+   core.
+4. Place any remaining core-only tasks from already placed graph neighbors.
 
 The neighbor fallback is deterministic:
 
@@ -271,17 +315,18 @@ transfer cost. Otherwise the scorer accumulates:
 | `sculptor.schedule.inter_core_transfer_bytes` | Total bytes crossing core boundaries. |
 | `sculptor.schedule.total_transfer_cost` | Total Manhattan-distance weighted transfer cost. |
 | `sculptor.schedule.boundary_penalty` | Extra penalty when first and last tasks do not share a mesh boundary. |
-| `sculptor.schedule.graph_score` | `total_transfer_cost + boundary_penalty`. |
+| `sculptor.schedule.graph_score` | Communication-only score equal to `total_transfer_cost`. |
 
-The boundary penalty is a soft endpoint constraint. If the first and last tasks
-do not share at least one mesh edge boundary, the scorer adds a 20% surcharge:
+The boundary penalty is a separately reported soft endpoint constraint. If the
+first and last tasks do not share at least one mesh edge boundary, it is a 20%
+surcharge:
 
 ```text
 boundary_penalty = ceil(total_transfer_cost / 5)
 ```
 
-This makes endpoint placement visible in the score without making non-boundary
-placements illegal.
+The placement objective can use this penalty when comparing placements, but it
+is not included in the reported graph score.
 
 </details>
 
@@ -364,6 +409,16 @@ growth along a mesh boundary. This is intended to prefer healthier two
 dimensional regions when transfer-cost candidates are equal or near-equal. It is
 intended to be composed with the transfer baseline, for example
 `greedy-heuristic=transfer-cost,compact-region,lookahead=3,beam=8`.
+
+The `link-pressure` greedy heuristic is a placement-time proxy for network
+contention. It routes every data edge whose endpoint islands are already
+placed using the same directed XY routes as the timing model. For each directed
+link, it adds a normalized pairwise penalty when multiple byte-heavy routes
+share that link. Opposite link directions are independent. The term is
+order-independent and does not claim that the transfers overlap in time; exact
+time-window contention remains part of placement-aware timing analysis. It can
+be composed as
+`greedy-heuristic=transfer-cost,link-pressure,boundary-regret,lookahead=3`.
 
 Boundary-aware greedy heuristics also run a terminal repair step after the
 initial island placement is selected. If the first and last task islands do not
@@ -466,7 +521,9 @@ that placement over the logical island communication graph, then repeatedly
 generates candidate placements with randomized perturbation moves selected from
 `annealing-move-set`. Better candidates are accepted immediately; worse
 candidates are accepted with probability `exp(-delta / temperature)`. The
-temperature is reduced by `annealing-cooling-rate` after each stage.
+temperature is reduced by `annealing-cooling-rate` after each epoch until it
+reaches `annealing-final-temperature`, which acts as a temperature floor rather
+than a stopping condition.
 
 Supported initial schedules are `identity`, `random`, `snake`, and `greedy`;
 the `snake` initializer uses the same physical-array order builder as the real
@@ -480,6 +537,19 @@ assignments shift together. The `all` preset also enables `adjacent-swap`,
 `segment-reverse`, `segment-relocation`, and `block-swap`, which can perturb
 contiguous regions of the island order instead of only changing single
 positions.
+
+Annealing stops when the best score has not improved by at least
+`annealing-improvement-threshold` for `annealing-plateau-patience` consecutive
+epochs, at least `annealing-minimum-epochs` have completed, and the latest
+uphill acceptance rate is no greater than
+`annealing-plateau-acceptance-rate`. The uphill acceptance rate counts accepted
+worse candidates divided by all proposed worse candidates; an epoch with no
+worse candidates has a rate of zero. Evaluation and runtime limits provide
+independent safety bounds.
+
+The scheduled task-graph function records the stopping reason, completed epoch
+count, candidate evaluation count, initial and best scores, final uphill
+acceptance rate, and annealing search time under `sculptor.schedule` attributes.
 
 `annealing-move-radius` controls the target range for `move-one-position` and
 `move-one-relocation`. A radius of `0` keeps the target unbounded across the
@@ -534,7 +604,10 @@ parsed DAG, and logical island graph. A scheduler returns one canonical plan:
 
 ```cpp
 IslandPlacementPlan plan;
-plan.physicalArrayByIsland = {/* one physical array per island */};
+plan.placements = {
+    {/* coreId=*/0, /*physicalArrayId=*/0},
+    {/* coreId=*/1, /*physicalArrayId=*/std::nullopt},
+};
 return plan;
 ```
 
@@ -564,7 +637,7 @@ Scheduling, fusion, and resource finalization add distinct metadata layers.
 | Local array id | Core-local analog array id derived from physical array id. |
 | Logical array placement | Mapping from logical arrays to physical arrays. |
 | Transfer summary | Inter-core byte movement and mesh-distance transfer cost. |
-| Graph score | Transfer cost plus any boundary penalty. |
+| Graph score | Communication-only Manhattan-distance transfer cost. |
 | Digital op count | Static estimate of digital work attached to scheduled tasks. |
 | Task index | Runtime order assigned during resource finalization. |
 | Runtime resource layout | Resource slots, intermediate indices, offsets, and workspace size assigned after task fusion. |

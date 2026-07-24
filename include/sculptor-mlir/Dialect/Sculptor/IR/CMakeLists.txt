@@ -9,6 +9,10 @@ mlir_tablegen(SculptorAttrs.cpp.inc -gen-attrdef-defs)
 mlir_tablegen(SculptorOps.h.inc -gen-op-decls)
 mlir_tablegen(SculptorOps.cpp.inc -gen-op-defs)
 
+set(LLVM_TARGET_DEFINITIONS SculptorAttrs.td)
+mlir_tablegen(SculptorAttrsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(SculptorAttrsEnums.cpp.inc -gen-enum-defs)
+
 set(LLVM_TARGET_DEFINITIONS Ops/SculptorNNOps.td)
 mlir_tablegen(SculptorNNOpsEnums.h.inc -gen-enum-decls)
 mlir_tablegen(SculptorNNOpsEnums.cpp.inc -gen-enum-defs)

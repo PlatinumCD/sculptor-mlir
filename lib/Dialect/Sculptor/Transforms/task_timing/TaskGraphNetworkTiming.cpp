@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/MeshGeometry.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingAnalysis.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TimingCostModel.h"
 
@@ -130,8 +131,11 @@ public:
     if (sourceCore == destinationCore || bytes <= 0)
       return timing;
 
+    task_schedulers::HardwareBudget budget;
+    budget.meshRows = placement.meshRows;
+    budget.meshCols = placement.meshCols;
     llvm::SmallVector<std::pair<int64_t, int64_t>, 16> route =
-        buildXYRoute(sourceCore, destinationCore);
+        task_schedulers::buildMeshXYRoute(sourceCore, destinationCore, budget);
     timing.hops = route.size();
     if (route.empty())
       return timing;
@@ -193,32 +197,6 @@ private:
     reservations.insert(insertionPoint,
                         LinkReservation{start, start + durationCycles});
     return start;
-  }
-
-  llvm::SmallVector<std::pair<int64_t, int64_t>, 16>
-  buildXYRoute(int64_t sourceCore, int64_t destinationCore) const {
-    llvm::SmallVector<std::pair<int64_t, int64_t>, 16> route;
-    int64_t current = sourceCore;
-    int64_t currentRow = current / placement.meshCols;
-    int64_t currentCol = current % placement.meshCols;
-    int64_t destinationRow = destinationCore / placement.meshCols;
-    int64_t destinationCol = destinationCore % placement.meshCols;
-
-    while (currentCol != destinationCol) {
-      int64_t next = current + (currentCol < destinationCol ? 1 : -1);
-      route.push_back({current, next});
-      current = next;
-      currentCol += currentCol < destinationCol ? 1 : -1;
-    }
-    while (currentRow != destinationRow) {
-      int64_t next =
-          current + (currentRow < destinationRow ? placement.meshCols
-                                                 : -placement.meshCols);
-      route.push_back({current, next});
-      current = next;
-      currentRow += currentRow < destinationRow ? 1 : -1;
-    }
-    return route;
   }
 
   const PlacementInfo &placement;

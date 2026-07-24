@@ -88,7 +88,11 @@ FailureOr<TaskGraphSchedulerOptions> buildTaskGraphSchedulerOptions(
     llvm::StringRef greedyHeuristic, llvm::StringRef annealingInitialSchedule,
     llvm::StringRef annealingMoveSet, int64_t annealingMoveRadius,
     double annealingInitialTemperature, double annealingFinalTemperature,
-    double annealingCoolingRate, int64_t annealingStepsPerTemperature) {
+    double annealingCoolingRate, int64_t annealingStepsPerTemperature,
+    int64_t annealingPlateauPatience, double annealingImprovementThreshold,
+    int64_t annealingMinimumEpochs, double annealingPlateauAcceptanceRate,
+    int64_t annealingMaximumEvaluations,
+    double annealingMaximumRuntimeSeconds) {
   if (schedule == "random") {
     if (randomSeed < 0) {
       diagnosticOp->emitError(
@@ -116,7 +120,10 @@ FailureOr<TaskGraphSchedulerOptions> buildTaskGraphSchedulerOptions(
         diagnosticOp, annealingInitialSchedule, annealingMoveSet,
         annealingMoveRadius, annealingInitialTemperature,
         annealingFinalTemperature, annealingCoolingRate,
-        annealingStepsPerTemperature);
+        annealingStepsPerTemperature, annealingPlateauPatience,
+        annealingImprovementThreshold, annealingMinimumEpochs,
+        annealingPlateauAcceptanceRate, annealingMaximumEvaluations,
+        annealingMaximumRuntimeSeconds);
     if (failed(annealing))
       return failure();
 
@@ -165,6 +172,23 @@ void attachTaskGraphSchedulerOptionAttrs(
               builder.getStringAttr(annealing->annealing.moveSetSpecification));
   op->setAttr(schedule_attrs::kAnnealingMoveRadiusAttrName,
               builder.getI64IntegerAttr(annealing->annealing.moveRadius));
+  op->setAttr(
+      schedule_attrs::kAnnealingPlateauPatienceAttrName,
+      builder.getI64IntegerAttr(annealing->annealing.plateauPatience));
+  op->setAttr(schedule_attrs::kAnnealingImprovementThresholdAttrName,
+              builder.getF64FloatAttr(
+                  annealing->annealing.improvementThreshold));
+  op->setAttr(schedule_attrs::kAnnealingMinimumEpochsAttrName,
+              builder.getI64IntegerAttr(annealing->annealing.minimumEpochs));
+  op->setAttr(schedule_attrs::kAnnealingPlateauAcceptanceRateAttrName,
+              builder.getF64FloatAttr(
+                  annealing->annealing.plateauAcceptanceRate));
+  op->setAttr(schedule_attrs::kAnnealingMaximumEvaluationsAttrName,
+              builder.getI64IntegerAttr(
+                  annealing->annealing.maximumEvaluations));
+  op->setAttr(schedule_attrs::kAnnealingMaximumRuntimeSecondsAttrName,
+              builder.getF64FloatAttr(
+                  annealing->annealing.maximumRuntimeSeconds));
   if (annealing->annealing.initialSchedule == AnnealingInitialSchedule::Greedy)
     attachGreedyAttrs(op, builder, annealing->greedyInitialPlacement);
 }
@@ -208,6 +232,10 @@ parseGreedyScheduleConfig(Operation *diagnosticOp,
       config.compactRegion = true;
       continue;
     }
+    if (term == "link-pressure") {
+      config.linkPressure = true;
+      continue;
+    }
 
     if (term.consume_front("lookahead=")) {
       auto parsed = parsePositiveGreedyInteger(diagnosticOp, "lookahead", term);
@@ -243,8 +271,8 @@ parseGreedyScheduleConfig(Operation *diagnosticOp,
     diagnosticOp->emitError("unknown Sculptor greedy heuristic term '")
         << term
         << "'; expected comma-separated terms: 'transfer-cost', "
-           "'boundary-regret', 'compact-region', 'lookahead=N', 'beam=N', "
-           "or 'scope=NAME'";
+           "'boundary-regret', 'compact-region', 'link-pressure', "
+           "'lookahead=N', 'beam=N', or 'scope=NAME'";
     return failure();
   }
   return config;
@@ -253,7 +281,10 @@ parseGreedyScheduleConfig(Operation *diagnosticOp,
 FailureOr<AnnealingScheduleConfig> parseAnnealingScheduleConfig(
     Operation *diagnosticOp, llvm::StringRef initialSchedule,
     llvm::StringRef moveSet, int64_t moveRadius, double initialTemperature,
-    double finalTemperature, double coolingRate, int64_t stepsPerTemperature) {
+    double finalTemperature, double coolingRate, int64_t stepsPerTemperature,
+    int64_t plateauPatience, double improvementThreshold,
+    int64_t minimumEpochs, double plateauAcceptanceRate,
+    int64_t maximumEvaluations, double maximumRuntimeSeconds) {
   AnnealingScheduleConfig config;
   if (initialSchedule == "identity") {
     config.initialSchedule = AnnealingInitialSchedule::Identity;
@@ -324,12 +355,51 @@ FailureOr<AnnealingScheduleConfig> parseAnnealingScheduleConfig(
         "expected Sculptor annealing steps per temperature to be positive");
     return failure();
   }
+  if (plateauPatience <= 0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing plateau patience to be positive");
+    return failure();
+  }
+  if (improvementThreshold < 0.0 || improvementThreshold >= 1.0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing improvement threshold to be at least "
+        "zero and less than one");
+    return failure();
+  }
+  if (minimumEpochs <= 0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing minimum epochs to be positive");
+    return failure();
+  }
+  if (plateauAcceptanceRate < 0.0 || plateauAcceptanceRate > 1.0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing plateau acceptance rate to be between "
+        "zero and one");
+    return failure();
+  }
+  if (maximumEvaluations < 0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing maximum evaluations to be "
+        "non-negative");
+    return failure();
+  }
+  if (maximumRuntimeSeconds < 0.0) {
+    diagnosticOp->emitError(
+        "expected Sculptor annealing maximum runtime to be non-negative");
+    return failure();
+  }
 
   config.moveRadius = moveRadius;
   config.initialTemperature = initialTemperature;
   config.finalTemperature = finalTemperature;
   config.coolingRate = coolingRate;
   config.stepsPerTemperature = stepsPerTemperature;
+  config.plateauPatience = plateauPatience;
+  config.improvementThreshold = improvementThreshold;
+  config.minimumEpochs = minimumEpochs;
+  config.plateauAcceptanceRate = plateauAcceptanceRate;
+  config.maximumEvaluations = maximumEvaluations;
+  config.maximumRuntimeSeconds = maximumRuntimeSeconds;
   return config;
 }
 

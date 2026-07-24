@@ -2,13 +2,19 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 
 #include "mlir/IR/Builders.h"
 
+#include "llvm/ADT/DenseSet.h"
+
 #include "TaskGraphIslandInternals.h"
 
+#include <algorithm>
 #include <limits>
+#include <optional>
+#include <queue>
 #include <utility>
 
 namespace {
@@ -53,6 +59,48 @@ static void recordInitialMatrixSetupIslands(
   }
 }
 
+struct ReductionIslandMetadata {
+  int64_t treeId = 0;
+  int64_t lane = 0;
+  int64_t width = 0;
+};
+
+static mlir::FailureOr<ReductionIslandMetadata>
+getReductionIslandMetadata(const TaskGraphNode &node) {
+  auto treeId = node.op->getAttrOfType<mlir::IntegerAttr>(
+      mlir::sculptor::task_graph_attrs::kTaskReductionTreeIdAttrName);
+  auto lane = node.op->getAttrOfType<mlir::IntegerAttr>(
+      mlir::sculptor::task_graph_attrs::kTaskReductionLaneAttrName);
+  auto width = node.op->getAttrOfType<mlir::IntegerAttr>(
+      mlir::sculptor::task_graph_attrs::kTaskReductionWidthAttrName);
+  if (!treeId || !lane || !width || treeId.getInt() < 0 || lane.getInt() < 0 ||
+      width.getInt() < 2 || lane.getInt() >= width.getInt()) {
+    node.op->emitError(
+        "expected valid reduction tree, lane, and width metadata");
+    return mlir::failure();
+  }
+  return ReductionIslandMetadata{treeId.getInt(), lane.getInt(),
+                                 width.getInt()};
+}
+
+static mlir::LogicalResult recordInitialReductionIslands(
+    const task_graph::TaskGraphDAG &dag,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  llvm::DenseMap<std::pair<int64_t, int64_t>, unsigned> islandByTreeLane;
+  for (const TaskGraphNode &node : dag.nodes) {
+    if (!task_graph::isReductionTask(node.op))
+      continue;
+
+    auto metadata = getReductionIslandMetadata(node);
+    if (mlir::failed(metadata))
+      return mlir::failure();
+    auto key = std::make_pair(metadata->treeId, metadata->lane);
+    auto inserted = islandByTreeLane.try_emplace(key, node.index);
+    islandByTaskIndex[node.index] = inserted.first->second;
+  }
+  return mlir::success();
+}
+
 static void appendUniqueTaskIndex(llvm::SmallVectorImpl<unsigned> &tasks,
                                   unsigned taskIndex) {
   for (unsigned existingTask : tasks) {
@@ -63,11 +111,83 @@ static void appendUniqueTaskIndex(llvm::SmallVectorImpl<unsigned> &tasks,
   tasks.push_back(taskIndex);
 }
 
-static task_graph::LogicalPlacementIslandGraph
+static void assignUncoveredExecutionEndpointIsland(
+    const task_graph::TaskExecutionGraph &executionGraph,
+    const llvm::DenseSet<unsigned> &analogIslands, unsigned endpoint,
+    bool traverseForward,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  if (islandByTaskIndex.contains(endpoint) ||
+      endpoint >= executionGraph.topologicalOrder.size())
+    return;
+
+  llvm::SmallVector<bool, 16> visited(executionGraph.topologicalOrder.size(),
+                                      false);
+  std::queue<unsigned> worklist;
+  visited[endpoint] = true;
+  worklist.push(endpoint);
+  std::optional<unsigned> selectedIsland;
+  while (!worklist.empty() && !selectedIsland) {
+    size_t levelSize = worklist.size();
+    llvm::SmallVector<unsigned, 4> candidates;
+    for (size_t item = 0; item < levelSize; ++item) {
+      unsigned current = worklist.front();
+      worklist.pop();
+      const auto &edgeIndices = traverseForward
+                                    ? executionGraph.outgoingEdges[current]
+                                    : executionGraph.incomingEdges[current];
+      for (unsigned edgeIndex : edgeIndices) {
+        const task_graph::TaskExecutionEdge &edge =
+            executionGraph.edges[edgeIndex];
+        unsigned adjacent =
+            traverseForward ? edge.consumerTask : edge.producerTask;
+        auto island = islandByTaskIndex.find(adjacent);
+        if (island != islandByTaskIndex.end() &&
+            analogIslands.contains(island->second)) {
+          candidates.push_back(island->second);
+          continue;
+        }
+        if (!visited[adjacent]) {
+          visited[adjacent] = true;
+          worklist.push(adjacent);
+        }
+      }
+    }
+    if (!candidates.empty()) {
+      selectedIsland =
+          traverseForward
+              ? *std::min_element(candidates.begin(), candidates.end())
+              : *std::max_element(candidates.begin(), candidates.end());
+    }
+  }
+  if (selectedIsland)
+    islandByTaskIndex[endpoint] = *selectedIsland;
+}
+
+static void assignExecutionEndpointIslands(
+    const task_graph::TaskExecutionGraph &executionGraph,
+    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  if (executionGraph.topologicalOrder.empty())
+    return;
+
+  llvm::DenseSet<unsigned> analogIslands;
+  for (const TaskGraphNode *setup : matrixSetupTasks) {
+    auto island = islandByTaskIndex.find(setup->index);
+    if (island != islandByTaskIndex.end())
+      analogIslands.insert(island->second);
+  }
+  assignUncoveredExecutionEndpointIsland(
+      executionGraph, analogIslands, executionGraph.topologicalOrder.front(),
+      /*traverseForward=*/true, islandByTaskIndex);
+  assignUncoveredExecutionEndpointIsland(
+      executionGraph, analogIslands, executionGraph.topologicalOrder.back(),
+      /*traverseForward=*/false, islandByTaskIndex);
+}
+
+static mlir::FailureOr<task_graph::LogicalPlacementIslandGraph>
 assembleLogicalPlacementIslandGraph(
     const task_graph::TaskGraphDAG &dag,
     const task_graph::TaskExecutionGraph &executionGraph,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
     llvm::ArrayRef<IslandAffinityEdge> affinityEdges,
     const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
   task_graph::LogicalPlacementIslandGraph graph;
@@ -76,15 +196,78 @@ assembleLogicalPlacementIslandGraph(
   graph.executionGraph =
       task_graph::buildIslandExecutionGraph(executionGraph, islandByTaskIndex);
 
+  llvm::DenseMap<unsigned, llvm::SmallVector<const TaskGraphNode *, 8>>
+      nodesByIsland;
+  for (const TaskGraphNode &node : dag.nodes) {
+    auto islandIt = islandByTaskIndex.find(node.index);
+    if (islandIt != islandByTaskIndex.end())
+      nodesByIsland[islandIt->second].push_back(&node);
+  }
+
+  llvm::SmallVector<unsigned, 16> islandIndices;
+  islandIndices.reserve(nodesByIsland.size());
+  for (const auto &entry : nodesByIsland)
+    islandIndices.push_back(entry.first);
+  llvm::sort(islandIndices);
+
   llvm::DenseMap<unsigned, unsigned> islandOrdinalByIndex;
-  graph.islands.reserve(matrixSetupTasks.size());
-  for (const TaskGraphNode *setupNode : matrixSetupTasks) {
+  graph.islands.reserve(islandIndices.size());
+  for (unsigned islandIndex : islandIndices) {
     task_graph::LogicalPlacementIsland island;
-    island.islandIndex = setupNode->index;
-    island.matrixSetupTaskIndex = setupNode->index;
+    island.islandIndex = islandIndex;
+    bool foundReductionTask = false;
+    for (const TaskGraphNode *node : nodesByIsland.lookup(islandIndex)) {
+      if (task_graph::isMatrixSetupTask(node->op)) {
+        if (island.matrixSetupTaskIndex) {
+          node->op->emitError(
+              "expected one matrix setup task per analog placement island");
+          return mlir::failure();
+        }
+        island.matrixSetupTaskIndex = node->index;
+      }
+
+      if (!task_graph::isReductionTask(node->op))
+        continue;
+      auto metadata = getReductionIslandMetadata(*node);
+      if (mlir::failed(metadata))
+        return mlir::failure();
+      if (!foundReductionTask) {
+        island.reductionTreeId = metadata->treeId;
+        island.reductionLane = metadata->lane;
+        island.reductionWidth = metadata->width;
+        foundReductionTask = true;
+      } else if (island.reductionTreeId != metadata->treeId ||
+                 island.reductionLane != metadata->lane ||
+                 island.reductionWidth != metadata->width) {
+        node->op->emitError(
+            "expected a reduction island to contain one tree lane");
+        return mlir::failure();
+      }
+    }
+
+    if (island.matrixSetupTaskIndex && foundReductionTask) {
+      dag.nodes[*island.matrixSetupTaskIndex].op->emitError(
+          "expected analog and reduction tasks to use separate islands");
+      return mlir::failure();
+    }
+    if (foundReductionTask) {
+      island.kind = task_graph::LogicalPlacementIslandKind::Reduction;
+      for (const TaskGraphNode *node : nodesByIsland.lookup(islandIndex)) {
+        if (!task_graph::isReductionTask(node->op)) {
+          node->op->emitError(
+              "expected reduction islands to contain only reduction tasks");
+          return mlir::failure();
+        }
+      }
+    } else if (!island.matrixSetupTaskIndex) {
+      dag.nodes[nodesByIsland.lookup(islandIndex).front()->index].op->emitError(
+          "expected logical island to have an analog or reduction anchor");
+      return mlir::failure();
+    }
+
     unsigned ordinal = static_cast<unsigned>(graph.islands.size());
     graph.islands.push_back(std::move(island));
-    islandOrdinalByIndex.try_emplace(setupNode->index, ordinal);
+    islandOrdinalByIndex.try_emplace(islandIndex, ordinal);
   }
 
   for (const TaskGraphNode &node : dag.nodes) {
@@ -100,7 +283,8 @@ assembleLogicalPlacementIslandGraph(
         graph.islands[ordinalIt->second];
     appendUniqueTaskIndex(island.taskIndices, node.index);
 
-    if (node.index == island.matrixSetupTaskIndex)
+    if (island.matrixSetupTaskIndex &&
+        node.index == *island.matrixSetupTaskIndex)
       continue;
 
     if (task_graph::isAnalogComputeTask(node.op)) {
@@ -132,6 +316,8 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
   llvm::DenseMap<unsigned, unsigned> islandByTaskIndex;
   recordInitialMatrixSetupIslands(matrixSetupTasks, mvmTasksByMatrixSetupTask,
                                   islandByTaskIndex);
+  if (failed(recordInitialReductionIslands(dag, islandByTaskIndex)))
+    return failure();
   if (failed(assignPrePlacementMinCutDigitalIslands(dag, islandByTaskIndex)))
     return failure();
 
@@ -143,11 +329,13 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
                                                           islandByTaskIndex)))
     return failure();
 
+  assignExecutionEndpointIslands(executionGraph, matrixSetupTasks,
+                                 islandByTaskIndex);
+
   llvm::SmallVector<IslandAffinityEdge, 16> affinityEdges =
       buildIslandAffinityEdges(dag, *resourceEdges, islandByTaskIndex);
 
-  return assembleLogicalPlacementIslandGraph(dag, executionGraph,
-                                             matrixSetupTasks, affinityEdges,
+  return assembleLogicalPlacementIslandGraph(dag, executionGraph, affinityEdges,
                                              islandByTaskIndex);
 }
 
@@ -171,9 +359,6 @@ FailureOr<LogicalPlacementIslandGraph>
 loadLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
                                 const TaskExecutionGraph &executionGraph) {
   llvm::DenseMap<unsigned, unsigned> islandByTaskIndex;
-  llvm::DenseMap<unsigned, const TaskGraphNode *> setupByIsland;
-  llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks;
-
   for (const TaskGraphNode &node : dag.nodes) {
     auto islandId =
         node.op->getAttrOfType<IntegerAttr>(schedule_attrs::kIslandIdAttrName);
@@ -196,28 +381,6 @@ loadLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
 
     unsigned islandIndex = static_cast<unsigned>(islandValue);
     islandByTaskIndex.try_emplace(node.index, islandIndex);
-    if (!isMatrixSetupTask(node.op))
-      continue;
-
-    if (islandIndex != node.index) {
-      node.op->emitError(
-          "expected logical island ID to match its matrix setup task index");
-      return failure();
-    }
-    if (!setupByIsland.try_emplace(islandIndex, &node).second) {
-      node.op->emitError(
-          "expected one matrix setup task per logical placement island");
-      return failure();
-    }
-    matrixSetupTasks.push_back(&node);
-  }
-
-  for (const auto &entry : islandByTaskIndex) {
-    if (setupByIsland.contains(entry.second))
-      continue;
-    dag.nodes[entry.first].op->emitError(
-        "expected logical island to be anchored by a matrix setup task");
-    return failure();
   }
 
   auto resourceEdges = collectResourceEdges(dag);
@@ -226,8 +389,7 @@ loadLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
 
   llvm::SmallVector<IslandAffinityEdge, 16> affinityEdges =
       buildIslandAffinityEdges(dag, *resourceEdges, islandByTaskIndex);
-  return assembleLogicalPlacementIslandGraph(dag, executionGraph,
-                                             matrixSetupTasks, affinityEdges,
+  return assembleLogicalPlacementIslandGraph(dag, executionGraph, affinityEdges,
                                              islandByTaskIndex);
 }
 
