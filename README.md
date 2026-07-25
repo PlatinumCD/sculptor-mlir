@@ -66,6 +66,7 @@ The compiler is staged around explicit IR boundaries:
 | Fuse graph | placed tasks -> same-island, same-core component tasks | `sculptor-fuse-task-graph` |
 | Lower shims and graph ABI | logical arrays -> physical array bindings, explicit setup dependencies, and backend-facing runtime shim calls | `sculptor-lower-golem-to-llvm-shims` |
 | Partition deployment | global scheduled graph -> isolated active-core modules plus typed routes | `sculptor-partition-task-graph-by-core` |
+| Extract deployment core | nested deployment core -> standalone core module plus filtered manifests | `sculptor-extract-core-module` |
 | Finalize core resources | one extracted core graph -> private slots and offsets | `sculptor-finalize-task-graph-resources` |
 | Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
 

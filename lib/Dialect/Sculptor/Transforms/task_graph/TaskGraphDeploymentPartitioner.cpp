@@ -125,6 +125,8 @@ bool isFinalizedLayoutAttr(StringRef name) {
   return name == runtime_attrs::kTaskGraphResourceCountAttrName ||
          name == runtime_attrs::kTaskGraphInputSlotsAttrName ||
          name == runtime_attrs::kTaskGraphOutputSlotsAttrName ||
+         name == runtime_attrs::kTaskGraphRouteInputSlotsAttrName ||
+         name == runtime_attrs::kTaskGraphRouteOutputSlotsAttrName ||
          name == runtime_attrs::kTaskGraphTempOffsetsAttrName ||
          name == runtime_attrs::kTaskGraphTempBaseSlotAttrName ||
          name == runtime_attrs::kTaskGraphTempCountAttrName ||

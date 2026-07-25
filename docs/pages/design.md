@@ -100,9 +100,12 @@ isolated scheduled core graphs.
    Assigns deterministic deployment task/resource IDs, converts cross-core
    tensor edges into typed route boundaries, clones each core's complete symbol
    closure, and emits modules only for active cores. Global runtime slots are
-   intentionally absent. A downstream exporter extracts one core module before
-   running `sculptor-finalize-task-graph-resources` independently for that
-   core's private memory.
+   intentionally absent.
+8. `sculptor-extract-core-module`
+   Selects one active core, flattens its isolated symbol closure into a
+   standalone module, and retains only that core's routes and model ownership
+   records. `sculptor-finalize-task-graph-resources` then assigns private local
+   slots and workspace storage.
 
 The outer deployment retains the global scheduling and timing summaries once.
 Each nested core graph contains local structural counts and its required
@@ -127,7 +130,8 @@ task or a cross-core tensor route.
 | `sculptor-fuse-task-graph` | A scheduled task graph with island and core assignments. | Same-island, same-core components outlined as fused task routines. |
 | `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions and graph resources containing logical-array operations. | Calls to LLVM-callable Golem runtime shims plus a task graph whose executable array identity is represented by physical bindings and setup dependencies; the logical-to-physical schedule map remains as reporting metadata. |
 | `sculptor-partition-task-graph-by-core` | A scheduled, fused graph after logical-array ABI lowering and before runtime finalization. | A deployment module with active per-core nested modules, route boundaries, a typed global route table, and stable global identities. |
-| `sculptor-finalize-task-graph-resources` | One standalone core graph extracted from a deployment. | Core-private runtime slots, task indices, intermediate offsets, and workspace metadata. |
+| `sculptor-extract-core-module` | A partitioned deployment plus `core-id=N`. | One standalone core module with filtered incoming/outgoing routes and model ownership manifests. |
+| `sculptor-finalize-task-graph-resources` | One standalone core graph extracted from a deployment. | Core-private runtime slots, task indices, intermediate offsets, route slot arrays, and workspace metadata. Route boundaries receive unique non-reused regions. |
 
 ### Export And Runtime Passes
 

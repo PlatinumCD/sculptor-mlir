@@ -146,8 +146,11 @@ Topology changes and runtime allocation are deliberately separate. The
 `sculptor-fuse-task-graph` pass runs after scheduling, placement-aware timing is
 recomputed on the fused graph, and
 `sculptor-partition-task-graph-by-core` isolates active cores before any runtime
-storage is assigned. A deployment exporter can then extract one core module and
-run `sculptor-finalize-task-graph-resources` against that core's private memory.
+storage is assigned. `sculptor-extract-core-module` then selects one active core
+and filters its deployment manifests. The resource finalizer assigns that
+core's private slots and workspace. Incoming and outgoing route buffers receive
+dedicated aligned regions that are never liveness-reused; ordinary same-core
+intermediates retain the existing reuse policy.
 
 </details>
 

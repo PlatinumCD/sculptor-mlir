@@ -8,6 +8,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphIslandMap.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphSimModel.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphVis.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractCoreModule.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
@@ -31,6 +32,7 @@ void registerSculptorPasses() {
   registerExportTaskGraphSimModelPass();
   registerExportTaskGraphVisPass();
   registerExpandMVMToGolemPass();
+  registerExtractCoreModulePass();
   registerExtractLayersPass();
   registerFinalizeTaskGraphResourcesPass();
   registerFuseTaskGraphPass();

@@ -9,6 +9,7 @@ add_mlir_library(MLIRSculptorTransforms
   ExportTaskGraphIslandMap.cpp
   ExportTaskGraphSimModel.cpp
   ExportTaskGraphVis.cpp
+  ExtractCoreModule.cpp
   ExtractLayers.cpp
   FinalizeTaskGraphResources.cpp
   FuseTaskGraph.cpp

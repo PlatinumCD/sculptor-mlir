@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphExecutionPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
@@ -22,6 +23,7 @@
 
 namespace {
 
+namespace deployment_attrs = mlir::sculptor::deployment_attrs;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 
 constexpr size_t kWorkspaceAlignment = alignof(std::max_align_t);
@@ -31,11 +33,19 @@ struct TaskPlan {
   llvm::SmallVector<uint32_t, 4> outputSlots;
 };
 
+struct RouteSlot {
+  int64_t routeId = 0;
+  uint32_t slot = 0;
+};
+
 struct ExecutablePlan {
   llvm::SmallVector<TaskPlan, 8> tasks;
   llvm::SmallVector<uint32_t, 4> inputSlots;
   llvm::SmallVector<uint32_t, 4> outputSlots;
+  llvm::SmallVector<RouteSlot, 4> routeInputSlots;
+  llvm::SmallVector<RouteSlot, 4> routeOutputSlots;
   llvm::SmallVector<size_t, 4> tempOffsets;
+  llvm::SmallVector<size_t, 4> routeOffsets;
   uint32_t resourceCount = 0;
   uint32_t tempBaseSlot = 0;
   uint32_t tempCount = 0;
@@ -46,6 +56,13 @@ struct ResourceInfo {
   uint32_t slot = 0;
   size_t byteSize = 0;
   std::optional<uint32_t> tempIndex;
+  std::optional<uint32_t> routeIndex;
+};
+
+struct RouteResource {
+  mlir::Value value;
+  int64_t routeId = 0;
+  uint32_t routeIndex = 0;
 };
 
 struct TempInterval {
@@ -72,7 +89,8 @@ template <typename OpT>
 mlir::LogicalResult
 recordResource(OpT resourceOp, ExecutablePlan &plan,
                llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-               llvm::SmallVectorImpl<mlir::Value> &intermediateResources) {
+               llvm::SmallVectorImpl<mlir::Value> &intermediateResources,
+               llvm::SmallVectorImpl<RouteResource> &routeResources) {
   mlir::FailureOr<int64_t> byteSize =
       mlir::sculptor::getTaskResourceByteSize(resourceOp.getResult());
   if (failed(byteSize)) {
@@ -87,6 +105,19 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
   if constexpr (std::is_same_v<OpT, mlir::sculptor::TaskGraphIntermediateOp>) {
     info.tempIndex = intermediateResources.size();
     intermediateResources.push_back(resourceOp.getResult());
+  } else if constexpr (std::is_same_v<OpT,
+                                      mlir::sculptor::TaskGraphRouteInputOp> ||
+                       std::is_same_v<OpT,
+                                      mlir::sculptor::TaskGraphRouteOutputOp>) {
+    auto routeId = resourceOp->template getAttrOfType<mlir::IntegerAttr>(
+        deployment_attrs::kRouteIdAttrName);
+    if (!routeId || routeId.getInt() < 0) {
+      resourceOp.emitError("expected a non-negative deployment route ID");
+      return mlir::failure();
+    }
+    info.routeIndex = routeResources.size();
+    routeResources.push_back(RouteResource{resourceOp.getResult(),
+                                           routeId.getInt(), *info.routeIndex});
   }
 
   resourceInfoByValue.try_emplace(resourceOp.getResult(), info);
@@ -95,6 +126,22 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
     plan.inputSlots.push_back(info.slot);
   } else if constexpr (std::is_same_v<OpT, mlir::sculptor::TaskGraphOutputOp>) {
     plan.outputSlots.push_back(info.slot);
+  } else if constexpr (std::is_same_v<OpT,
+                                      mlir::sculptor::TaskGraphRouteInputOp>) {
+    plan.routeInputSlots.push_back(
+        RouteSlot{resourceOp
+                      ->template getAttrOfType<mlir::IntegerAttr>(
+                          deployment_attrs::kRouteIdAttrName)
+                      .getInt(),
+                  info.slot});
+  } else if constexpr (std::is_same_v<OpT,
+                                      mlir::sculptor::TaskGraphRouteOutputOp>) {
+    plan.routeOutputSlots.push_back(
+        RouteSlot{resourceOp
+                      ->template getAttrOfType<mlir::IntegerAttr>(
+                          deployment_attrs::kRouteIdAttrName)
+                      .getInt(),
+                  info.slot});
   }
 
   return mlir::success();
@@ -103,12 +150,13 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
 mlir::LogicalResult
 collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
                  llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-                 llvm::SmallVectorImpl<mlir::Value> &intermediateResources) {
+                 llvm::SmallVectorImpl<mlir::Value> &intermediateResources,
+                 llvm::SmallVectorImpl<RouteResource> &routeResources) {
   mlir::Block &block = taskGraphFunc.getBody().front();
   for (mlir::Operation &op : block) {
     if (auto inputOp = llvm::dyn_cast<mlir::sculptor::TaskGraphInputOp>(&op)) {
       if (failed(recordResource(inputOp, plan, resourceInfoByValue,
-                                intermediateResources)))
+                                intermediateResources, routeResources)))
         return mlir::failure();
       continue;
     }
@@ -116,7 +164,7 @@ collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
     if (auto outputOp =
             llvm::dyn_cast<mlir::sculptor::TaskGraphOutputOp>(&op)) {
       if (failed(recordResource(outputOp, plan, resourceInfoByValue,
-                                intermediateResources)))
+                                intermediateResources, routeResources)))
         return mlir::failure();
       continue;
     }
@@ -124,7 +172,7 @@ collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
     if (auto intermediateOp =
             llvm::dyn_cast<mlir::sculptor::TaskGraphIntermediateOp>(&op)) {
       if (failed(recordResource(intermediateOp, plan, resourceInfoByValue,
-                                intermediateResources)))
+                                intermediateResources, routeResources)))
         return mlir::failure();
       continue;
     }
@@ -132,10 +180,34 @@ collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
     if (auto persistentOp =
             llvm::dyn_cast<mlir::sculptor::TaskGraphPersistentOp>(&op)) {
       if (failed(recordResource(persistentOp, plan, resourceInfoByValue,
-                                intermediateResources)))
+                                intermediateResources, routeResources)))
+        return mlir::failure();
+      continue;
+    }
+
+    if (auto routeInputOp =
+            llvm::dyn_cast<mlir::sculptor::TaskGraphRouteInputOp>(&op)) {
+      if (failed(recordResource(routeInputOp, plan, resourceInfoByValue,
+                                intermediateResources, routeResources)))
+        return mlir::failure();
+      continue;
+    }
+
+    if (auto routeOutputOp =
+            llvm::dyn_cast<mlir::sculptor::TaskGraphRouteOutputOp>(&op)) {
+      if (failed(recordResource(routeOutputOp, plan, resourceInfoByValue,
+                                intermediateResources, routeResources)))
         return mlir::failure();
     }
   }
+
+  auto sortByRouteId = [](llvm::SmallVectorImpl<RouteSlot> &slots) {
+    llvm::sort(slots, [](const RouteSlot &lhs, const RouteSlot &rhs) {
+      return lhs.routeId < rhs.routeId;
+    });
+  };
+  sortByRouteId(plan.routeInputSlots);
+  sortByRouteId(plan.routeOutputSlots);
 
   plan.resourceCount = resourceInfoByValue.size();
   plan.tempCount = intermediateResources.size();
@@ -341,6 +413,28 @@ mlir::LogicalResult packTemporaryWorkspace(
   return mlir::success();
 }
 
+void packRouteWorkspace(
+    ExecutablePlan &plan,
+    const llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
+    llvm::ArrayRef<RouteResource> routeResources) {
+  llvm::SmallVector<RouteResource, 4> orderedRoutes(routeResources);
+  llvm::sort(orderedRoutes,
+             [](const RouteResource &lhs, const RouteResource &rhs) {
+               if (lhs.routeId != rhs.routeId)
+                 return lhs.routeId < rhs.routeId;
+               return lhs.routeIndex < rhs.routeIndex;
+             });
+
+  plan.routeOffsets.assign(routeResources.size(), 0);
+  for (const RouteResource &route : orderedRoutes) {
+    const ResourceInfo &resourceInfo = resourceInfoByValue.lookup(route.value);
+    size_t offset = llvm::alignTo(plan.workspaceSize, kWorkspaceAlignment);
+    plan.routeOffsets[route.routeIndex] = offset;
+    plan.workspaceSize =
+        offset + std::max<size_t>(resourceInfo.byteSize, size_t{1});
+  }
+}
+
 mlir::ArrayAttr buildI64ArrayAttr(mlir::Builder &builder,
                                   llvm::ArrayRef<int64_t> values) {
   llvm::SmallVector<mlir::Attribute> attrs;
@@ -371,14 +465,16 @@ buildExecutablePlan(mlir::func::FuncOp taskGraphFunc) {
   ExecutablePlan plan;
   llvm::DenseMap<mlir::Value, ResourceInfo> resourceInfoByValue;
   llvm::SmallVector<mlir::Value> intermediateResources;
+  llvm::SmallVector<RouteResource> routeResources;
 
   if (failed(collectResources(taskGraphFunc, plan, resourceInfoByValue,
-                              intermediateResources)) ||
+                              intermediateResources, routeResources)) ||
       failed(collectTasks(taskGraphFunc, plan, resourceInfoByValue)) ||
       failed(packTemporaryWorkspace(taskGraphFunc, plan, resourceInfoByValue,
                                     intermediateResources))) {
     return mlir::failure();
   }
+  packRouteWorkspace(plan, resourceInfoByValue, routeResources);
 
   return plan;
 }
@@ -394,9 +490,11 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
 
   llvm::DenseMap<mlir::Value, ResourceInfo> resourceInfoByValue;
   llvm::SmallVector<mlir::Value> intermediateResources;
+  llvm::SmallVector<RouteResource> routeResources;
   ExecutablePlan recomputedPlan;
   if (failed(collectResources(taskGraphFunc, recomputedPlan,
-                              resourceInfoByValue, intermediateResources))) {
+                              resourceInfoByValue, intermediateResources,
+                              routeResources))) {
     return mlir::failure();
   }
 
@@ -411,6 +509,18 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
       runtime_attrs::kTaskGraphOutputSlotsAttrName,
       buildIntegerArrayAttr(builder,
                             llvm::ArrayRef<uint32_t>(plan.outputSlots)));
+  auto buildRouteSlotArrayAttr =
+      [&](llvm::ArrayRef<RouteSlot> routeSlots) -> mlir::ArrayAttr {
+    llvm::SmallVector<int64_t, 4> slots;
+    slots.reserve(routeSlots.size());
+    for (const RouteSlot &routeSlot : routeSlots)
+      slots.push_back(routeSlot.slot);
+    return buildI64ArrayAttr(builder, slots);
+  };
+  taskGraphFunc->setAttr(runtime_attrs::kTaskGraphRouteInputSlotsAttrName,
+                         buildRouteSlotArrayAttr(plan.routeInputSlots));
+  taskGraphFunc->setAttr(runtime_attrs::kTaskGraphRouteOutputSlotsAttrName,
+                         buildRouteSlotArrayAttr(plan.routeOutputSlots));
   taskGraphFunc->setAttr(
       runtime_attrs::kTaskGraphTempOffsetsAttrName,
       buildIntegerArrayAttr(builder, llvm::ArrayRef<size_t>(plan.tempOffsets)));
@@ -430,6 +540,13 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
     resourceOp->setAttr(
         runtime_attrs::kResourceTempOffsetAttrName,
         builder.getI64IntegerAttr(plan.tempOffsets[*resourceInfo.tempIndex]));
+  }
+
+  for (const RouteResource &route : routeResources) {
+    mlir::Operation *resourceOp = route.value.getDefiningOp();
+    resourceOp->setAttr(
+        runtime_attrs::kResourceTempOffsetAttrName,
+        builder.getI64IntegerAttr(plan.routeOffsets[route.routeIndex]));
   }
 
   for (auto &resourceIt : resourceInfoByValue) {

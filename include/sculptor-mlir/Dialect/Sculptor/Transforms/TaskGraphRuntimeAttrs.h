@@ -13,6 +13,10 @@ inline constexpr llvm::StringLiteral kTaskGraphInputSlotsAttrName(
     "sculptor.runtime.input_slots");
 inline constexpr llvm::StringLiteral kTaskGraphOutputSlotsAttrName(
     "sculptor.runtime.output_slots");
+inline constexpr llvm::StringLiteral kTaskGraphRouteInputSlotsAttrName(
+    "sculptor.runtime.route_input_slots");
+inline constexpr llvm::StringLiteral kTaskGraphRouteOutputSlotsAttrName(
+    "sculptor.runtime.route_output_slots");
 inline constexpr llvm::StringLiteral kTaskGraphTempOffsetsAttrName(
     "sculptor.runtime.temp_offsets");
 inline constexpr llvm::StringLiteral kTaskGraphTempBaseSlotAttrName(

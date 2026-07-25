@@ -1,6 +1,84 @@
 // RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --implicit-check-not=!sculptor.logical.array
 // RUN: sculptor-mlir-opt %s --sculptor-finalize-task-graph-resources --sculptor-lower-golem-to-llvm-shims | FileCheck %s --implicit-check-not=!sculptor.logical.array
 // RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core | sculptor-mlir-opt | FileCheck %s --check-prefix=PARTITION --implicit-check-not=!sculptor.logical.array --implicit-check-not=sculptor.runtime.task_index --implicit-check-not=sculptor.runtime.slot
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core --sculptor-extract-core-module="core-id=0" --sculptor-finalize-task-graph-resources | sculptor-mlir-opt | FileCheck %s --check-prefix=CORE0 --implicit-check-not="module @core_" --implicit-check-not=!sculptor.logical.array --implicit-check-not=@task_setup_1 --implicit-check-not=@task_mvm_1 --implicit-check-not=sculptor.deployment.active_core_ids --implicit-check-not=sculptor.deployment.routes
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core --sculptor-extract-core-module="core-id=1" --sculptor-finalize-task-graph-resources | sculptor-mlir-opt | FileCheck %s --check-prefix=CORE1 --implicit-check-not="module @core_" --implicit-check-not=!sculptor.logical.array --implicit-check-not=@task_setup_0 --implicit-check-not=@task_mvm_0 --implicit-check-not=sculptor.deployment.active_core_ids --implicit-check-not=sculptor.deployment.routes
+
+// CORE0-LABEL: module attributes
+// CORE0-SAME: sculptor.deployment.incoming_routes = []
+// CORE0-SAME: sculptor.deployment.model_inputs = [{global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 0 : i64}]
+// CORE0-SAME: sculptor.deployment.model_outputs = []
+// CORE0-SAME: sculptor.deployment.outgoing_routes = [#sculptor.deployment_route<id = 0 : i64, sourceCore = 0 : i64, sourceTask = 1 : i64, sourceOutput = 0 : i64, destinationCore = 1 : i64, destinationTask = 3 : i64, destinationInput = 0 : i64, resourceId = 2 : i64, byteSize = 12 : i64>]
+// CORE0-SAME: sculptor.runtime.core_id = 0 : i64
+// CORE0: func.func private @task_setup_0()
+// CORE0-SAME: sculptor.runtime.local_array_id = 0 : i64
+// CORE0-SAME: sculptor.runtime.physical_array_id = 0 : i64
+// CORE0: func.func private @task_mvm_0
+// CORE0-LABEL: func.func private @generate_task_graph()
+// CORE0-SAME: sculptor.runtime.input_slots = [0]
+// CORE0-SAME: sculptor.runtime.output_slots = []
+// CORE0-SAME: sculptor.runtime.resource_count = 2 : i64
+// CORE0-SAME: sculptor.runtime.route_input_slots = []
+// CORE0-SAME: sculptor.runtime.route_output_slots = [1]
+// CORE0-SAME: sculptor.runtime.workspace_size = 12 : i64
+// CORE0: sculptor.task_graph.input
+// CORE0-SAME: sculptor.deployment.global_resource_id = 0 : i64
+// CORE0-SAME: sculptor.runtime.byte_size = 16 : i64
+// CORE0-SAME: sculptor.runtime.slot = 0 : i64
+// CORE0: sculptor.task_graph.route_output
+// CORE0-SAME: sculptor.deployment.global_resource_id = 2 : i64
+// CORE0-SAME: sculptor.deployment.route_id = 0 : i64
+// CORE0-SAME: sculptor.runtime.byte_size = 12 : i64
+// CORE0-SAME: sculptor.runtime.slot = 1 : i64
+// CORE0-SAME: sculptor.runtime.temp_offset = 0 : i64
+// CORE0: %[[CORE0_SETUP:.*]] = sculptor.task.create
+// CORE0-SAME: @task_setup_0
+// CORE0-SAME: deps[]
+// CORE0-SAME: sculptor.deployment.global_task_id = 0 : i64
+// CORE0-SAME: sculptor.runtime.task_index = 0 : i64
+// CORE0: sculptor.task.create
+// CORE0-SAME: @task_mvm_0
+// CORE0-SAME: deps[%[[CORE0_SETUP]]]
+// CORE0-SAME: sculptor.deployment.global_task_id = 1 : i64
+// CORE0-SAME: sculptor.runtime.task_index = 1 : i64
+
+// CORE1-LABEL: module attributes
+// CORE1-SAME: sculptor.deployment.incoming_routes = [#sculptor.deployment_route<id = 0 : i64, sourceCore = 0 : i64, sourceTask = 1 : i64, sourceOutput = 0 : i64, destinationCore = 1 : i64, destinationTask = 3 : i64, destinationInput = 0 : i64, resourceId = 2 : i64, byteSize = 12 : i64>]
+// CORE1-SAME: sculptor.deployment.model_inputs = []
+// CORE1-SAME: sculptor.deployment.model_outputs = [{global_resource_id = 1 : i64, output_index = 0 : i64, owner_core = 1 : i64}]
+// CORE1-SAME: sculptor.deployment.outgoing_routes = []
+// CORE1-SAME: sculptor.runtime.core_id = 1 : i64
+// CORE1: func.func private @task_setup_1()
+// CORE1-SAME: sculptor.runtime.local_array_id = 0 : i64
+// CORE1-SAME: sculptor.runtime.physical_array_id = 1 : i64
+// CORE1: func.func private @task_mvm_1
+// CORE1-LABEL: func.func private @generate_task_graph()
+// CORE1-SAME: sculptor.runtime.input_slots = []
+// CORE1-SAME: sculptor.runtime.output_slots = [1]
+// CORE1-SAME: sculptor.runtime.resource_count = 2 : i64
+// CORE1-SAME: sculptor.runtime.route_input_slots = [0]
+// CORE1-SAME: sculptor.runtime.route_output_slots = []
+// CORE1-SAME: sculptor.runtime.workspace_size = 12 : i64
+// CORE1: sculptor.task_graph.route_input
+// CORE1-SAME: sculptor.deployment.global_resource_id = 2 : i64
+// CORE1-SAME: sculptor.deployment.route_id = 0 : i64
+// CORE1-SAME: sculptor.runtime.byte_size = 12 : i64
+// CORE1-SAME: sculptor.runtime.slot = 0 : i64
+// CORE1-SAME: sculptor.runtime.temp_offset = 0 : i64
+// CORE1: sculptor.task_graph.output
+// CORE1-SAME: sculptor.deployment.global_resource_id = 1 : i64
+// CORE1-SAME: sculptor.runtime.byte_size = 8 : i64
+// CORE1-SAME: sculptor.runtime.slot = 1 : i64
+// CORE1: %[[CORE1_SETUP:.*]] = sculptor.task.create
+// CORE1-SAME: @task_setup_1
+// CORE1-SAME: deps[]
+// CORE1-SAME: sculptor.deployment.global_task_id = 2 : i64
+// CORE1-SAME: sculptor.runtime.task_index = 0 : i64
+// CORE1: sculptor.task.create
+// CORE1-SAME: @task_mvm_1
+// CORE1-SAME: deps[%[[CORE1_SETUP]]]
+// CORE1-SAME: sculptor.deployment.global_task_id = 3 : i64
+// CORE1-SAME: sculptor.runtime.task_index = 1 : i64
 
 // PARTITION-LABEL: module attributes
 // PARTITION-SAME: sculptor.deployment.active_core_ids = [0, 1]
