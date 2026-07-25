@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskMetadata.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 
@@ -41,6 +42,7 @@ constexpr llvm::StringLiteral kForwardFunctionName = "forward";
 
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 namespace task_metadata = mlir::sculptor::task_metadata;
+namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 
 struct MaterializableTaskRegion {
   mlir::sculptor::TaskRegionOp region;
@@ -321,6 +323,12 @@ emitTaskFunctionDeclaration(mlir::ModuleOp module,
        builder.getI64IntegerAttr(taskRegion.ordinal),
        region->getAttrOfType<mlir::sculptor::TaskReductionAttr>(
            mlir::sculptor::task_graph_attrs::kTaskReductionAttrName)});
+  for (llvm::StringRef attrName :
+       {runtime_attrs::kTaskDigitalOpsAttrName,
+        runtime_attrs::kTaskAnalogExecutionCountAttrName}) {
+    if (mlir::Attribute attr = region->getAttr(attrName))
+      taskFunc->setAttr(attrName, attr);
+  }
   return taskFunc;
 }
 

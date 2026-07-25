@@ -45,6 +45,8 @@ inline constexpr llvm::StringLiteral kTaskLocalArrayIdAttrName(
     "sculptor.runtime.local_array_id");
 inline constexpr llvm::StringLiteral kTaskDigitalOpsAttrName(
     "sculptor.runtime.digital_ops");
+inline constexpr llvm::StringLiteral kTaskAnalogExecutionCountAttrName(
+    "sculptor.runtime.analog_execution_count");
 inline constexpr llvm::StringLiteral kTaskInputSlotsAttrName(
     "sculptor.runtime.input_slots");
 inline constexpr llvm::StringLiteral kTaskOutputSlotsAttrName(

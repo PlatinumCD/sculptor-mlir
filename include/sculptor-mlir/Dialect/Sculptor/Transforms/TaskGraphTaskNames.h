@@ -15,6 +15,8 @@ inline constexpr llvm::StringLiteral
     kMatrixSetupTaskKind("sculptor.matrix_setup");
 inline constexpr llvm::StringLiteral kMVMTaskKind("sculptor.mvm");
 inline constexpr llvm::StringLiteral
+    kMVMSequenceTaskKind("sculptor.mvm_sequence");
+inline constexpr llvm::StringLiteral
     kConvTileMVMTaskKind("sculptor.conv_tile_mvm");
 
 inline constexpr llvm::StringLiteral kConvPatchTaskKind("digital.conv_patch");

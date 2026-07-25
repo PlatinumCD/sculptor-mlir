@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskLatencyModel.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
@@ -15,6 +16,8 @@ namespace mlir {
 namespace sculptor {
 namespace task_timing {
 namespace {
+
+namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 
 LogicalResult addByteCount(Operation *anchor, int64_t bytes, int64_t &total) {
   if (bytes < 0 || total > std::numeric_limits<int64_t>::max() - bytes) {
@@ -101,7 +104,17 @@ estimateTaskLatency(sculptor::TaskCreateOp taskOp, int64_t digitalOps,
       std::ceil(outputBits / static_cast<double>(model.analogIOBitsPerCycle));
 
   estimate.analogLoadLatencyNs = cyclesToNanoseconds(loadCycles, model);
-  estimate.analogExecuteLatencyNs = model.analogMVMLatencyNs;
+  int64_t analogExecutionCount = 1;
+  if (auto countAttr = taskOp->getAttrOfType<IntegerAttr>(
+          runtime_attrs::kTaskAnalogExecutionCountAttrName)) {
+    analogExecutionCount = countAttr.getInt();
+    if (analogExecutionCount <= 0) {
+      taskOp.emitError("expected positive analog execution count");
+      return failure();
+    }
+  }
+  estimate.analogExecuteLatencyNs =
+      model.analogMVMLatencyNs * static_cast<double>(analogExecutionCount);
   estimate.analogStoreLatencyNs = cyclesToNanoseconds(storeCycles, model);
   estimate.intrinsicLatencyNs =
       estimate.analogLoadLatencyNs + estimate.analogExecuteLatencyNs +

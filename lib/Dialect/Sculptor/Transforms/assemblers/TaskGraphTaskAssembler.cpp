@@ -459,6 +459,15 @@ public:
         task->setAttr(task_graph_attrs::kTaskReductionAttrName,
                       taskMetadata->reduction);
       }
+      if (auto calleeFunc =
+              module.lookupSymbol<mlir::func::FuncOp>(calleeAttr.getValue())) {
+        for (llvm::StringRef attrName :
+             {runtime_attrs::kTaskDigitalOpsAttrName,
+              runtime_attrs::kTaskAnalogExecutionCountAttrName}) {
+          if (mlir::Attribute attr = calleeFunc->getAttr(attrName))
+            task->setAttr(attrName, attr);
+        }
+      }
       taskByCall[call.getOperation()] = task.getResult();
     }
 

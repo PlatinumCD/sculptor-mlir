@@ -65,7 +65,13 @@ module {
   }
 
   // CHECK-LABEL: func.func @conv2d_no_bias
+  // CHECK: sculptor.task_region kind = "digital.conv_patch" name = "conv2d_patch_sequence"
+  // CHECK: scf.for
+  // CHECK: sculptor.task_region kind = "sculptor.mvm_sequence" name = "conv2d_mvm_sequence"
+  // CHECK: scf.for
   // CHECK: sculptor.mvm {{.*}} : (tensor<1x4xf32>, tensor<2x4xf32>) -> tensor<1x2xf32>
+  // CHECK: sculptor.task_region kind = "digital.output_recombine" name = "conv2d_output_assembly"
+  // CHECK: scf.for
   func.func @conv2d_no_bias(%arg0: tensor<1x1x3x3xf32>)
       -> tensor<1x2x2x2xf32>
       attributes {layer_type = "conv2d"} {
@@ -76,9 +82,13 @@ module {
   }
 
   // CHECK-LABEL: func.func @conv2d_bias
+  // CHECK: sculptor.task_region kind = "digital.conv_patch" name = "conv2d_patch_sequence"
+  // CHECK: sculptor.task_region kind = "sculptor.mvm_sequence" name = "conv2d_mvm_sequence"
+  // CHECK: scf.for
   // CHECK: sculptor.mvm {{.*}} : (tensor<1x4xf32>, tensor<2x4xf32>) -> tensor<1x2xf32>
-  // CHECK: tensor.expand_shape
-  // CHECK: linalg.add
+  // CHECK: sculptor.task_region kind = "digital.bias_add" name = "conv2d_output_assembly"
+  // CHECK: scf.for
+  // CHECK: arith.addf
   func.func @conv2d_bias(%arg0: tensor<1x1x3x3xf32>)
       -> tensor<1x2x2x2xf32>
       attributes {layer_type = "conv2d_w_bias"} {

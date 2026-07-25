@@ -1,4 +1,7 @@
-// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=12 array-cols=12" | FileCheck %s --implicit-check-not=sculptor.nn.conv2d --implicit-check-not="sculptor.mvm %" --implicit-check-not=scf.for --implicit-check-not=memref. --implicit-check-not=bufferization.to_tensor
+// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=12 array-cols=12" | FileCheck %s --implicit-check-not=sculptor.nn.conv2d --implicit-check-not="sculptor.mvm %" --implicit-check-not=sculptor.mvm_sequence --implicit-check-not=memref. --implicit-check-not=bufferization.to_tensor
+// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=1 array-cols=4" | FileCheck %s --check-prefix=MULTI --implicit-check-not=sculptor.nn.conv2d --implicit-check-not="sculptor.mvm %" --implicit-check-not=sculptor.mvm_sequence
+// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=12 array-cols=12" --sculptor-materialize-tasks --sculptor-assemble-task-graph | FileCheck %s --check-prefix=GRAPH
+// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=12 array-cols=12" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing="analog-mvm-latency-ns=100 analog-io-bits-per-cycle=256 digital-clock-ghz=1 digital-issue-width=2 digital-vector-bits-per-cycle=256 network-hop-latency-cycles=1 network-link-bits-per-cycle=32" | FileCheck %s --check-prefix=TIMING
 
 module {
   func.func @forward(%arg0: tensor<1x1x5x5xf32>) -> tensor<1x1x3x3xf32> {
@@ -9,20 +12,43 @@ module {
 
   // CHECK-LABEL: func.func @conv2d_bias
   // CHECK: sculptor.task_region kind = "sculptor.matrix_setup" name = "conv2d_bias_matrix_tile_0_0"()
-  // CHECK: %[[PATCH0:.*]] = sculptor.task_region kind = "digital.conv_patch" name = "conv2d_oh_0_ow_0"(%arg0)
-  // CHECK: tensor.empty() : tensor<1x9xf32>
+  // CHECK: %[[PATCHES:.*]] = sculptor.task_region kind = "digital.conv_patch" name = "conv2d_patch_sequence"(%arg0)
+  // CHECK: tensor.empty() : tensor<9x9xf32>
+  // CHECK: scf.for
+  // CHECK: scf.for
   // CHECK: tensor.extract
   // CHECK: tensor.insert
-  // CHECK: %[[VECTOR0:.*]] = sculptor.task_region kind = "digital.vector_tile" name = "conv2d_bias_vector_tile_0"(%[[PATCH0]])
-  // CHECK: %[[EXEC0:.*]] = sculptor.task_region kind = "sculptor.mvm" name = "conv2d_bias_mvm_0_0"(%[[VECTOR0]],
-  // CHECK: %[[RECOMBINE0:.*]] = sculptor.task_region kind = "digital.tile_recombine" name = "conv2d_bias_tile_recombine"(%[[EXEC0]])
-  // CHECK: sculptor.task_region kind = "digital.bias_add" name = "conv2d_oh_0_ow_0_bias_add"(%[[RECOMBINE0]])
-  // CHECK: sculptor.task_region kind = "digital.conv_patch" name = "conv2d_oh_2_ow_2"(%arg0)
-  // CHECK: sculptor.task_region kind = "digital.output_recombine" name = "conv2d_output_recombine"
-  // CHECK: tensor.expand_shape
-  // CHECK: tensor.concat dim(3)
-  // CHECK: tensor.concat dim(2)
+  // CHECK: %[[EXEC:.*]] = sculptor.task_region kind = "sculptor.conv_tile_mvm" name = "conv2d_bias_mvm_0_0"(%[[PATCHES]],
+  // CHECK: tensor.empty() : tensor<9x1xf32>
+  // CHECK: scf.for
+  // CHECK: tensor.extract_slice
+  // CHECK: sculptor.array.load
+  // CHECK: sculptor.array.execute
+  // CHECK: sculptor.array.store
+  // CHECK: tensor.insert_slice
+  // CHECK: %[[RECOMBINE:.*]] = sculptor.task_region kind = "digital.tile_recombine" name = "conv2d_bias_tile_recombine"(%[[EXEC]])
+  // CHECK: sculptor.task_region kind = "digital.bias_add" name = "conv2d_output_assembly"(%[[RECOMBINE]])
+  // CHECK: tensor.empty() : tensor<1x1x3x3xf32>
+  // CHECK: scf.for
+  // CHECK: arith.addf
+  // CHECK: tensor.insert
   // CHECK: return {{.*}} : tensor<1x1x3x3xf32>
+  // MULTI-LABEL: func.func @conv2d_bias
+  // MULTI-COUNT-3: sculptor.task_region kind = "sculptor.matrix_setup"
+  // MULTI: %[[PATCHES:.*]] = sculptor.task_region kind = "digital.conv_patch" name = "conv2d_patch_sequence"
+  // MULTI-COUNT-3: sculptor.task_region kind = "sculptor.conv_tile_mvm"
+  // MULTI: sculptor.task_region kind = "digital.tile_recombine"
+  // MULTI-COUNT-2: linalg.add
+  // MULTI: sculptor.task_region kind = "digital.bias_add" name = "conv2d_output_assembly"
+  // MULTI: return {{.*}} : tensor<1x1x3x3xf32>
+  // GRAPH-LABEL: func.func private @generate_task_graph
+  // GRAPH: sculptor.task.create {{.*}} task_kind = "sculptor.conv_tile_mvm"
+  // GRAPH-SAME: sculptor.runtime.analog_execution_count = 9 : i64
+  // GRAPH: sculptor.task.create {{.*}} task_kind = "digital.bias_add"
+  // GRAPH-SAME: sculptor.runtime.digital_ops = 9 : i64
+  // TIMING: sculptor.task.create {{.*}} task_kind = "sculptor.conv_tile_mvm"
+  // TIMING-SAME: sculptor.runtime.analog_execution_count = 9 : i64
+  // TIMING-SAME: sculptor.timing.analog_execute_latency_ns = 9.000000e+02 : f64
   func.func @conv2d_bias(%arg0: tensor<1x1x5x5xf32>)
       -> tensor<1x1x3x3xf32>
       attributes {layer_type = "conv2d_w_bias"} {
