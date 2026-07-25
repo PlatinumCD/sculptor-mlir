@@ -5,6 +5,7 @@ namespace mlir {
 namespace sculptor {
 
 void registerFinalizeGolemIntrinsicsPass();
+void registerEmitGolemTileABIPass();
 void registerEmitRuntimeGraphPass();
 
 // Registers every Sculptor conversion pass exposed to textual pipelines and

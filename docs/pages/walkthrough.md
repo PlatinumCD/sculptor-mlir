@@ -1081,6 +1081,36 @@ emits the runtime graph construction logic.
 </details>
 
 <details class="doc-section" open markdown="1">
+<summary markdown="block">## Emit A Golem Tile ABI</summary>
+
+
+For a partitioned deployment, each active core can instead be extracted and
+packaged for the Golem bare-metal tile runtime. Resource finalization runs on
+the standalone core so slots and workspace offsets are private to that tile.
+After normal MLIR function and tensor lowering has converted task
+implementations to `llvm.func`, run:
+
+```bash
+sculptor-mlir-opt core-finalized-and-lowered.mlir \
+  --sculptor-emit-golem-tile-abi \
+  --sculptor-finalize-golem-intrinsics |
+  mlir-translate --mlir-to-llvmir
+```
+
+`sculptor-emit-golem-tile-abi` classifies
+`task_kind = "sculptor.matrix_setup"` entries into an initialization-order boot
+table and places every other task in a global-ID-sorted dispatch table. It emits
+Golem `TaskExecute` adapters plus immutable route and model-I/O records, then
+removes `@generate_task_graph` and all consumed Sculptor IR. Empty tables are
+represented by a null getter and a zero count.
+
+The result is a pure LLVM-dialect module. Object generation, CRT/runtime
+linking, boot iteration, READY signaling, and packet dispatch remain downstream
+Golem platform responsibilities.
+
+</details>
+
+<details class="doc-section" open markdown="1">
 <summary markdown="block">## Emit Runtime Graph</summary>
 
 

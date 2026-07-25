@@ -1,4 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/Passes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Conversion/EmitGolemTileABI.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/EmitRuntimeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/FinalizeGolemIntrinsics.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
@@ -315,6 +316,7 @@ void registerSculptorPassPipelines() {
 void registerSculptorConversionPasses() {
   registerLowerGolemToLLVMShimsPass();
   registerFinalizeGolemIntrinsicsPass();
+  registerEmitGolemTileABIPass();
   registerEmitRuntimeGraphPass();
   registerSculptorPassPipelines();
 }

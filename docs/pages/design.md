@@ -106,6 +106,12 @@ isolated scheduled core graphs.
    standalone module, and retains only that core's routes and model ownership
    records. `sculptor-finalize-task-graph-resources` then assigns private local
    slots and workspace storage.
+9. Standard MLIR lowering followed by `sculptor-emit-golem-tile-abi`
+   Converts task implementations to `llvm.func`, then packages the declarative
+   core graph as immutable Golem boot, dispatch, route, and model-I/O tables.
+   The pass emits Golem `TaskExecute` adapters, removes the consumed graph and
+   Sculptor metadata, and leaves a pure LLVM-dialect module ready for intrinsic
+   finalization and LLVM IR translation.
 
 The outer deployment retains the global scheduling and timing summaries once.
 Each nested core graph contains local structural counts and its required
@@ -132,6 +138,7 @@ task or a cross-core tensor route.
 | `sculptor-partition-task-graph-by-core` | A scheduled, fused graph after logical-array ABI lowering and before runtime finalization. | A deployment module with active per-core nested modules, route boundaries, a typed global route table, and stable global identities. |
 | `sculptor-extract-core-module` | A partitioned deployment plus `core-id=N`. | One standalone core module with filtered incoming/outgoing routes and model ownership manifests. |
 | `sculptor-finalize-task-graph-resources` | One standalone core graph extracted from a deployment. | Core-private runtime slots, task indices, intermediate offsets, route slot arrays, and workspace metadata. Route boundaries receive unique non-reused regions. |
+| `sculptor-emit-golem-tile-abi` | One isolated, finalized core after task implementations have become `llvm.func`. | A pure LLVM-dialect tile module with Golem task adapters, separate boot and dispatch tables, route and model-I/O records, and C ABI accessors. |
 
 ### Export And Runtime Passes
 
@@ -143,6 +150,7 @@ runtime-shaped IR and produce external artifacts or final backend forms.
 | `sculptor-export-task-graph-vis` | Writes an assembled task graph visualization as DOT or GraphML. |
 | `sculptor-export-task-graph-sim-model` | Writes a scheduled task graph model for external placement or simulation tooling. |
 | `sculptor-finalize-golem-intrinsics` | Rewrites LLVM Golem shim calls into target Golem ISA intrinsics. |
+| `sculptor-emit-golem-tile-abi` | Packages one extracted core for the Golem bare-metal runtime. It is distinct from the generic runtime graph emitter and does not generate or link an ELF. |
 | `sculptor-emit-runtime-graph` | Emits generic runtime graph metadata and task-entry shims after the task graph has runtime layout metadata. |
 
 After the Sculptor-specific pipeline, normal MLIR passes handle bufferization,

@@ -68,6 +68,7 @@ The compiler is staged around explicit IR boundaries:
 | Partition deployment | global scheduled graph -> isolated active-core modules plus typed routes | `sculptor-partition-task-graph-by-core` |
 | Extract deployment core | nested deployment core -> standalone core module plus filtered manifests | `sculptor-extract-core-module` |
 | Finalize core resources | one extracted core graph -> private slots and offsets | `sculptor-finalize-task-graph-resources` |
+| Emit Golem tile ABI | finalized, LLVM-lowered core -> immutable task/route tables and Golem task adapters | `sculptor-emit-golem-tile-abi` |
 | Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
 
 ## Repository Layout

@@ -1,4 +1,5 @@
 add_mlir_library(MLIRSculptorConversion
+  EmitGolemTileABI.cpp
   EmitRuntimeGraph.cpp
   FinalizeGolemIntrinsics.cpp
   LowerGolemToLLVMShims.cpp
@@ -9,6 +10,9 @@ add_mlir_library(MLIRSculptorConversion
   runtime/RuntimeGraphModel.cpp
   runtime/RuntimeGraphWrappers.cpp
   golem/GolemUtils.cpp
+  golem/GolemTileABI.cpp
+  golem/GolemTileEntryShims.cpp
+  golem/GolemTileTables.cpp
   golem/LowerExecute.cpp
   golem/LowerMatrix.cpp
   golem/LowerStore.cpp
