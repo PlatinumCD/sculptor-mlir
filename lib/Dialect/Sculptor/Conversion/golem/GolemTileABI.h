@@ -31,6 +31,14 @@ inline constexpr llvm::StringLiteral
     kModelInputsGlobalName("__golem_tile_model_inputs");
 inline constexpr llvm::StringLiteral
     kModelOutputsGlobalName("__golem_tile_model_outputs");
+inline constexpr llvm::StringLiteral
+    kResourcesGlobalName("__golem_tile_resources");
+inline constexpr llvm::StringLiteral
+    kResourceDimensionsGlobalName("__golem_tile_resource_dimensions");
+inline constexpr llvm::StringLiteral
+    kTaskBindingsGlobalName("__golem_tile_task_bindings");
+inline constexpr llvm::StringLiteral
+    kTaskBindingDataGlobalName("__golem_tile_task_binding_data");
 
 inline constexpr llvm::StringLiteral
     kBootTasksAccessorName("golem_tile_boot_tasks");
@@ -56,19 +64,39 @@ inline constexpr llvm::StringLiteral
     kModelOutputsAccessorName("golem_tile_model_outputs");
 inline constexpr llvm::StringLiteral
     kModelOutputCountAccessorName("golem_tile_model_output_count");
+inline constexpr llvm::StringLiteral
+    kResourcesAccessorName("golem_tile_resources");
+inline constexpr llvm::StringLiteral
+    kResourceCountAccessorName("golem_tile_resource_count");
+inline constexpr llvm::StringLiteral
+    kResourceDimensionsAccessorName("golem_tile_resource_dimensions");
+inline constexpr llvm::StringLiteral
+    kResourceDimensionCountAccessorName("golem_tile_resource_dimension_count");
+inline constexpr llvm::StringLiteral
+    kWorkspaceSizeAccessorName("golem_tile_workspace_size");
+inline constexpr llvm::StringLiteral
+    kTaskBindingsAccessorName("golem_tile_task_bindings");
+inline constexpr llvm::StringLiteral
+    kTaskBindingCountAccessorName("golem_tile_task_binding_count");
+inline constexpr llvm::StringLiteral
+    kTaskBindingDataAccessorName("golem_tile_task_binding_data");
+inline constexpr llvm::StringLiteral
+    kTaskBindingDataCountAccessorName("golem_tile_task_binding_data_count");
 inline constexpr llvm::StringLiteral kCoreIdAccessorName("golem_tile_core_id");
 
 inline constexpr uint32_t kFloat32ElementType = 1;
 inline constexpr uint32_t kTaskSuccess = 0;
 inline constexpr uint32_t kTaskFailure = 1;
+inline constexpr uint32_t kResourceWorkspaceFlag = 1U << 0;
+inline constexpr uint32_t kResourceExternalFlag = 1U << 1;
 
-enum class ResourceKind {
-  ModelInput,
-  ModelOutput,
-  Intermediate,
-  Persistent,
-  RouteInput,
-  RouteOutput,
+enum class ResourceKind : uint32_t {
+  ModelInput = 0,
+  ModelOutput = 1,
+  Intermediate = 2,
+  Persistent = 3,
+  RouteInput = 4,
+  RouteOutput = 5,
 };
 
 struct ResourceModel {
@@ -79,6 +107,7 @@ struct ResourceModel {
   uint32_t globalId = 0;
   std::optional<uint32_t> routeId;
   uint32_t slot = 0;
+  uint32_t dimensionOffset = 0;
   uint64_t byteSize = 0;
   std::optional<uint64_t> workspaceOffset;
 };
@@ -94,8 +123,21 @@ struct TaskModel {
   std::optional<uint32_t> physicalArrayId;
   SmallVector<ShapedType> inputTypes;
   SmallVector<ShapedType> outputTypes;
+  SmallVector<uint32_t> inputSlots;
+  SmallVector<uint32_t> outputSlots;
+  SmallVector<uint32_t> dispatchDependencyIds;
   SmallVector<unsigned> resultIndices;
   bool isBoot = false;
+};
+
+struct TaskBindingModel {
+  uint32_t taskId = 0;
+  uint32_t inputOffset = 0;
+  uint32_t inputCount = 0;
+  uint32_t outputOffset = 0;
+  uint32_t outputCount = 0;
+  uint32_t dependencyOffset = 0;
+  uint32_t dependencyCount = 0;
 };
 
 struct RouteModel {
@@ -119,17 +161,24 @@ struct TileModel {
   DenseMap<uint32_t, unsigned> nonRouteResourceIndexByGlobalId;
   DenseMap<uint32_t, unsigned> routeInputResourceIndexByRouteId;
   DenseMap<uint32_t, unsigned> routeOutputResourceIndexByRouteId;
-  SmallVector<TaskModel> tasks;
+  SmallVector<unsigned> resourceIndicesBySlot;
+  SmallVector<int64_t> resourceDimensions;
+  SmallVector<TaskModel, 0> tasks;
   SmallVector<unsigned> bootTaskIndices;
   SmallVector<unsigned> dispatchTaskIndices;
+  SmallVector<TaskBindingModel> taskBindings;
+  SmallVector<uint32_t> taskBindingData;
   SmallVector<RouteModel> incomingRoutes;
   SmallVector<RouteModel> outgoingRoutes;
   SmallVector<ModelIOModel> modelInputs;
   SmallVector<ModelIOModel> modelOutputs;
+  uint64_t workspaceSize = 0;
 };
 
 LLVM::LLVMStructType getTensorType(MLIRContext *context);
 LLVM::LLVMStructType getTaskType(MLIRContext *context);
+LLVM::LLVMStructType getResourceType(MLIRContext *context);
+LLVM::LLVMStructType getTaskBindingType(MLIRContext *context);
 LLVM::LLVMStructType getRouteType(MLIRContext *context);
 LLVM::LLVMStructType getModelIOType(MLIRContext *context);
 LLVM::LLVMStructType getMemRefDescriptorType(MLIRContext *context,

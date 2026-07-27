@@ -1,6 +1,7 @@
 #include "GolemTileABI.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include "mlir/IR/SymbolTable.h"
 
@@ -115,6 +116,185 @@ LogicalResult emitCoreIdAccessor(ModuleOp module, uint32_t coreId) {
   Block *entry = function.addEntryBlock(moduleBuilder);
   OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
   bodyBuilder.create<LLVM::ReturnOp>(loc, buildI32(bodyBuilder, loc, coreId));
+  return success();
+}
+
+LogicalResult emitWorkspaceSizeAccessor(ModuleOp module,
+                                        uint64_t workspaceSize) {
+  if (failed(checkAvailableSymbol(module, kWorkspaceSizeAccessorName)))
+    return failure();
+
+  MLIRContext *context = module.getContext();
+  Location loc = module.getLoc();
+  Type i64Type = IntegerType::get(context, 64);
+  auto functionType = LLVM::LLVMFunctionType::get(i64Type, {}, false);
+  OpBuilder moduleBuilder(context);
+  moduleBuilder.setInsertionPointToEnd(module.getBody());
+  auto function = moduleBuilder.create<LLVM::LLVMFuncOp>(
+      loc, kWorkspaceSizeAccessorName, functionType);
+  Block *entry = function.addEntryBlock(moduleBuilder);
+  OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
+  bodyBuilder.create<LLVM::ReturnOp>(loc,
+                                     buildI64(bodyBuilder, loc, workspaceSize));
+  return success();
+}
+
+uint32_t getResourceFlags(ResourceKind kind) {
+  switch (kind) {
+  case ResourceKind::ModelInput:
+  case ResourceKind::ModelOutput:
+    return kResourceExternalFlag;
+  case ResourceKind::Intermediate:
+  case ResourceKind::RouteInput:
+  case ResourceKind::RouteOutput:
+    return kResourceWorkspaceFlag;
+  case ResourceKind::Persistent:
+    return 0;
+  }
+  llvm_unreachable("unknown Golem tile resource kind");
+}
+
+LogicalResult emitResourceTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kResourcesGlobalName)) ||
+      failed(checkAvailableSymbol(module, kResourcesAccessorName)) ||
+      failed(checkAvailableSymbol(module, kResourceCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp global;
+  if (!model.resourceIndicesBySlot.empty()) {
+    auto resourceType = getResourceType(module.getContext());
+    global = emitArrayGlobal(
+        module, kResourcesGlobalName, resourceType,
+        model.resourceIndicesBySlot.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const ResourceModel &resource =
+              model.resources[model.resourceIndicesBySlot[index]];
+          const uint32_t values[] = {
+              resource.globalId,
+              resource.routeId.value_or(0),
+              resource.slot,
+              static_cast<uint32_t>(resource.kind),
+              kFloat32ElementType,
+              static_cast<uint32_t>(resource.shapedType.getRank()),
+              resource.dimensionOffset,
+              getResourceFlags(resource.kind),
+          };
+
+          Value entry =
+              builder.create<LLVM::ZeroOp>(module.getLoc(), resourceType);
+          for (auto indexedValue : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), indexedValue.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(indexedValue.index())});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), resource.byteSize),
+              ArrayRef<int64_t>{8});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(),
+                       resource.workspaceOffset.value_or(0)),
+              ArrayRef<int64_t>{9});
+          return entry;
+        });
+  }
+
+  if (failed(emitPointerAccessor(module, kResourcesAccessorName, global)) ||
+      failed(emitCountAccessor(module, kResourceCountAccessorName,
+                               model.resourceIndicesBySlot.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitResourceDimensionTable(ModuleOp module,
+                                         const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kResourceDimensionsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kResourceDimensionsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kResourceDimensionCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp global;
+  if (!model.resourceDimensions.empty()) {
+    Type i64Type = IntegerType::get(module.getContext(), 64);
+    global =
+        emitArrayGlobal(module, kResourceDimensionsGlobalName, i64Type,
+                        model.resourceDimensions.size(),
+                        [&](OpBuilder &builder, unsigned index) -> Value {
+                          return buildI64(builder, module.getLoc(),
+                                          static_cast<uint64_t>(
+                                              model.resourceDimensions[index]));
+                        });
+  }
+
+  if (failed(emitPointerAccessor(module, kResourceDimensionsAccessorName,
+                                 global)) ||
+      failed(emitCountAccessor(module, kResourceDimensionCountAccessorName,
+                               model.resourceDimensions.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitTaskBindingTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kTaskBindingsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kTaskBindingsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kTaskBindingCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp global;
+  if (!model.taskBindings.empty()) {
+    auto bindingType = getTaskBindingType(module.getContext());
+    global = emitArrayGlobal(
+        module, kTaskBindingsGlobalName, bindingType, model.taskBindings.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const TaskBindingModel &binding = model.taskBindings[index];
+          const uint32_t values[] = {
+              binding.taskId,          binding.inputOffset,
+              binding.inputCount,      binding.outputOffset,
+              binding.outputCount,     binding.dependencyOffset,
+              binding.dependencyCount, 0,
+          };
+          Value entry =
+              builder.create<LLVM::ZeroOp>(module.getLoc(), bindingType);
+          for (auto indexedValue : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), indexedValue.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(indexedValue.index())});
+          return entry;
+        });
+  }
+
+  if (failed(emitPointerAccessor(module, kTaskBindingsAccessorName, global)) ||
+      failed(emitCountAccessor(module, kTaskBindingCountAccessorName,
+                               model.taskBindings.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitTaskBindingDataTable(ModuleOp module,
+                                       const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kTaskBindingDataGlobalName)) ||
+      failed(checkAvailableSymbol(module, kTaskBindingDataAccessorName)) ||
+      failed(checkAvailableSymbol(module, kTaskBindingDataCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp global;
+  if (!model.taskBindingData.empty()) {
+    Type i32Type = IntegerType::get(module.getContext(), 32);
+    global = emitArrayGlobal(module, kTaskBindingDataGlobalName, i32Type,
+                             model.taskBindingData.size(),
+                             [&](OpBuilder &builder, unsigned index) -> Value {
+                               return buildI32(builder, module.getLoc(),
+                                               model.taskBindingData[index]);
+                             });
+  }
+
+  if (failed(
+          emitPointerAccessor(module, kTaskBindingDataAccessorName, global)) ||
+      failed(emitCountAccessor(module, kTaskBindingDataCountAccessorName,
+                               model.taskBindingData.size())))
+    return failure();
   return success();
 }
 
@@ -259,12 +439,17 @@ LogicalResult emitModelIOTable(ModuleOp module, ArrayRef<ModelIOModel> entries,
 
 LogicalResult emitTileTables(ModuleOp module, const TileModel &model) {
   if (failed(emitCoreIdAccessor(module, model.coreId)) ||
+      failed(emitResourceTable(module, model)) ||
+      failed(emitResourceDimensionTable(module, model)) ||
+      failed(emitWorkspaceSizeAccessor(module, model.workspaceSize)) ||
       failed(emitTaskTable(module, model, model.bootTaskIndices,
                            kBootTasksGlobalName, kBootTasksAccessorName,
                            kBootTaskCountAccessorName)) ||
       failed(emitTaskTable(module, model, model.dispatchTaskIndices,
                            kDispatchTasksGlobalName, kDispatchTasksAccessorName,
                            kDispatchTaskCountAccessorName)) ||
+      failed(emitTaskBindingTable(module, model)) ||
+      failed(emitTaskBindingDataTable(module, model)) ||
       failed(emitRouteTable(
           module, model.incomingRoutes, kIncomingRoutesGlobalName,
           kIncomingRoutesAccessorName, kIncomingRouteCountAccessorName)) ||

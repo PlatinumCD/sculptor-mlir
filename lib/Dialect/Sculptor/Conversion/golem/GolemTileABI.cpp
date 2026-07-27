@@ -207,6 +207,11 @@ LogicalResult collectResources(TileModel &model) {
     auto kindAndValue = getResourceKindAndValue(op);
     if (!kindAndValue)
       continue;
+    if (kindAndValue->first == ResourceKind::Persistent) {
+      op.emitError("Golem tile ABI does not support persistent task-graph "
+                   "resource storage");
+      return failure();
+    }
 
     auto shapedType =
         getSupportedTensorType(&op, kindAndValue->second.getType());
@@ -267,7 +272,7 @@ LogicalResult collectResources(TileModel &model) {
     model.resourceIndexByValue.try_emplace(kindAndValue->second, resourceIndex);
     model.resources.push_back(ResourceModel{
         &op, kindAndValue->second, *shapedType, kindAndValue->first, *globalId,
-        routeId, *slot, *byteSize, workspaceOffset});
+        routeId, *slot, 0, *byteSize, workspaceOffset});
     if (kindAndValue->first == ResourceKind::RouteInput) {
       model.routeInputResourceIndexByRouteId.try_emplace(*routeId,
                                                          resourceIndex);
@@ -278,6 +283,49 @@ LogicalResult collectResources(TileModel &model) {
       model.nonRouteResourceIndexByGlobalId.try_emplace(*globalId,
                                                         resourceIndex);
     }
+  }
+
+  if (model.resources.size() > std::numeric_limits<uint32_t>::max()) {
+    model.taskGraphFunc.emitError(
+        "local resource count exceeds the Golem tile ABI");
+    return failure();
+  }
+  uint32_t resourceCount = static_cast<uint32_t>(model.resources.size());
+
+  model.resourceIndicesBySlot.assign(resourceCount,
+                                     std::numeric_limits<unsigned>::max());
+  for (auto indexedResource : llvm::enumerate(model.resources)) {
+    ResourceModel &resource = indexedResource.value();
+    if (resource.slot >= resourceCount) {
+      resource.op->emitError("core-local resource slot ")
+          << resource.slot << " is outside the finalized resource table";
+      return failure();
+    }
+    model.resourceIndicesBySlot[resource.slot] = indexedResource.index();
+  }
+  for (auto indexedResource : llvm::enumerate(model.resourceIndicesBySlot)) {
+    if (indexedResource.value() == std::numeric_limits<unsigned>::max()) {
+      model.taskGraphFunc.emitError("finalized resource table is missing "
+                                    "core-local slot ")
+          << indexedResource.index();
+      return failure();
+    }
+
+    ResourceModel &resource = model.resources[indexedResource.value()];
+    int64_t rank = resource.shapedType.getRank();
+    uint64_t dimensionOffset = model.resourceDimensions.size();
+    if (rank < 0 ||
+        static_cast<uint64_t>(rank) > std::numeric_limits<uint32_t>::max() ||
+        dimensionOffset > std::numeric_limits<uint32_t>::max() ||
+        static_cast<uint64_t>(rank) >
+            std::numeric_limits<uint32_t>::max() - dimensionOffset) {
+      resource.op->emitError(
+          "resource rank or dimension offset exceeds the Golem tile ABI");
+      return failure();
+    }
+    resource.dimensionOffset = static_cast<uint32_t>(dimensionOffset);
+    model.resourceDimensions.append(resource.shapedType.getShape().begin(),
+                                    resource.shapedType.getShape().end());
   }
 
   return success();
@@ -449,6 +497,8 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
     taskModel.localArrayId = *localArrayId;
     taskModel.physicalArrayId = *physicalArrayId;
     taskModel.isBoot = task_graph::isMatrixSetupTask(task);
+    taskModel.inputSlots.assign(inputSlots->begin(), inputSlots->end());
+    taskModel.outputSlots.assign(outputSlots->begin(), outputSlots->end());
 
     for (auto indexedInput : llvm::enumerate(task.getInputs())) {
       auto resourceIt = model.resourceIndexByValue.find(indexedInput.value());
@@ -458,7 +508,13 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
         return failure();
       }
       const ResourceModel &resource = model.resources[resourceIt->second];
-      if ((*inputSlots)[indexedInput.index()] != resource.slot) {
+      uint32_t inputSlot = (*inputSlots)[indexedInput.index()];
+      if (inputSlot >= model.resourceIndicesBySlot.size()) {
+        task.emitError("task input references nonexistent resource slot ")
+            << inputSlot;
+        return failure();
+      }
+      if (inputSlot != resource.slot) {
         task.emitError("task input slot metadata does not match its resource");
         return failure();
       }
@@ -473,7 +529,13 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
         return failure();
       }
       const ResourceModel &resource = model.resources[resourceIt->second];
-      if ((*outputSlots)[indexedOutput.index()] != resource.slot) {
+      uint32_t outputSlot = (*outputSlots)[indexedOutput.index()];
+      if (outputSlot >= model.resourceIndicesBySlot.size()) {
+        task.emitError("task output references nonexistent resource slot ")
+            << outputSlot;
+        return failure();
+      }
+      if (outputSlot != resource.slot) {
         task.emitError("task output slot metadata does not match its resource");
         return failure();
       }
@@ -526,6 +588,8 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
             << producer.globalId;
         return failure();
       }
+      if (!task.isBoot && !producer.isBoot)
+        task.dispatchDependencyIds.push_back(producer.globalId);
     }
   }
 
@@ -535,6 +599,170 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
   llvm::sort(model.dispatchTaskIndices, [&](unsigned lhs, unsigned rhs) {
     return model.tasks[lhs].globalId < model.tasks[rhs].globalId;
   });
+  return success();
+}
+
+LogicalResult collectWorkspaceMetadata(TileModel &model) {
+  auto workspaceSize = getRequiredUnsignedAttr<uint64_t>(
+      model.taskGraphFunc, runtime_attrs::kTaskGraphWorkspaceSizeAttrName);
+  if (failed(workspaceSize))
+    return failure();
+  model.workspaceSize = *workspaceSize;
+
+  for (const ResourceModel &resource : model.resources) {
+    bool usesWorkspace = resource.kind == ResourceKind::Intermediate ||
+                         resource.kind == ResourceKind::RouteInput ||
+                         resource.kind == ResourceKind::RouteOutput;
+    if (!usesWorkspace)
+      continue;
+
+    if (!resource.workspaceOffset) {
+      resource.op->emitError(
+          "workspace resource requires sculptor.runtime.temp_offset");
+      return failure();
+    }
+    if (*resource.workspaceOffset > model.workspaceSize ||
+        resource.byteSize > model.workspaceSize - *resource.workspaceOffset) {
+      resource.op->emitError("workspace resource range exceeds "
+                             "sculptor.runtime.workspace_size");
+      return failure();
+    }
+  }
+  return success();
+}
+
+LogicalResult appendTaskBindingRange(TileModel &model, TaskCreateOp task,
+                                     ArrayRef<uint32_t> values,
+                                     uint32_t &offset, uint32_t &count) {
+  uint64_t currentSize = model.taskBindingData.size();
+  uint64_t valueCount = values.size();
+  constexpr uint64_t maxCount = std::numeric_limits<uint32_t>::max();
+  if (currentSize > maxCount || valueCount > maxCount ||
+      valueCount > maxCount - currentSize) {
+    task.emitError("task binding offsets or counts exceed the Golem tile ABI");
+    return failure();
+  }
+
+  offset = static_cast<uint32_t>(currentSize);
+  count = static_cast<uint32_t>(valueCount);
+  model.taskBindingData.append(values.begin(), values.end());
+  return success();
+}
+
+LogicalResult buildTaskBindings(TileModel &model) {
+  if (model.dispatchTaskIndices.size() > std::numeric_limits<uint32_t>::max()) {
+    model.taskGraphFunc.emitError(
+        "dispatch task count exceeds the Golem tile ABI");
+    return failure();
+  }
+
+  DenseSet<uint32_t> dispatchTaskIds;
+  for (unsigned taskIndex : model.dispatchTaskIndices)
+    dispatchTaskIds.insert(model.tasks[taskIndex].globalId);
+
+  model.taskBindings.reserve(model.dispatchTaskIndices.size());
+  for (unsigned taskIndex : model.dispatchTaskIndices) {
+    TaskModel &task = model.tasks[taskIndex];
+    DenseSet<uint32_t> dependencyIds;
+    for (uint32_t dependencyId : task.dispatchDependencyIds) {
+      if (!dispatchTaskIds.contains(dependencyId)) {
+        task.op.emitError("task binding dependency ")
+            << dependencyId << " does not reference a local dispatch task";
+        return failure();
+      }
+      if (!dependencyIds.insert(dependencyId).second) {
+        task.op.emitError("task binding contains duplicate dependency ")
+            << dependencyId;
+        return failure();
+      }
+    }
+
+    TaskBindingModel binding;
+    binding.taskId = task.globalId;
+    if (failed(appendTaskBindingRange(model, task.op, task.inputSlots,
+                                      binding.inputOffset,
+                                      binding.inputCount)) ||
+        failed(appendTaskBindingRange(model, task.op, task.outputSlots,
+                                      binding.outputOffset,
+                                      binding.outputCount)) ||
+        failed(appendTaskBindingRange(
+            model, task.op, task.dispatchDependencyIds,
+            binding.dependencyOffset, binding.dependencyCount)))
+      return failure();
+    model.taskBindings.push_back(binding);
+  }
+  return success();
+}
+
+LogicalResult validateDeploymentPlan(TileModel &model) {
+  for (const ResourceModel &resource : model.resources) {
+    uint64_t offset = resource.dimensionOffset;
+    uint64_t rank = static_cast<uint64_t>(resource.shapedType.getRank());
+    if (offset > model.resourceDimensions.size() ||
+        rank > model.resourceDimensions.size() - offset) {
+      resource.op->emitError(
+          "resource dimension range is outside the flattened dimension table");
+      return failure();
+    }
+    ArrayRef<int64_t> dimensions =
+        ArrayRef<int64_t>(model.resourceDimensions).slice(offset, rank);
+    if (dimensions != resource.shapedType.getShape()) {
+      resource.op->emitError(
+          "resource dimension table does not match its static tensor type");
+      return failure();
+    }
+  }
+
+  if (model.taskBindings.size() != model.dispatchTaskIndices.size()) {
+    model.taskGraphFunc.emitError(
+        "task binding count does not match the dispatch task table");
+    return failure();
+  }
+  DenseSet<uint32_t> resourceSlots;
+  for (const ResourceModel &resource : model.resources)
+    resourceSlots.insert(resource.slot);
+
+  for (auto indexedBinding : llvm::enumerate(model.taskBindings)) {
+    const TaskBindingModel &binding = indexedBinding.value();
+    TaskModel &task =
+        model.tasks[model.dispatchTaskIndices[indexedBinding.index()]];
+    if (binding.taskId != task.globalId ||
+        binding.inputCount != task.inputTypes.size() ||
+        binding.outputCount != task.outputTypes.size()) {
+      task.op.emitError(
+          "task binding counts disagree with the existing Task record");
+      return failure();
+    }
+
+    auto validateRange =
+        [&](uint32_t offset, uint32_t count,
+            StringRef description) -> FailureOr<ArrayRef<uint32_t>> {
+      if (offset > model.taskBindingData.size() ||
+          count > model.taskBindingData.size() - offset) {
+        task.op.emitError("task binding ")
+            << description
+            << " range is outside the flattened binding data table";
+        return failure();
+      }
+      return ArrayRef<uint32_t>(model.taskBindingData).slice(offset, count);
+    };
+
+    auto inputs =
+        validateRange(binding.inputOffset, binding.inputCount, "input");
+    auto outputs =
+        validateRange(binding.outputOffset, binding.outputCount, "output");
+    auto dependencies = validateRange(binding.dependencyOffset,
+                                      binding.dependencyCount, "dependency");
+    if (failed(inputs) || failed(outputs) || failed(dependencies))
+      return failure();
+    for (uint32_t slot : llvm::concat<const uint32_t>(*inputs, *outputs)) {
+      if (!resourceSlots.contains(slot)) {
+        task.op.emitError("task binding references nonexistent resource slot ")
+            << slot;
+        return failure();
+      }
+    }
+  }
   return success();
 }
 
@@ -748,6 +976,21 @@ LLVM::LLVMStructType getTaskType(MLIRContext *context) {
       {i32Type, LLVM::LLVMPointerType::get(context), i32Type, i32Type});
 }
 
+LLVM::LLVMStructType getResourceType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type,
+                i32Type, i64Type, i64Type});
+}
+
+LLVM::LLVMStructType getTaskBindingType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(
+      context,
+      {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type});
+}
+
 LLVM::LLVMStructType getRouteType(MLIRContext *context) {
   Type i32Type = IntegerType::get(context, 32);
   Type i64Type = IntegerType::get(context, 64);
@@ -801,7 +1044,9 @@ FailureOr<TileModel> collectTileModel(ModuleOp module) {
           ResourceKind::ModelInput, model.modelInputs)) ||
       failed(collectModelIO(
           module, model, deployment_attrs::kModelOutputsAttrName,
-          "output_index", ResourceKind::ModelOutput, model.modelOutputs)))
+          "output_index", ResourceKind::ModelOutput, model.modelOutputs)) ||
+      failed(collectWorkspaceMetadata(model)) ||
+      failed(buildTaskBindings(model)) || failed(validateDeploymentPlan(model)))
     return failure();
 
   return model;

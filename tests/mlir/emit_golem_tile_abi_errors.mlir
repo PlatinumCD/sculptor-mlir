@@ -311,6 +311,131 @@ module attributes {
 
 // -----
 
+// Local resource slots must be unique.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    %resource0 = sculptor.task_graph.intermediate %graph {sculptor.deployment.global_resource_id = 20 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    // expected-error@+1 {{duplicate core-local sculptor.runtime.slot 0}}
+    %resource1 = sculptor.task_graph.intermediate %graph {sculptor.deployment.global_resource_id = 21 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 4 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Task bindings cannot reference absent local resource slots.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [{
+    global_resource_id = 0 : i64,
+    input_index = 0 : i64,
+    owner_core = 0 : i64
+  }],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  llvm.func @consume(!llvm.ptr, !llvm.ptr, i64, i64, i64)
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    // expected-error@+1 {{task input references nonexistent resource slot 9}}
+    %task = sculptor.task.create %graph, @consume, domain = "digital", task_kind = "digital.compute", task_name = "consume", source_layer = "errors", source_task_ordinal = 0, inputs[%input], outputs[], deps[] {sculptor.deployment.global_task_id = 0 : i64, sculptor.runtime.core_id = 0 : i64, sculptor.runtime.input_slots = [9], sculptor.runtime.output_slots = [], sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1xf32>>) -> !sculptor.task
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Workspace resources must fit inside the finalized workspace.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph attributes {
+    sculptor.runtime.workspace_size = 10 : i64
+  } {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // expected-error@+1 {{workspace resource range exceeds sculptor.runtime.workspace_size}}
+    %resource = sculptor.task_graph.intermediate %graph {sculptor.deployment.global_resource_id = 20 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Persistent resource storage has no generic Golem tile allocation contract.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // expected-error@+1 {{does not support persistent task-graph resource storage}}
+    %resource = sculptor.task_graph.persistent %graph {sculptor.deployment.global_resource_id = 20 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Resource byte sizes must agree with their statically shaped tensor types.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [{
+    global_resource_id = 0 : i64,
+    input_index = 0 : i64,
+    owner_core = 0 : i64
+  }],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // expected-error@+1 {{resource byte size does not match its static tensor type}}
+    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<2xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Static tensor layout arithmetic must remain representable by the ABI.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [{
+    global_resource_id = 0 : i64,
+    input_index = 0 : i64,
+    owner_core = 0 : i64
+  }],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // expected-error@+1 {{tensor strides must fit in a signed 64-bit value}}
+    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<4611686018427387904x2xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
 // The packaging boundary rejects any unrelated Sculptor operation left behind.
 module attributes {
   sculptor.deployment.incoming_routes = [],
@@ -324,7 +449,9 @@ module attributes {
     %stray = sculptor.task_graph.create : !sculptor.task_graph
     llvm.return
   }
-  func.func private @generate_task_graph() -> !sculptor.task_graph {
+  func.func private @generate_task_graph() -> !sculptor.task_graph attributes {
+    sculptor.runtime.workspace_size = 0 : i64
+  } {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
     return %graph : !sculptor.task_graph
   }
