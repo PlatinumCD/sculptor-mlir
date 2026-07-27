@@ -666,6 +666,16 @@ static void attachArrayExecutionAttrs(mlir::Operation *op,
                         extent.validCols, rewriter);
 }
 
+static void attachArrayStoreShapeAttrs(mlir::Operation *op,
+                                       const MatrixTileExtent &extent,
+                                       mlir::Builder &builder) {
+  op->setAttr(
+      tiling_attrs::kTilePhysicalShapeAttrName,
+      builder.getI64ArrayAttr({extent.physicalRows, extent.physicalCols}));
+  op->setAttr(tiling_attrs::kTileValidShapeAttrName,
+              builder.getI64ArrayAttr({extent.validRows, extent.validCols}));
+}
+
 static mlir::Value createArrayExecutionRegion(
     mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
     mlir::Value vectorTileValue, mlir::Value logicalArray, int64_t tileRow,
@@ -707,6 +717,7 @@ static mlir::Value createArrayExecutionRegion(
 
   auto arrayStore = rewriter.create<mlir::sculptor::ArrayStoreOp>(
       mvmOp.getLoc(), storeType, arrayExecute.getResult());
+  attachArrayStoreShapeAttrs(arrayStore, extent, rewriter);
 
   rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(),
                                            arrayStore.getOutput());
@@ -862,11 +873,10 @@ static mlir::Value createSequenceArrayExecutionRegion(
             mlir::sculptor::ArrayResultType::get(rewriter.getContext());
         auto executed = loopBuilder.create<mlir::sculptor::ArrayExecuteOp>(
             loopLoc, resultType, array);
-        mlir::Value stored =
-            loopBuilder
-                .create<mlir::sculptor::ArrayStoreOp>(loopLoc, storedRowType,
-                                                      executed.getResult())
-                .getOutput();
+        auto store = loopBuilder.create<mlir::sculptor::ArrayStoreOp>(
+            loopLoc, storedRowType, executed.getResult());
+        attachArrayStoreShapeAttrs(store, extent, loopBuilder);
+        mlir::Value stored = store.getOutput();
         mlir::Value updated =
             loopBuilder
                 .create<mlir::tensor::InsertSliceOp>(

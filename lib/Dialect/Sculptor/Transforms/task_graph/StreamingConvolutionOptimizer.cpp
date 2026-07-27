@@ -594,6 +594,14 @@ static void attachArrayBinding(Operation *op, OpBuilder &builder,
               builder.getI64IntegerAttr(stage.physicalArrayId));
 }
 
+static void attachArrayStoreShape(Operation *op, OpBuilder &builder,
+                                  const ArrayStage &stage) {
+  op->setAttr(tiling_attrs::kTilePhysicalShapeAttrName,
+              builder.getI64ArrayAttr({stage.arrayRows, stage.arrayCols}));
+  op->setAttr(tiling_attrs::kTileValidShapeAttrName,
+              builder.getI64ArrayAttr({stage.validRows, stage.validCols}));
+}
+
 static ArrayAttr buildArrayBindings(OpBuilder &builder,
                                     ArrayRef<ArrayStage> arrays) {
   SmallVector<Attribute, 4> bindings;
@@ -684,16 +692,16 @@ buildStreamingConvolutionCallee(ModuleOp module,
                          builder.getI64ArrayAttr(executionCounts));
 
   int64_t totalPhysicalColumns = 0;
-  int64_t totalValidRows = 0;
+  int64_t totalPhysicalRows = 0;
   for (const ArrayStage &stage : match.arrays) {
     totalPhysicalColumns += stage.arrayCols;
-    totalValidRows += stage.validRows;
+    totalPhysicalRows += stage.arrayRows;
   }
   auto loadBytes =
       checkedMultiply(patchTask, {outputPositions, totalPhysicalColumns, 4},
                       "streaming convolution analog load byte count");
   auto storeBytes =
-      checkedMultiply(patchTask, {outputPositions, totalValidRows, 4},
+      checkedMultiply(patchTask, {outputPositions, totalPhysicalRows, 4},
                       "streaming convolution analog store byte count");
   auto patchOps = checkedMultiply(
       patchTask,
@@ -837,6 +845,7 @@ buildStreamingConvolutionCallee(ModuleOp module,
               positionLoc, storedType, executedResults[indexedStage.index()]);
           attachArrayBinding(store, positionBuilder, indexedStage.index(),
                              stage);
+          attachArrayStoreShape(store, positionBuilder, stage);
           partialResults.push_back(store.getOutput());
         }
 

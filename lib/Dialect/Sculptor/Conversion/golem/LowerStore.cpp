@@ -1,4 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -6,6 +7,32 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace {
+
+mlir::FailureOr<int64_t>
+getPhysicalArrayRows(mlir::sculptor::ArrayStoreOp op) {
+  auto shape = op->getAttrOfType<mlir::ArrayAttr>(
+      mlir::sculptor::tiling_attrs::kTilePhysicalShapeAttrName);
+  if (!shape) {
+    return op.emitOpError("expected physical array shape attribute '")
+               << mlir::sculptor::tiling_attrs::kTilePhysicalShapeAttrName
+               << "'",
+           mlir::failure();
+  }
+  if (shape.size() != 2) {
+    return op.emitOpError("expected physical array shape to contain two "
+                          "integer dimensions"),
+           mlir::failure();
+  }
+
+  auto rows = mlir::dyn_cast<mlir::IntegerAttr>(shape[0]);
+  auto cols = mlir::dyn_cast<mlir::IntegerAttr>(shape[1]);
+  if (!rows || !cols) {
+    return op.emitOpError("expected physical array shape to contain two "
+                          "integer dimensions"),
+           mlir::failure();
+  }
+  return rows.getInt();
+}
 
 class ArrayStoreLowering
     : public mlir::OpConversionPattern<mlir::sculptor::ArrayStoreOp> {
@@ -31,14 +58,23 @@ public:
 
     mlir::Location loc = op.getLoc();
     mlir::Type elementType = outputType.getElementType();
-    int64_t lanes = outputType.getDimSize(1);
+    int64_t validRows = outputType.getDimSize(1);
+    mlir::FailureOr<int64_t> physicalRows = getPhysicalArrayRows(op);
+    if (mlir::failed(physicalRows))
+      return mlir::failure();
+    if (*physicalRows <= 0)
+      return op.emitOpError("expected positive physical array row count");
+    if (validRows <= 0 || validRows > *physicalRows) {
+      return op.emitOpError(
+          "logical store width must be between one and physical array rows");
+    }
 
     auto outputMemrefType =
         mlir::MemRefType::get(outputType.getShape(), elementType);
     mlir::Value outputMemref =
         rewriter.create<mlir::memref::AllocOp>(loc, outputMemrefType);
     mlir::Value scratch = mlir::sculptor::golem::allocateStoreScratchBuffer(
-        rewriter, loc, lanes, elementType);
+        rewriter, loc, *physicalRows, elementType);
 
     auto shimScratchType = mlir::MemRefType::get({mlir::ShapedType::kDynamic,
                                                   mlir::ShapedType::kDynamic,
@@ -53,10 +89,10 @@ public:
 
     mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
     mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
-    mlir::Value cLanes =
-        rewriter.create<mlir::arith::ConstantIndexOp>(loc, lanes);
+    mlir::Value cValidRows =
+        rewriter.create<mlir::arith::ConstantIndexOp>(loc, validRows);
     rewriter.create<mlir::scf::ForOp>(
-        loc, c0, cLanes, c1, mlir::ValueRange{},
+        loc, c0, cValidRows, c1, mlir::ValueRange{},
         [&](mlir::OpBuilder &builder, mlir::Location loopLoc,
             mlir::Value laneIndex, mlir::ValueRange) {
           mlir::Value value = builder.create<mlir::memref::LoadOp>(

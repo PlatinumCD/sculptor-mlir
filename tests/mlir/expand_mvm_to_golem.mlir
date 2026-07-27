@@ -39,19 +39,19 @@ module {
   // CHECK: ^bb0(%[[XV00:.*]]: tensor<1x3xf32>, %[[XA00:.*]]: !sculptor.logical.array):
   // CHECK: sculptor.array.load %[[XV00]], %[[XA00]] : tensor<1x3xf32>, !sculptor.logical.array
   // CHECK: %[[E00:.*]] = sculptor.array.execute %[[XA00]] : !sculptor.logical.array -> !sculptor.array.result
-  // CHECK: %[[S00:.*]] = sculptor.array.store %[[E00]] : !sculptor.array.result -> tensor<1x2xf32>
+  // CHECK: %[[S00:.*]] = sculptor.array.store %[[E00]] {sculptor.tile_physical_shape = [2, 3], sculptor.tile_valid_shape = [2, 3]} : !sculptor.array.result -> tensor<1x2xf32>
   // CHECK: sculptor.yield %[[S00]] : tensor<1x2xf32>
   // CHECK: } {sculptor.source_resource = "torch_tensor_3_4_torch.float32", sculptor.tile = [0, 0], sculptor.tile_grid = [2, 2], sculptor.tile_physical_shape = [2, 3], sculptor.tile_valid_shape = [2, 3], sculptor.vector_tile = 0 : i64, sculptor.vector_tile_grid = 2 : i64, sculptor.vector_tile_physical_cols = 3 : i64, sculptor.vector_tile_valid_cols = 3 : i64} : (tensor<1x3xf32>, !sculptor.logical.array) -> tensor<1x2xf32>
   // CHECK: %[[X10:.*]] = sculptor.task_region kind = "sculptor.mvm" name = "tile_set_load_mvm_1_0"(%[[V0]], %[[A10]]) {
   // CHECK: sculptor.array.load {{.*}} : tensor<1x3xf32>, !sculptor.logical.array
-  // CHECK: sculptor.array.store {{.*}} : !sculptor.array.result -> tensor<1x1xf32>
+  // CHECK: sculptor.array.store {{.*}} {sculptor.tile_physical_shape = [2, 3], sculptor.tile_valid_shape = [1, 3]} : !sculptor.array.result -> tensor<1x1xf32>
   // CHECK: sculptor.yield {{.*}} : tensor<1x1xf32>
   // CHECK: %[[X01:.*]] = sculptor.task_region kind = "sculptor.mvm" name = "tile_set_load_mvm_0_1"(%[[V1]], %[[A01]]) {
   // CHECK: sculptor.array.load {{.*}} : tensor<1x3xf32>, !sculptor.logical.array
   // CHECK: sculptor.yield {{.*}} : tensor<1x2xf32>
   // CHECK: %[[X11:.*]] = sculptor.task_region kind = "sculptor.mvm" name = "tile_set_load_mvm_1_1"(%[[V1]], %[[A11]]) {
   // CHECK: sculptor.array.load {{.*}} : tensor<1x3xf32>, !sculptor.logical.array
-  // CHECK: sculptor.array.store {{.*}} : !sculptor.array.result -> tensor<1x1xf32>
+  // CHECK: sculptor.array.store {{.*}} {sculptor.tile_physical_shape = [2, 3], sculptor.tile_valid_shape = [1, 1]} : !sculptor.array.result -> tensor<1x1xf32>
   // CHECK: sculptor.yield {{.*}} : tensor<1x1xf32>
   // CHECK: %[[RECOMBINE:.*]] = sculptor.task_region kind = "digital.tile_recombine" name = "tile_set_load_tile_recombine"(%[[X00]], %[[X01]], %[[X10]], %[[X11]]) {
   // CHECK: ^bb0(%[[R00:.*]]: tensor<1x2xf32>, %[[R01:.*]]: tensor<1x2xf32>, %[[R10:.*]]: tensor<1x1xf32>, %[[R11:.*]]: tensor<1x1xf32>):
