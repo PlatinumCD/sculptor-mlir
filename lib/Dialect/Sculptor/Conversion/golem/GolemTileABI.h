@@ -77,6 +77,7 @@ struct ResourceModel {
   ShapedType shapedType;
   ResourceKind kind = ResourceKind::Intermediate;
   uint32_t globalId = 0;
+  std::optional<uint32_t> routeId;
   uint32_t slot = 0;
   uint64_t byteSize = 0;
   std::optional<uint64_t> workspaceOffset;
@@ -115,6 +116,9 @@ struct TileModel {
   func::FuncOp taskGraphFunc;
   SmallVector<ResourceModel> resources;
   DenseMap<Value, unsigned> resourceIndexByValue;
+  DenseMap<uint32_t, unsigned> nonRouteResourceIndexByGlobalId;
+  DenseMap<uint32_t, unsigned> routeInputResourceIndexByRouteId;
+  DenseMap<uint32_t, unsigned> routeOutputResourceIndexByRouteId;
   SmallVector<TaskModel> tasks;
   SmallVector<unsigned> bootTaskIndices;
   SmallVector<unsigned> dispatchTaskIndices;

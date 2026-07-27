@@ -106,18 +106,39 @@ FailureOr<SmallVector<uint32_t>> getRequiredU32ArrayAttr(Operation *op,
   return result;
 }
 
+bool hasRepresentableContiguousStrides(ShapedType shapedType) {
+  uint64_t stride = 1;
+  constexpr uint64_t maxStride =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  for (int64_t dim = shapedType.getRank() - 1; dim >= 0; --dim) {
+    uint64_t size = static_cast<uint64_t>(shapedType.getDimSize(dim));
+    if (size != 0 && stride > maxStride / size)
+      return false;
+    stride *= size;
+  }
+  return true;
+}
+
 FailureOr<ShapedType> getSupportedTensorType(Operation *op, Type type) {
   auto resourceType = dyn_cast<TaskResourceType>(type);
   Type valueType = resourceType ? resourceType.getValueType() : type;
   auto shapedType = dyn_cast<ShapedType>(valueType);
   if (!shapedType || !shapedType.hasStaticShape() ||
-      !shapedType.getElementType().isF32() || shapedType.getRank() > 2) {
+      !shapedType.getElementType().isF32()) {
     op->emitError(
-        "Golem tile task ABI supports only statically shaped f32 tensors "
-        "with ranks zero through two");
+        "Golem tile task ABI supports only statically shaped f32 tensors");
+    return failure();
+  }
+  if (!hasRepresentableContiguousStrides(shapedType)) {
+    op->emitError(
+        "Golem tile task ABI tensor strides must fit in a signed 64-bit value");
     return failure();
   }
   return shapedType;
+}
+
+bool isRouteResourceKind(ResourceKind kind) {
+  return kind == ResourceKind::RouteInput || kind == ResourceKind::RouteOutput;
 }
 
 std::optional<std::pair<ResourceKind, Value>>
@@ -175,7 +196,11 @@ FailureOr<func::FuncOp> findTaskGraphFunction(ModuleOp module) {
 }
 
 LogicalResult collectResources(TileModel &model) {
-  DenseSet<uint32_t> globalIds;
+  // Global IDs identify logical payloads, while route IDs identify individual
+  // transfers of those payloads. Keep the identity domains separate so fan-out
+  // routes can share a global resource without sharing a local buffer.
+  DenseSet<uint32_t> nonRouteGlobalIds;
+  DenseSet<uint32_t> routeIds;
   DenseSet<uint32_t> slots;
 
   for (Operation &op : model.taskGraphFunc.getBody().front()) {
@@ -195,10 +220,24 @@ LogicalResult collectResources(TileModel &model) {
         failed(byteSize))
       return failure();
 
-    if (!globalIds.insert(*globalId).second) {
-      op.emitError("duplicate sculptor.deployment.global_resource_id ")
-          << *globalId;
-      return failure();
+    std::optional<uint32_t> routeId;
+    if (isRouteResourceKind(kindAndValue->first)) {
+      auto collectedRouteId = getRequiredUnsignedAttr<uint32_t>(
+          &op, deployment_attrs::kRouteIdAttrName);
+      if (failed(collectedRouteId))
+        return failure();
+      routeId = *collectedRouteId;
+      if (!routeIds.insert(*routeId).second) {
+        op.emitError("duplicate sculptor.deployment.route_id ") << *routeId;
+        return failure();
+      }
+    } else {
+      if (!nonRouteGlobalIds.insert(*globalId).second) {
+        op.emitError("duplicate non-route "
+                     "sculptor.deployment.global_resource_id ")
+            << *globalId;
+        return failure();
+      }
     }
     if (!slots.insert(*slot).second) {
       op.emitError("duplicate core-local sculptor.runtime.slot ") << *slot;
@@ -228,7 +267,17 @@ LogicalResult collectResources(TileModel &model) {
     model.resourceIndexByValue.try_emplace(kindAndValue->second, resourceIndex);
     model.resources.push_back(ResourceModel{
         &op, kindAndValue->second, *shapedType, kindAndValue->first, *globalId,
-        *slot, *byteSize, workspaceOffset});
+        routeId, *slot, *byteSize, workspaceOffset});
+    if (kindAndValue->first == ResourceKind::RouteInput) {
+      model.routeInputResourceIndexByRouteId.try_emplace(*routeId,
+                                                         resourceIndex);
+    } else if (kindAndValue->first == ResourceKind::RouteOutput) {
+      model.routeOutputResourceIndexByRouteId.try_emplace(*routeId,
+                                                          resourceIndex);
+    } else {
+      model.nonRouteResourceIndexByGlobalId.try_emplace(*globalId,
+                                                        resourceIndex);
+    }
   }
 
   return success();
@@ -499,29 +548,49 @@ FailureOr<ArrayAttr> getRequiredArrayAttr(ModuleOp module, StringRef name) {
   return attr;
 }
 
-FailureOr<ResourceModel *> findResourceByGlobalId(TileModel &model,
-                                                  uint32_t globalId,
-                                                  ResourceKind expectedKind,
-                                                  Operation *diagnosticOp) {
-  ResourceModel *match = nullptr;
-  for (ResourceModel &resource : model.resources) {
-    if (resource.globalId != globalId)
-      continue;
-    if (resource.kind != expectedKind) {
-      diagnosticOp->emitError("global resource ")
-          << globalId << " has the wrong boundary kind";
-      return failure();
-    }
-    match = &resource;
-    break;
-  }
-  if (!match) {
+FailureOr<ResourceModel *>
+findNonRouteResourceByGlobalId(TileModel &model, uint32_t globalId,
+                               ResourceKind expectedKind,
+                               Operation *diagnosticOp) {
+  auto resourceIt = model.nonRouteResourceIndexByGlobalId.find(globalId);
+  if (resourceIt == model.nonRouteResourceIndexByGlobalId.end()) {
     diagnosticOp->emitError("cannot match deployment metadata to local "
-                            "resource with global ID ")
+                            "non-route resource with global ID ")
         << globalId;
     return failure();
   }
-  return match;
+
+  ResourceModel &resource = model.resources[resourceIt->second];
+  if (resource.kind != expectedKind) {
+    diagnosticOp->emitError("global resource ")
+        << globalId << " has the wrong boundary kind";
+    return failure();
+  }
+  return &resource;
+}
+
+FailureOr<ResourceModel *> findRouteResourceById(TileModel &model,
+                                                 uint32_t routeId,
+                                                 ResourceKind expectedKind,
+                                                 Operation *diagnosticOp) {
+  const DenseMap<uint32_t, unsigned> *resourcesByRouteId = nullptr;
+  if (expectedKind == ResourceKind::RouteInput) {
+    resourcesByRouteId = &model.routeInputResourceIndexByRouteId;
+  } else if (expectedKind == ResourceKind::RouteOutput) {
+    resourcesByRouteId = &model.routeOutputResourceIndexByRouteId;
+  } else {
+    diagnosticOp->emitError(
+        "internal error: route lookup requested for a non-route resource");
+    return failure();
+  }
+
+  auto resourceIt = resourcesByRouteId->find(routeId);
+  if (resourceIt == resourcesByRouteId->end()) {
+    diagnosticOp->emitError("cannot match deployment route ")
+        << routeId << " to a local route boundary resource";
+    return failure();
+  }
+  return &model.resources[resourceIt->second];
 }
 
 LogicalResult collectRoutes(ModuleOp module, TileModel &model,
@@ -573,15 +642,10 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
       return failure();
     }
 
-    auto resource = findResourceByGlobalId(
-        model, static_cast<uint32_t>(resourceIdValue), resourceKind, module);
+    auto resource = findRouteResourceById(model, routeId, resourceKind, module);
     if (failed(resource))
       return failure();
-    auto resourceRouteId = getRequiredUnsignedAttr<uint32_t>(
-        (*resource)->op, deployment_attrs::kRouteIdAttrName);
-    if (failed(resourceRouteId))
-      return failure();
-    if (*resourceRouteId != routeId ||
+    if ((*resource)->globalId != static_cast<uint32_t>(resourceIdValue) ||
         (*resource)->byteSize != static_cast<uint64_t>(byteSizeValue)) {
       module.emitError("route metadata does not match local route resource "
                        "slot metadata for route ")
@@ -643,7 +707,7 @@ LogicalResult collectModelIO(ModuleOp module, TileModel &model,
       return failure();
     }
 
-    auto resource = findResourceByGlobalId(
+    auto resource = findNonRouteResourceByGlobalId(
         model, static_cast<uint32_t>(resourceId.getInt()), resourceKind,
         module);
     if (failed(resource))

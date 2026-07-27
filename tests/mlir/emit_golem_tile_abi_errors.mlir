@@ -169,7 +169,7 @@ module attributes {
 
 // -----
 
-// Rank three is intentionally outside the first Golem Tensor ABI contract.
+// Dynamic tensors remain outside the statically shaped Golem Tensor ABI.
 module attributes {
   sculptor.deployment.incoming_routes = [],
   sculptor.deployment.model_inputs = [{
@@ -183,8 +183,68 @@ module attributes {
 } {
   func.func private @generate_task_graph() -> !sculptor.task_graph {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
-    // expected-error@+1 {{supports only statically shaped f32 tensors with ranks zero through two}}
-    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x1x1xf32>>
+    // expected-error@+1 {{supports only statically shaped f32 tensors}}
+    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<?xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Unsupported element types remain outside the Golem Tensor ABI.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [{
+    global_resource_id = 0 : i64,
+    input_index = 0 : i64,
+    owner_core = 0 : i64
+  }],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    // expected-error@+1 {{supports only statically shaped f32 tensors}}
+    %input = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 0 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xi32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Ordinary resources retain unique global resource identities.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    %input0 = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 7 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    // expected-error@+1 {{duplicate non-route sculptor.deployment.global_resource_id 7}}
+    %input1 = sculptor.task_graph.input %graph {sculptor.deployment.global_resource_id = 7 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// Route IDs identify transfer instances and must remain unique.
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    %route0 = sculptor.task_graph.route_input %graph {sculptor.deployment.global_resource_id = 7 : i64, sculptor.deployment.route_id = 3 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    // expected-error@+1 {{duplicate sculptor.deployment.route_id 3}}
+    %route1 = sculptor.task_graph.route_input %graph {sculptor.deployment.global_resource_id = 7 : i64, sculptor.deployment.route_id = 3 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 1 : i64, sculptor.runtime.temp_offset = 4 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
     return %graph : !sculptor.task_graph
   }
 }
@@ -192,7 +252,7 @@ module attributes {
 // -----
 
 // Route records and route-boundary resources must agree exactly.
-// expected-error@+1 {{route metadata does not match local route resource slot metadata for route 0}}
+// expected-error@+1 {{cannot match deployment route 0 to a local route boundary resource}}
 module attributes {
   sculptor.deployment.incoming_routes = [],
   sculptor.deployment.model_inputs = [],
@@ -215,6 +275,36 @@ module attributes {
   func.func private @generate_task_graph() -> !sculptor.task_graph {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
     %route = sculptor.task_graph.route_output %graph {sculptor.deployment.global_resource_id = 2 : i64, sculptor.deployment.route_id = 1 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
+    return %graph : !sculptor.task_graph
+  }
+}
+
+// -----
+
+// A matching route ID must still carry the manifest's logical resource ID.
+// expected-error@+1 {{route metadata does not match local route resource slot metadata for route 0}}
+module attributes {
+  sculptor.deployment.incoming_routes = [],
+  sculptor.deployment.model_inputs = [],
+  sculptor.deployment.model_outputs = [],
+  sculptor.deployment.outgoing_routes = [
+    #sculptor.deployment_route<
+      id = 0 : i64,
+      sourceCore = 0 : i64,
+      sourceTask = 1 : i64,
+      sourceOutput = 0 : i64,
+      destinationCore = 1 : i64,
+      destinationTask = 3 : i64,
+      destinationInput = 0 : i64,
+      resourceId = 3 : i64,
+      byteSize = 4 : i64
+    >
+  ],
+  sculptor.runtime.core_id = 0 : i64
+} {
+  func.func private @generate_task_graph() -> !sculptor.task_graph {
+    %graph = sculptor.task_graph.create : !sculptor.task_graph
+    %route = sculptor.task_graph.route_output %graph {sculptor.deployment.global_resource_id = 2 : i64, sculptor.deployment.route_id = 0 : i64, sculptor.runtime.byte_size = 4 : i64, sculptor.runtime.slot = 0 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1xf32>>
     return %graph : !sculptor.task_graph
   }
 }
