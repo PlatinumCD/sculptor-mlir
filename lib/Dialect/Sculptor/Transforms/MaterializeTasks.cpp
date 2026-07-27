@@ -7,9 +7,11 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphOptimizationAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskMetadata.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -43,6 +45,8 @@ constexpr llvm::StringLiteral kForwardFunctionName = "forward";
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 namespace task_metadata = mlir::sculptor::task_metadata;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace optimization_attrs = mlir::sculptor::optimization_attrs;
+namespace tiling_attrs = mlir::sculptor::tiling_attrs;
 
 struct MaterializableTaskRegion {
   mlir::sculptor::TaskRegionOp region;
@@ -325,7 +329,16 @@ emitTaskFunctionDeclaration(mlir::ModuleOp module,
            mlir::sculptor::task_graph_attrs::kTaskReductionAttrName)});
   for (llvm::StringRef attrName :
        {runtime_attrs::kTaskDigitalOpsAttrName,
-        runtime_attrs::kTaskAnalogExecutionCountAttrName}) {
+        runtime_attrs::kTaskAnalogExecutionCountAttrName,
+        optimization_attrs::kStreamingConvolutionAttrName,
+        tiling_attrs::kSourceResourceAttrName, tiling_attrs::kTileAttrName,
+        tiling_attrs::kTileGridAttrName,
+        tiling_attrs::kTilePhysicalShapeAttrName,
+        tiling_attrs::kTileValidShapeAttrName,
+        tiling_attrs::kVectorTileAttrName,
+        tiling_attrs::kVectorTileGridAttrName,
+        tiling_attrs::kVectorTilePhysicalColsAttrName,
+        tiling_attrs::kVectorTileValidColsAttrName}) {
     if (mlir::Attribute attr = region->getAttr(attrName))
       taskFunc->setAttr(attrName, attr);
   }

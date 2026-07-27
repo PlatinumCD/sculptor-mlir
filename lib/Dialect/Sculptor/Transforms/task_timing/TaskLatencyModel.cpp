@@ -18,6 +18,7 @@ namespace task_timing {
 namespace {
 
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace task_graph_names = mlir::sculptor::task_graph_names;
 
 LogicalResult addByteCount(Operation *anchor, int64_t bytes, int64_t &total) {
   if (bytes < 0 || total > std::numeric_limits<int64_t>::max() - bytes) {
@@ -54,6 +55,62 @@ LogicalResult collectTaskIOBytes(sculptor::TaskCreateOp taskOp,
   return success();
 }
 
+double computeDigitalLatencyNs(int64_t digitalOps, const TimingModel &model) {
+  if (digitalOps <= 0)
+    return 0.0;
+  double vectorOpsPerCycle =
+      static_cast<double>(model.digitalVectorBitsPerCycle) / 32.0;
+  double operationsPerCycle =
+      std::max<double>(model.digitalIssueWidth, vectorOpsPerCycle);
+  return cyclesToNanoseconds(std::ceil(digitalOps / operationsPerCycle), model);
+}
+
+FailureOr<TaskLatencyEstimate>
+estimateStreamingConvolutionLatency(sculptor::TaskCreateOp taskOp,
+                                    int64_t digitalOps,
+                                    const TimingModel &model) {
+  auto counts = taskOp->getAttrOfType<ArrayAttr>(
+      runtime_attrs::kTaskAnalogExecutionCountsAttrName);
+  auto loadBytes = taskOp->getAttrOfType<IntegerAttr>(
+      runtime_attrs::kTaskAnalogLoadBytesAttrName);
+  auto storeBytes = taskOp->getAttrOfType<IntegerAttr>(
+      runtime_attrs::kTaskAnalogStoreBytesAttrName);
+  if (!counts || counts.empty() || !loadBytes || !storeBytes ||
+      loadBytes.getInt() < 0 || storeBytes.getInt() < 0) {
+    taskOp.emitError(
+        "expected streaming convolution timing counts and byte totals");
+    return failure();
+  }
+
+  int64_t maximumExecutionCount = 0;
+  for (Attribute attribute : counts) {
+    auto count = dyn_cast<IntegerAttr>(attribute);
+    if (!count || count.getInt() <= 0) {
+      taskOp.emitError("expected positive per-array analog execution counts");
+      return failure();
+    }
+    maximumExecutionCount = std::max(maximumExecutionCount, count.getInt());
+  }
+
+  double loadCycles =
+      std::ceil(static_cast<double>(loadBytes.getInt()) * 8.0 /
+                static_cast<double>(model.analogIOBitsPerCycle));
+  double storeCycles =
+      std::ceil(static_cast<double>(storeBytes.getInt()) * 8.0 /
+                static_cast<double>(model.analogIOBitsPerCycle));
+
+  TaskLatencyEstimate estimate;
+  estimate.analogLoadLatencyNs = cyclesToNanoseconds(loadCycles, model);
+  estimate.analogExecuteLatencyNs =
+      model.analogMVMLatencyNs * static_cast<double>(maximumExecutionCount);
+  estimate.analogStoreLatencyNs = cyclesToNanoseconds(storeCycles, model);
+  estimate.intrinsicLatencyNs = estimate.analogLoadLatencyNs +
+                                estimate.analogExecuteLatencyNs +
+                                estimate.analogStoreLatencyNs +
+                                computeDigitalLatencyNs(digitalOps, model);
+  return estimate;
+}
+
 } // namespace
 
 FailureOr<TaskLatencyEstimate>
@@ -75,21 +132,16 @@ estimateTaskLatency(sculptor::TaskCreateOp taskOp, int64_t digitalOps,
     }
   }
 
+  if (taskOp.getTaskKind() == task_graph_names::kStreamingConvolutionTaskKind)
+    return estimateStreamingConvolutionLatency(taskOp, digitalOps, model);
+
   int64_t inputBytes = 0;
   int64_t outputBytes = 0;
   if (failed(collectTaskIOBytes(taskOp, inputBytes, outputBytes)))
     return failure();
 
   TaskLatencyEstimate estimate;
-  double digitalLatencyNs = 0.0;
-  if (digitalOps > 0) {
-    double vectorOpsPerCycle =
-        static_cast<double>(model.digitalVectorBitsPerCycle) / 32.0;
-    double operationsPerCycle =
-        std::max<double>(model.digitalIssueWidth, vectorOpsPerCycle);
-    digitalLatencyNs =
-        cyclesToNanoseconds(std::ceil(digitalOps / operationsPerCycle), model);
-  }
+  double digitalLatencyNs = computeDigitalLatencyNs(digitalOps, model);
 
   if (!task_graph::isAnalogComputeTask(taskOp)) {
     estimate.intrinsicLatencyNs = digitalLatencyNs;

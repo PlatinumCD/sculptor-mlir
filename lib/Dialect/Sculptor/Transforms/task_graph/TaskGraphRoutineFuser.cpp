@@ -170,6 +170,8 @@ static bool isComponentFusibleTask(mlir::sculptor::TaskCreateOp taskOp) {
   // placement contract used to reload digital-only islands after fusion.
   return !isMatrixSetupTask(taskOp) &&
          taskOp.getTaskKind() != task_graph_names::kReductionTaskKind &&
+         taskOp.getTaskKind() !=
+             task_graph_names::kStreamingConvolutionTaskKind &&
          getOptionalScheduledCore(taskOp) &&
          getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
 }

@@ -10,6 +10,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/ConstantUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -40,21 +41,10 @@ namespace sculptor {
 namespace {
 
 constexpr llvm::StringLiteral kForwardFunctionName = "forward";
-constexpr llvm::StringLiteral kSourceResourceAttr = "sculptor.source_resource";
-constexpr llvm::StringLiteral kTileAttr = "sculptor.tile";
-constexpr llvm::StringLiteral kTileGridAttr = "sculptor.tile_grid";
-constexpr llvm::StringLiteral kTilePhysicalShapeAttr =
-    "sculptor.tile_physical_shape";
-constexpr llvm::StringLiteral kTileValidShapeAttr = "sculptor.tile_valid_shape";
-constexpr llvm::StringLiteral kVectorTileAttr = "sculptor.vector_tile";
-constexpr llvm::StringLiteral kVectorTileGridAttr = "sculptor.vector_tile_grid";
-constexpr llvm::StringLiteral kVectorTilePhysicalColsAttr =
-    "sculptor.vector_tile_physical_cols";
-constexpr llvm::StringLiteral kVectorTileValidColsAttr =
-    "sculptor.vector_tile_valid_cols";
 
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace tiling_attrs = mlir::sculptor::tiling_attrs;
 
 struct MatrixPartitionSpec {
   mlir::arith::ConstantOp constant;
@@ -353,9 +343,10 @@ getI64PairAttr(mlir::Operation *op, llvm::StringRef attrName) {
 static mlir::LogicalResult
 recordLogicalArray(mlir::Operation *op, mlir::Value logicalArray,
                    llvm::StringMap<LogicalArrayGrid> &logicalArrays) {
-  auto sourceAttr = op->getAttrOfType<mlir::StringAttr>(kSourceResourceAttr);
-  auto tile = getI64PairAttr(op, kTileAttr);
-  auto grid = getI64PairAttr(op, kTileGridAttr);
+  auto sourceAttr = op->getAttrOfType<mlir::StringAttr>(
+      tiling_attrs::kSourceResourceAttrName);
+  auto tile = getI64PairAttr(op, tiling_attrs::kTileAttrName);
+  auto grid = getI64PairAttr(op, tiling_attrs::kTileGridAttrName);
   if (!sourceAttr || !tile || !grid)
     return mlir::success();
 
@@ -475,14 +466,16 @@ static void attachMatrixTileAttrs(mlir::Operation *op,
                                   mlir::RewriterBase &rewriter) {
   MatrixTileExtent extent =
       getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
-  op->setAttr(kSourceResourceAttr, rewriter.getStringAttr(spec.sourceResource));
-  op->setAttr(kTileAttr, rewriter.getI64ArrayAttr({tileRow, tileCol}));
-  op->setAttr(kTileGridAttr,
+  op->setAttr(tiling_attrs::kSourceResourceAttrName,
+              rewriter.getStringAttr(spec.sourceResource));
+  op->setAttr(tiling_attrs::kTileAttrName,
+              rewriter.getI64ArrayAttr({tileRow, tileCol}));
+  op->setAttr(tiling_attrs::kTileGridAttrName,
               rewriter.getI64ArrayAttr({spec.gridRows, spec.gridCols}));
   op->setAttr(
-      kTilePhysicalShapeAttr,
+      tiling_attrs::kTilePhysicalShapeAttrName,
       rewriter.getI64ArrayAttr({extent.physicalRows, extent.physicalCols}));
-  op->setAttr(kTileValidShapeAttr,
+  op->setAttr(tiling_attrs::kTileValidShapeAttrName,
               rewriter.getI64ArrayAttr({extent.validRows, extent.validCols}));
 }
 
@@ -549,11 +542,14 @@ static void attachVectorTileAttrs(mlir::Operation *op, int64_t vectorTile,
                                   int64_t vectorTileGrid, int64_t physicalCols,
                                   int64_t validCols,
                                   mlir::RewriterBase &rewriter) {
-  op->setAttr(kVectorTileAttr, rewriter.getI64IntegerAttr(vectorTile));
-  op->setAttr(kVectorTileGridAttr, rewriter.getI64IntegerAttr(vectorTileGrid));
-  op->setAttr(kVectorTilePhysicalColsAttr,
+  op->setAttr(tiling_attrs::kVectorTileAttrName,
+              rewriter.getI64IntegerAttr(vectorTile));
+  op->setAttr(tiling_attrs::kVectorTileGridAttrName,
+              rewriter.getI64IntegerAttr(vectorTileGrid));
+  op->setAttr(tiling_attrs::kVectorTilePhysicalColsAttrName,
               rewriter.getI64IntegerAttr(physicalCols));
-  op->setAttr(kVectorTileValidColsAttr, rewriter.getI64IntegerAttr(validCols));
+  op->setAttr(tiling_attrs::kVectorTileValidColsAttrName,
+              rewriter.getI64IntegerAttr(validCols));
 }
 
 static mlir::sculptor::TaskRegionOp createDigitalPreparationRegion(

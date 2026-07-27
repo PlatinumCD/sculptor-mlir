@@ -14,6 +14,7 @@ add_mlir_library(MLIRSculptorTransforms
   FinalizeTaskGraphResources.cpp
   FuseTaskGraph.cpp
   MaterializeTasks.cpp
+  OptimizeTaskGraph.cpp
   PartitionTaskGraphByCore.cpp
   ScheduleTaskGraph.cpp
   TaskGraphTaskMetadata.cpp
@@ -45,6 +46,8 @@ add_mlir_library(MLIRSculptorTransforms
   task_schedulers/MeshGeometry.cpp
   task_graph/TaskGraphDeploymentPartitioner.cpp
   task_graph/TaskGraphRoutineFuser.cpp
+  task_graph/TaskGraphOptimizer.cpp
+  task_graph/StreamingConvolutionOptimizer.cpp
   task_timing/TaskGraphTimingAnalysis.cpp
   task_timing/TaskGraphTimingIRCodec.cpp
   task_timing/TaskGraphNetworkTiming.cpp

@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/I64ArrayAttrUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RewriteUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphOptimizationAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 
@@ -22,6 +23,7 @@ namespace nn_layer_match = mlir::sculptor::nn_layer_match;
 namespace converter_constant = mlir::sculptor::converter_constant;
 namespace converter_conv = mlir::sculptor::converter_conv;
 namespace i64_array_attr = mlir::sculptor::i64_array_attr;
+namespace optimization_attrs = mlir::sculptor::optimization_attrs;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 
@@ -383,6 +385,38 @@ buildPatchPreparationRegion(mlir::OpBuilder &builder, const Conv2DMatch &match,
       state.loc, mlir::TypeRange{state.patchSequenceTy},
       mlir::ValueRange{match.activation}, task_graph_names::kConvPatchTaskKind,
       builder.getStringAttr("conv2d_patch_sequence"));
+
+  llvm::SmallVector<mlir::NamedAttribute, 8> descriptorFields{
+      builder.getNamedAttr(
+          optimization_attrs::kInputShapeFieldName,
+          builder.getI64ArrayAttr(
+              {state.shape.n, state.shape.c, state.shape.h, state.shape.w})),
+      builder.getNamedAttr(
+          optimization_attrs::kOutputShapeFieldName,
+          builder.getI64ArrayAttr(
+              {state.shape.n, state.shape.f, state.shape.oh, state.shape.ow})),
+      builder.getNamedAttr(
+          optimization_attrs::kKernelShapeFieldName,
+          builder.getI64ArrayAttr({state.shape.kh, state.shape.kw})),
+      builder.getNamedAttr(
+          optimization_attrs::kStrideFieldName,
+          builder.getI64ArrayAttr({state.attrs.strideH, state.attrs.strideW})),
+      builder.getNamedAttr(optimization_attrs::kPaddingFieldName,
+                           builder.getI64ArrayAttr(
+                               {state.attrs.paddingH, state.attrs.paddingW})),
+      builder.getNamedAttr(optimization_attrs::kDilationFieldName,
+                           builder.getI64ArrayAttr(
+                               {state.attrs.dilationH, state.attrs.dilationW})),
+      builder.getNamedAttr(optimization_attrs::kHasBiasFieldName,
+                           builder.getBoolAttr(state.hasBias)),
+  };
+  if (state.hasBias) {
+    ConstantOp biasConstant = match.biasConstant;
+    descriptorFields.push_back(builder.getNamedAttr(
+        optimization_attrs::kBiasFieldName, biasConstant.getValue()));
+  }
+  prepRegion->setAttr(optimization_attrs::kStreamingConvolutionAttrName,
+                      builder.getDictionaryAttr(descriptorFields));
 
   mlir::Block *body = new mlir::Block();
   prepRegion.getBody().push_back(body);

@@ -10,8 +10,11 @@
 #include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <limits>
 #include <optional>
 
 namespace {
@@ -26,6 +29,11 @@ struct ArrayBinding {
     return physicalArrayId == other.physicalArrayId &&
            localArrayId == other.localArrayId;
   }
+};
+
+struct OrderedArrayBinding {
+  unsigned inputIndex;
+  ArrayBinding binding;
 };
 
 bool returnsTaskGraph(mlir::func::FuncOp func) {
@@ -89,6 +97,100 @@ getArrayBinding(mlir::ModuleOp module, mlir::sculptor::TaskCreateOp taskOp) {
   if (mlir::failed(physicalArrayId) || mlir::failed(localArrayId))
     return mlir::failure();
   return ArrayBinding{*physicalArrayId, *localArrayId};
+}
+
+mlir::FailureOr<std::optional<mlir::ArrayAttr>>
+getOrderedArrayBindingsAttr(mlir::ModuleOp module,
+                            mlir::sculptor::TaskCreateOp taskOp) {
+  mlir::FailureOr<mlir::func::FuncOp> callee = lookupTaskCallee(module, taskOp);
+  if (mlir::failed(callee))
+    return mlir::failure();
+
+  auto taskBindings = taskOp->getAttrOfType<mlir::ArrayAttr>(
+      runtime_attrs::kTaskArrayBindingsAttrName);
+  auto calleeBindings = (*callee)->getAttrOfType<mlir::ArrayAttr>(
+      runtime_attrs::kTaskArrayBindingsAttrName);
+  if (taskBindings && calleeBindings && taskBindings != calleeBindings) {
+    return taskOp.emitOpError("expected task and callee '")
+           << (*callee).getSymName() << "' to agree on '"
+           << runtime_attrs::kTaskArrayBindingsAttrName << "'";
+  }
+  if (taskBindings) {
+    if (!calleeBindings)
+      (*callee)->setAttr(runtime_attrs::kTaskArrayBindingsAttrName,
+                         taskBindings);
+    return std::optional<mlir::ArrayAttr>(taskBindings);
+  }
+  if (calleeBindings) {
+    taskOp->setAttr(runtime_attrs::kTaskArrayBindingsAttrName, calleeBindings);
+    return std::optional<mlir::ArrayAttr>(calleeBindings);
+  }
+  return std::optional<mlir::ArrayAttr>();
+}
+
+mlir::FailureOr<llvm::SmallVector<OrderedArrayBinding, 4>>
+parseOrderedArrayBindings(mlir::ModuleOp module,
+                          mlir::sculptor::TaskCreateOp taskOp) {
+  auto bindingsAttr = getOrderedArrayBindingsAttr(module, taskOp);
+  if (mlir::failed(bindingsAttr))
+    return mlir::failure();
+  if (!*bindingsAttr)
+    return llvm::SmallVector<OrderedArrayBinding, 4>{};
+
+  llvm::SmallSet<unsigned, 4> seenInputIndices;
+  llvm::SmallVector<OrderedArrayBinding, 4> bindings;
+  bindings.reserve((**bindingsAttr).size());
+  for (mlir::Attribute attribute : **bindingsAttr) {
+    auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+    if (!dictionary) {
+      return taskOp.emitOpError("expected '")
+             << runtime_attrs::kTaskArrayBindingsAttrName
+             << "' to contain dictionary attributes";
+    }
+    auto inputIndexAttr = dictionary.getAs<mlir::IntegerAttr>(
+        runtime_attrs::kArrayBindingInputIndexFieldName);
+    auto physicalArrayAttr = dictionary.getAs<mlir::IntegerAttr>(
+        runtime_attrs::kArrayBindingPhysicalIdFieldName);
+    auto localArrayAttr = dictionary.getAs<mlir::IntegerAttr>(
+        runtime_attrs::kArrayBindingLocalIdFieldName);
+    if (!inputIndexAttr || !physicalArrayAttr || !localArrayAttr ||
+        inputIndexAttr.getInt() < 0 || physicalArrayAttr.getInt() < 0 ||
+        localArrayAttr.getInt() < 0 ||
+        static_cast<uint64_t>(inputIndexAttr.getInt()) >
+            std::numeric_limits<unsigned>::max()) {
+      return taskOp.emitOpError("expected valid non-negative fields in '")
+             << runtime_attrs::kTaskArrayBindingsAttrName << "'";
+    }
+
+    unsigned inputIndex = static_cast<unsigned>(inputIndexAttr.getInt());
+    if (inputIndex >= taskOp.getInputs().size() ||
+        !isLogicalArrayResource(taskOp.getInputs()[inputIndex])) {
+      return taskOp.emitOpError("array binding input index ")
+             << inputIndex << " does not identify a logical-array input";
+    }
+    if (!seenInputIndices.insert(inputIndex).second) {
+      return taskOp.emitOpError("duplicate array binding for input index ")
+             << inputIndex;
+    }
+    bindings.push_back(
+        OrderedArrayBinding{inputIndex, ArrayBinding{physicalArrayAttr.getInt(),
+                                                     localArrayAttr.getInt()}});
+  }
+
+  llvm::sort(bindings, [](const OrderedArrayBinding &lhs,
+                          const OrderedArrayBinding &rhs) {
+    return lhs.inputIndex < rhs.inputIndex;
+  });
+  return bindings;
+}
+
+const OrderedArrayBinding *
+findOrderedArrayBinding(llvm::ArrayRef<OrderedArrayBinding> bindings,
+                        unsigned inputIndex) {
+  for (const OrderedArrayBinding &binding : bindings)
+    if (binding.inputIndex == inputIndex)
+      return &binding;
+  return nullptr;
 }
 
 bool containsDependency(mlir::ValueRange dependencies, mlir::Value candidate) {
@@ -203,20 +305,31 @@ lowerTaskGraphFunctionABI(mlir::ModuleOp module,
     llvm::SmallVector<mlir::Value, 8> retainedOutputs;
     llvm::SmallVector<mlir::Value, 8> dependencies(taskOp.getDependencies());
     llvm::SmallVector<unsigned, 4> retainedOutputIndices;
-    std::optional<mlir::Value> logicalInputResource;
+    unsigned logicalInputCount =
+        llvm::count_if(taskOp.getInputs(), [](mlir::Value input) {
+          return isLogicalArrayResource(input);
+        });
+    auto orderedBindings = parseOrderedArrayBindings(module, taskOp);
+    if (mlir::failed(orderedBindings))
+      return mlir::failure();
+    if (!orderedBindings->empty() &&
+        orderedBindings->size() != logicalInputCount) {
+      return taskOp.emitOpError("expected '")
+             << runtime_attrs::kTaskArrayBindingsAttrName
+             << "' to contain one entry per logical-array input";
+    }
+    if (logicalInputCount > 1 && orderedBindings->empty()) {
+      return taskOp.emitOpError(
+          "expected ordered array bindings for a task consuming multiple "
+          "logical arrays");
+    }
 
-    for (mlir::Value input : taskOp.getInputs()) {
+    for (auto indexedInput : llvm::enumerate(taskOp.getInputs())) {
+      mlir::Value input = indexedInput.value();
       if (!isLogicalArrayResource(input)) {
         retainedInputs.push_back(input);
         continue;
       }
-
-      if (logicalInputResource && *logicalInputResource != input) {
-        return taskOp.emitOpError(
-            "cannot lower a task that consumes multiple logical arrays with "
-            "one local array binding");
-      }
-      logicalInputResource = input;
 
       auto producerIt = producerByResource.find(input);
       if (producerIt == producerByResource.end()) {
@@ -227,11 +340,26 @@ lowerTaskGraphFunctionABI(mlir::ModuleOp module,
 
       mlir::FailureOr<ArrayBinding> producerBinding =
           getArrayBinding(module, producerIt->second);
-      mlir::FailureOr<ArrayBinding> consumerBinding =
-          getArrayBinding(module, taskOp);
-      if (mlir::failed(producerBinding) || mlir::failed(consumerBinding))
+      if (mlir::failed(producerBinding))
         return mlir::failure();
-      if (!(*producerBinding == *consumerBinding)) {
+
+      ArrayBinding consumerBinding;
+      if (orderedBindings->empty()) {
+        auto scalarBinding = getArrayBinding(module, taskOp);
+        if (mlir::failed(scalarBinding))
+          return mlir::failure();
+        consumerBinding = *scalarBinding;
+      } else {
+        const OrderedArrayBinding *orderedBinding =
+            findOrderedArrayBinding(*orderedBindings, indexedInput.index());
+        if (!orderedBinding) {
+          return taskOp.emitOpError(
+                     "missing ordered array binding for logical input ")
+                 << indexedInput.index();
+        }
+        consumerBinding = orderedBinding->binding;
+      }
+      if (!(*producerBinding == consumerBinding)) {
         return taskOp.emitOpError(
             "expected logical array producer and consumer to share the same "
             "physical and local array binding");
@@ -261,6 +389,13 @@ lowerTaskGraphFunctionABI(mlir::ModuleOp module,
     taskOp.getInputsMutable().assign(retainedInputs);
     taskOp.getOutputsMutable().assign(retainedOutputs);
     taskOp.getDependenciesMutable().assign(dependencies);
+    if (!orderedBindings->empty()) {
+      taskOp->removeAttr(runtime_attrs::kTaskArrayBindingsAttrName);
+      auto callee = lookupTaskCallee(module, taskOp);
+      if (mlir::failed(callee))
+        return mlir::failure();
+      (*callee)->removeAttr(runtime_attrs::kTaskArrayBindingsAttrName);
+    }
 
     if (convertedResultIndices->empty()) {
       taskOp->removeAttr(runtime_attrs::kTaskResultIndicesAttrName);

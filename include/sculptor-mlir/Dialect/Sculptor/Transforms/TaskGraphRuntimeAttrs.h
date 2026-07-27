@@ -47,6 +47,22 @@ inline constexpr llvm::StringLiteral kTaskDigitalOpsAttrName(
     "sculptor.runtime.digital_ops");
 inline constexpr llvm::StringLiteral kTaskAnalogExecutionCountAttrName(
     "sculptor.runtime.analog_execution_count");
+inline constexpr llvm::StringLiteral kTaskAnalogExecutionCountsAttrName(
+    "sculptor.runtime.analog_execution_counts");
+inline constexpr llvm::StringLiteral kTaskAnalogLoadBytesAttrName(
+    "sculptor.runtime.analog_load_bytes");
+inline constexpr llvm::StringLiteral kTaskAnalogStoreBytesAttrName(
+    "sculptor.runtime.analog_store_bytes");
+inline constexpr llvm::StringLiteral kTaskArrayBindingsAttrName(
+    "sculptor.runtime.array_bindings");
+inline constexpr llvm::StringLiteral kArrayBindingIndexAttrName(
+    "sculptor.runtime.array_binding_index");
+inline constexpr llvm::StringLiteral kArrayBindingInputIndexFieldName(
+    "input_index");
+inline constexpr llvm::StringLiteral kArrayBindingPhysicalIdFieldName(
+    "physical_array_id");
+inline constexpr llvm::StringLiteral kArrayBindingLocalIdFieldName(
+    "local_array_id");
 inline constexpr llvm::StringLiteral kTaskInputSlotsAttrName(
     "sculptor.runtime.input_slots");
 inline constexpr llvm::StringLiteral kTaskOutputSlotsAttrName(

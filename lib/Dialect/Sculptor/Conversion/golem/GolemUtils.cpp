@@ -179,11 +179,24 @@ void emitShimCall(PatternRewriter &rewriter, Location loc,
 }
 
 FailureOr<int64_t> getRequiredLocalArrayId(Operation *op) {
+  auto localArrayAttr =
+      op->getAttrOfType<IntegerAttr>(runtime_attrs::kTaskLocalArrayIdAttrName);
+  if (localArrayAttr) {
+    int64_t localArrayId = localArrayAttr.getInt();
+    if (localArrayId < 0 ||
+        localArrayId > std::numeric_limits<int32_t>::max()) {
+      return op->emitError("expected runtime attr '")
+             << runtime_attrs::kTaskLocalArrayIdAttrName
+             << "' to be a non-negative 32-bit integer";
+    }
+    return localArrayId;
+  }
+
   auto func = op->getParentOfType<func::FuncOp>();
   if (!func)
     return op->emitError("expected analog array op to be inside a func.func");
 
-  auto localArrayAttr = func->getAttrOfType<IntegerAttr>(
+  localArrayAttr = func->getAttrOfType<IntegerAttr>(
       runtime_attrs::kTaskLocalArrayIdAttrName);
   if (!localArrayAttr) {
     return op->emitError("expected enclosing task function '")
