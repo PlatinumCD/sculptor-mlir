@@ -88,6 +88,10 @@ isolated scheduled core graphs.
 4. `sculptor-schedule-task-graph`
    Consumes the prebuilt islands, assigns cores and arrays, and records transfer
    metadata and the placement score without changing graph topology.
+   `sculptor-lower-scheduled-mvm-to-digital` may be inserted immediately after
+   this pass to create a controlled digital-compute baseline. It preserves the
+   scheduled task graph and replaces only the analog tile implementations with
+   padded, tiled `linalg.matmul_transpose_b` operations.
    `sculptor-optimize-task-graph` may then apply selected
    placement-preserving graph rewrites before generic fusion. Its
    `streaming-convolution` pattern replaces a co-located patch/MVM/recombine
@@ -138,6 +142,7 @@ task or a cross-core tensor route.
 | `sculptor-build-task-graph-islands` | An assembled task graph. | Placement-island members annotated with stable logical island IDs. |
 | `sculptor-analyze-task-graph-timing` | An island-annotated task graph. | Task-level execution order and latency metadata plus graph critical-path and island-work summaries. |
 | `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
+| `sculptor-lower-scheduled-mvm-to-digital` | A scheduled, unfinalized Golem task graph. | A placement-preserving digital baseline: analog MVM task bodies become tiled `linalg.matmul_transpose_b` operations while core assignments, islands, tensor communication, setup dependencies, and physical tile geometry remain fixed. |
 | `sculptor-optimize-task-graph` | A scheduled, unfinalized task graph plus an optional comma-separated pattern list. | A placement-preserving optimized graph with structural metadata refreshed and stale timing metadata removed. The initial `streaming-convolution` pattern eliminates full im2col resources for eligible co-located convolutions. |
 | `sculptor-fuse-task-graph` | A scheduled task graph with island and core assignments. | Same-island, same-core components outlined as fused task routines. |
 | `sculptor-lower-golem-to-llvm-shims` | Scheduled task functions and graph resources containing logical-array operations. | Calls to LLVM-callable Golem runtime shims plus a task graph whose executable array identity is represented by physical bindings and setup dependencies; the logical-to-physical schedule map remains as reporting metadata. |

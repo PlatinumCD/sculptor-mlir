@@ -13,6 +13,7 @@ add_mlir_library(MLIRSculptorTransforms
   ExtractLayers.cpp
   FinalizeTaskGraphResources.cpp
   FuseTaskGraph.cpp
+  LowerScheduledMVMToDigital.cpp
   MaterializeTasks.cpp
   OptimizeTaskGraph.cpp
   PartitionTaskGraphByCore.cpp

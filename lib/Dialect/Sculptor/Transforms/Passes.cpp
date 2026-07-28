@@ -13,6 +13,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/LowerScheduledMVMToDigital.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/OptimizeTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
@@ -37,6 +38,7 @@ void registerSculptorPasses() {
   registerExtractLayersPass();
   registerFinalizeTaskGraphResourcesPass();
   registerFuseTaskGraphPass();
+  registerLowerScheduledMVMToDigitalPass();
   registerMaterializeTasksPass();
   registerOptimizeTaskGraphPass();
   registerPartitionTaskGraphByCorePass();

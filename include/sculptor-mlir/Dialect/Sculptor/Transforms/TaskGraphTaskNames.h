@@ -27,6 +27,7 @@ inline constexpr llvm::StringLiteral kBiasAddTaskKind("digital.bias_add");
 inline constexpr llvm::StringLiteral kReductionTaskKind("digital.reduction");
 inline constexpr llvm::StringLiteral
     kStreamingConvolutionTaskKind("mixed.streaming_conv_mvm");
+inline constexpr llvm::StringLiteral kDigitalMatmulTaskKind("digital.matmul");
 
 inline constexpr llvm::StringLiteral kForwardSourceLayer("forward");
 
