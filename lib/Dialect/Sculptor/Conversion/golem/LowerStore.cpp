@@ -101,8 +101,6 @@ public:
               loopLoc, value, outputMemref, mlir::ValueRange{c0, laneIndex});
           builder.create<mlir::scf::YieldOp>(loopLoc);
         });
-    rewriter.create<mlir::memref::DeallocOp>(loc, scratch);
-
     auto tensor = rewriter.create<mlir::bufferization::ToTensorOp>(
         loc, outputType, outputMemref, /*restrict=*/true, /*writable=*/true);
     rewriter.replaceOp(op, tensor.getResult());

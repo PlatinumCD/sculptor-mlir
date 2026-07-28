@@ -1018,7 +1018,9 @@ python3 linear_example.py --mode mlir |
     --cse \
     --empty-tensor-to-alloc-tensor \
     --one-shot-bufferize='bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map' \
+    --buffer-deallocation-pipeline \
     --convert-bufferization-to-memref \
+    --optimize-allocation-liveness \
     --convert-linalg-to-loops \
     --lower-affine \
     --convert-scf-to-cf \
@@ -1038,6 +1040,12 @@ The full output is much larger than the previous stage because memref
 descriptors, allocation logic, loops, constants, and C interface wrappers are
 expanded into LLVM dialect. The important shape is visible in these real output
 snippets.
+
+`--buffer-deallocation-pipeline` is required after one-shot bufferization.
+When allocation hoisting is enabled, run `--buffer-hoisting` and
+`--buffer-loop-hoisting` before the deallocation pipeline. Hoisting only moves
+allocations; running it after deallocation can separate a loop-local allocation
+from its matching free.
 
 The module now contains LLVM dialect declarations for allocation, constants, and
 the Golem shim ABI:
@@ -1141,7 +1149,9 @@ python3 linear_example.py --mode mlir |
     --cse \
     --empty-tensor-to-alloc-tensor \
     --one-shot-bufferize='bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map' \
+    --buffer-deallocation-pipeline \
     --convert-bufferization-to-memref \
+    --optimize-allocation-liveness \
     --convert-linalg-to-loops \
     --lower-affine \
     --convert-scf-to-cf \

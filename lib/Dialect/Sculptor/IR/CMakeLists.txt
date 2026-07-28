@@ -14,5 +14,6 @@ add_mlir_dialect_library(SculptorIR
 
   LINK_LIBS PUBLIC
   MLIRIR
+  MLIRSideEffectInterfaces
   MLIRSupport
 )

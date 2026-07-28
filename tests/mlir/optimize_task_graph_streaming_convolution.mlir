@@ -1,7 +1,10 @@
 // RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph="patterns=streaming-convolution require-change=true" --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing | FileCheck %s --check-prefix=STREAM --implicit-check-not="tensor<9x9xf32>" --implicit-check-not="task_kind = \"digital.conv_patch\"" --implicit-check-not="task_kind = \"sculptor.conv_tile_mvm\"" --implicit-check-not="task_kind = \"digital.tile_recombine\"" --implicit-check-not="task_kind = \"digital.bias_add\""
 // RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --check-prefix=SHIM --implicit-check-not="!sculptor.logical.array" --implicit-check-not="sculptor.array." --implicit-check-not=memref<1x1x1xf32>
 // RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core --sculptor-extract-core-module="core-id=0" --sculptor-finalize-task-graph-resources -o %t.core.mlir
-// RUN: sculptor-mlir-opt %t.core.mlir --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --convert-bufferization-to-memref --convert-linalg-to-loops --lower-affine --convert-scf-to-cf --convert-math-to-llvm --expand-strided-metadata --lower-affine --convert-arith-to-llvm --convert-index-to-llvm --convert-cf-to-llvm --finalize-memref-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts -o %t.llvm.mlir
+// RUN: sculptor-mlir-opt %t.core.mlir --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --buffer-deallocation-pipeline --convert-bufferization-to-memref --optimize-allocation-liveness -o %t.deallocated.mlir
+// RUN: sculptor-mlir-opt %t.deallocated.mlir | FileCheck %s --check-prefix=DEALLOC
+// RUN: sculptor-mlir-opt %t.core.mlir --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --convert-bufferization-to-memref --buffer-hoisting --buffer-loop-hoisting --buffer-deallocation-pipeline --optimize-allocation-liveness | FileCheck %s --check-prefix=HOIST
+// RUN: sculptor-mlir-opt %t.deallocated.mlir --convert-linalg-to-loops --lower-affine --convert-scf-to-cf --convert-math-to-llvm --expand-strided-metadata --lower-affine --convert-arith-to-llvm --convert-index-to-llvm --convert-cf-to-llvm --finalize-memref-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts -o %t.llvm.mlir
 // RUN: sculptor-mlir-opt %t.llvm.mlir --sculptor-emit-golem-tile-abi --sculptor-finalize-golem-intrinsics | mlir-translate --mlir-to-llvmir > /dev/null
 // RUN: not sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=3 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=3 schedule=snake" --sculptor-optimize-task-graph="require-change=true" 2>&1 | FileCheck %s --check-prefix=DISTRIBUTED
 
@@ -87,6 +90,38 @@ module {
 // SHIM: call @golem_analog_mvm_store
 // SHIM: memref.alloc() {alignment = 64 : i64} : memref<1x1x4xf32>
 // SHIM: call @golem_analog_mvm_store
+
+// DEALLOC-LABEL: func.func private @task_conv2d_bias_matrix_tile_0_0_0()
+// DEALLOC: %[[SETUP:.*]] = memref.alloc() {{.*}} : memref<4x4xf32>
+// DEALLOC: call @golem_analog_mvm_set(%[[SETUP]],
+// DEALLOC-NEXT: memref.dealloc %[[SETUP]] : memref<4x4xf32>
+// DEALLOC-LABEL: func.func private @task_conv2d_bias_streaming_conv_mvm(
+// DEALLOC: %[[OUTPUT:.*]] = memref.alloc() {{.*}} : memref<1x1x3x3xf32>
+// DEALLOC: scf.for
+// DEALLOC: %[[PATCH:.*]] = memref.alloc() {{.*}} : memref<1x4xf32>
+// DEALLOC: func.call @golem_analog_mvm_load(%[[PATCH]],
+// DEALLOC-NEXT: memref.dealloc %[[PATCH]] : memref<1x4xf32>
+// DEALLOC: %[[LOGICAL:.*]] = memref.alloc() : memref<1x1xf32>
+// DEALLOC: %[[SCRATCH:.*]] = memref.alloc() {{.*}} : memref<1x1x4xf32>
+// DEALLOC: func.call @golem_analog_mvm_store
+// DEALLOC: memref.dealloc %[[SCRATCH]] : memref<1x1x4xf32>
+// DEALLOC: memref.dealloc %[[LOGICAL]] : memref<1x1xf32>
+// DEALLOC-NOT: memref.dealloc %[[OUTPUT]] : memref<1x1x3x3xf32>
+// DEALLOC: return %[[OUTPUT]] : memref<1x1x3x3xf32>
+
+// HOIST-LABEL: func.func private @task_conv2d_bias_streaming_conv_mvm(
+// HOIST: %[[OUTPUT:.*]] = memref.alloc() {{.*}} : memref<1x1x3x3xf32>
+// HOIST: %[[PATCH:.*]] = memref.alloc() {{.*}} : memref<1x4xf32>
+// HOIST: %[[SCRATCH:.*]] = memref.alloc() {{.*}} : memref<1x1x4xf32>
+// HOIST: scf.for
+// HOIST: func.call @golem_analog_mvm_load(%[[PATCH]],
+// HOIST: func.call @golem_analog_mvm_store
+// HOIST-NOT: memref.dealloc %[[PATCH]] : memref<1x4xf32>
+// HOIST: }
+// HOIST: memref.dealloc %[[SCRATCH]] : memref<1x1x4xf32>
+// HOIST: memref.dealloc %[[PATCH]] : memref<1x4xf32>
+// HOIST-NOT: memref.dealloc %[[OUTPUT]] : memref<1x1x3x3xf32>
+// HOIST: return %[[OUTPUT]] : memref<1x1x3x3xf32>
 
 // DISTRIBUTED: error: no selected task-graph optimization pattern applied
 

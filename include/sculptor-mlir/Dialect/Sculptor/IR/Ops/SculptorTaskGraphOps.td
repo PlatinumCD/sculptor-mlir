@@ -3,6 +3,7 @@
 
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 include "sculptor-mlir/Dialect/Sculptor/IR/SculptorBase.td"
 include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.td"
@@ -13,7 +14,7 @@ include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.td"
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphCreateOp
-  : Sculptor_Op<"task_graph.create"> {
+  : Sculptor_Op<"task_graph.create", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create an analog task graph handle";
 
@@ -32,7 +33,7 @@ def Sculptor_TaskGraphCreateOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphInputOp
-  : Sculptor_Op<"task_graph.input"> {
+  : Sculptor_Op<"task_graph.input", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create a graph input resource handle";
 
@@ -55,7 +56,7 @@ def Sculptor_TaskGraphInputOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphOutputOp
-  : Sculptor_Op<"task_graph.output"> {
+  : Sculptor_Op<"task_graph.output", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create a graph output resource handle";
 
@@ -78,7 +79,7 @@ def Sculptor_TaskGraphOutputOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphIntermediateOp
-  : Sculptor_Op<"task_graph.intermediate"> {
+  : Sculptor_Op<"task_graph.intermediate", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create an internal graph intermediate resource handle";
 
@@ -101,7 +102,7 @@ def Sculptor_TaskGraphIntermediateOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphPersistentOp
-  : Sculptor_Op<"task_graph.persistent"> {
+  : Sculptor_Op<"task_graph.persistent", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create a graph persistent resource handle";
 
@@ -124,7 +125,7 @@ def Sculptor_TaskGraphPersistentOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphRouteInputOp
-  : Sculptor_Op<"task_graph.route_input"> {
+  : Sculptor_Op<"task_graph.route_input", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create an incoming cross-core route resource handle";
 
@@ -149,7 +150,7 @@ def Sculptor_TaskGraphRouteInputOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskGraphRouteOutputOp
-  : Sculptor_Op<"task_graph.route_output"> {
+  : Sculptor_Op<"task_graph.route_output", [MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create an outgoing cross-core route resource handle";
 
@@ -174,7 +175,8 @@ def Sculptor_TaskGraphRouteOutputOp
 //===----------------------------------------------------------------------===//
 
 def Sculptor_TaskCreateOp
-  : Sculptor_Op<"task.create"> {
+  : Sculptor_Op<"task.create",
+                [AttrSizedOperandSegments, MemoryEffects<[MemWrite]>]> {
 
   let summary = "Create a task in an analog task graph";
 
@@ -202,8 +204,6 @@ def Sculptor_TaskCreateOp
   );
 
   let hasVerifier = 1;
-  let traits = [AttrSizedOperandSegments];
-
   let assemblyFormat = [{
     $graph `,` $callee `,` `domain` `=` $domain `,`
     `task_kind` `=` $taskKind `,`
