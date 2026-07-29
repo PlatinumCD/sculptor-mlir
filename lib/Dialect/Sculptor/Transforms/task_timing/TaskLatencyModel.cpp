@@ -115,7 +115,7 @@ estimateStreamingConvolutionLatency(sculptor::TaskCreateOp taskOp,
 
 FailureOr<TaskLatencyEstimate>
 estimateTaskLatency(sculptor::TaskCreateOp taskOp, int64_t digitalOps,
-                    const TimingModel &model) {
+                    const TimingModel &model, MVMCostMode mvmCostMode) {
   if (taskOp.getTaskKind() == "mixed.fused") {
     auto load = taskOp->getAttrOfType<FloatAttr>(
         timing_attrs::kAnalogLoadLatencyNsAttrName);
@@ -130,6 +130,15 @@ estimateTaskLatency(sculptor::TaskCreateOp taskOp, int64_t digitalOps,
           load.getValueAsDouble(), execute.getValueAsDouble(),
           store.getValueAsDouble(), intrinsic.getValueAsDouble()};
     }
+  }
+
+  if (mvmCostMode == MVMCostMode::Digital &&
+      (task_graph::isAnalogComputeTask(taskOp) ||
+       taskOp.getTaskKind() ==
+           task_graph_names::kStreamingConvolutionTaskKind)) {
+    TaskLatencyEstimate estimate;
+    estimate.intrinsicLatencyNs = computeDigitalLatencyNs(digitalOps, model);
+    return estimate;
   }
 
   if (taskOp.getTaskKind() == task_graph_names::kStreamingConvolutionTaskKind)

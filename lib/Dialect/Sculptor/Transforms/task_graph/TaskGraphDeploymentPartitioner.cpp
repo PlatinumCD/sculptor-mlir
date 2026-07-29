@@ -684,6 +684,10 @@ void copyCoreGraphAttrs(func::FuncOp source, func::FuncOp target) {
       schedule_attrs::kMeshColsAttrName,
       schedule_attrs::kNumAnalogArraysAttrName,
       schedule_attrs::kAnalogArraysAttrName,
+      schedule_attrs::kPlacementCostModeAttrName,
+      schedule_attrs::kPredictedMakespanNsAttrName,
+      schedule_attrs::kCriticalCommunicationNsAttrName,
+      schedule_attrs::kMaximumResourceWorkNsAttrName,
       "sculptor.timing.model",
   };
   for (StringRef name : coreGraphAttrs) {

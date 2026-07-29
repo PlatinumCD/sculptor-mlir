@@ -332,8 +332,14 @@ buildFinalPlacementPlan(const TimingPlacementState &state,
   for (const greedy::IslandPlacement &placement : placements)
     physicalArrayByIsland[placement.island] = placement.physicalArrayId;
 
-  return task_schedulers::buildPlacementPlanFromAnalogPlacements(
+  auto plan = task_schedulers::buildPlacementPlanFromAnalogPlacements(
       context.problem, context.placementResources, physicalArrayByIsland);
+  if (mlir::failed(plan))
+    return mlir::failure();
+  plan->timingObjective = task_schedulers::TimingPlacementObjective{
+      state.score.predictedMakespanNs, state.score.criticalCommunicationNs,
+      state.score.maximumResourceWorkNs};
+  return plan;
 }
 
 } // namespace

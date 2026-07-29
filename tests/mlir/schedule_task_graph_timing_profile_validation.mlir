@@ -6,8 +6,10 @@ module {
     sculptor.timing.island_edges = [],
     sculptor.timing.islands = [#sculptor.island_timing<islandId = 0 : i64, taskCount = 0 : i64, totalWorkNs = 0.000000e+00 : f64, analogWorkNs = 0.000000e+00 : f64, digitalWorkNs = 0.000000e+00 : f64, earliestStartNs = 0.000000e+00 : f64, earliestFinishNs = 0.000000e+00 : f64, criticalPathRemainingNs = 0.000000e+00 : f64, slackNs = 0.000000e+00 : f64, isCritical = false>],
     sculptor.timing.model = #sculptor.timing_model<analogMVMLatencyNs = 100 : i64, analogIOBitsPerCycle = 256 : i64, analogIOShared = true, digitalClockGHz = 1.000000e+00 : f64, digitalIssueWidth = 2 : i64, digitalVectorBitsPerCycle = 256 : i64, networkLinkBitsPerCycle = 32 : i64, networkHopLatencyCycles = 1 : i64, networkPipelined = true>,
+    sculptor.timing.mvm_cost_mode = "analog",
     sculptor.timing.placement_aware = false,
-    sculptor.timing.task_count = 0 : i64
+    sculptor.timing.task_count = 0 : i64,
+    sculptor.timing.total_digital_replacement_ops = 0 : i64
   } {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
     return %graph : !sculptor.task_graph

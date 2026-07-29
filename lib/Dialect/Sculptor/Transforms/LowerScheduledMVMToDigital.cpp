@@ -7,9 +7,10 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphCleanup.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDigitalOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -38,7 +39,6 @@ namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_attrs = mlir::sculptor::task_attrs;
 namespace task_graph = mlir::sculptor::task_graph;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
-namespace tiling_attrs = mlir::sculptor::tiling_attrs;
 
 struct MatrixSetup {
   mlir::sculptor::TaskCreateOp task;
@@ -75,12 +75,6 @@ static bool isLogicalArrayType(mlir::Type type) {
   auto resourceType = mlir::dyn_cast<mlir::sculptor::TaskResourceType>(type);
   return resourceType && mlir::isa<mlir::sculptor::LogicalArrayType>(
                              resourceType.getValueType());
-}
-
-static mlir::Type getTaskResourceValueType(mlir::Value resource) {
-  auto resourceType =
-      mlir::dyn_cast<mlir::sculptor::TaskResourceType>(resource.getType());
-  return resourceType ? resourceType.getValueType() : mlir::Type{};
 }
 
 static mlir::FailureOr<mlir::RankedTensorType>
@@ -163,43 +157,6 @@ getSetupWeight(mlir::sculptor::TaskCreateOp task, mlir::func::FuncOp callee) {
   return std::make_pair(*weightType, value);
 }
 
-static mlir::FailureOr<int64_t>
-getRequiredI64Attr(mlir::Operation *metadataOwner,
-                   mlir::Operation *diagnosticAnchor, llvm::StringRef name,
-                   llvm::StringRef description) {
-  auto attr = metadataOwner->getAttrOfType<mlir::IntegerAttr>(name);
-  if (!attr) {
-    diagnosticAnchor->emitError("expected ")
-        << description << " attribute '" << name << "'";
-    return mlir::failure();
-  }
-  return attr.getInt();
-}
-
-static mlir::FailureOr<int64_t> computeDigitalOps(mlir::Operation *anchor,
-                                                  int64_t rows,
-                                                  int64_t outputColumns,
-                                                  int64_t reductionWidth) {
-  std::optional<int64_t> outputElements = llvm::checkedMul(rows, outputColumns);
-  if (!outputElements) {
-    anchor->emitError("digital matmul operation count overflow");
-    return mlir::failure();
-  }
-  std::optional<int64_t> multiplyAccumulates =
-      llvm::checkedMul(*outputElements, reductionWidth);
-  if (!multiplyAccumulates) {
-    anchor->emitError("digital matmul operation count overflow");
-    return mlir::failure();
-  }
-  std::optional<int64_t> scalarOps =
-      llvm::checkedMul(*multiplyAccumulates, int64_t{2});
-  if (!scalarOps) {
-    anchor->emitError("digital matmul operation count overflow");
-    return mlir::failure();
-  }
-  return *scalarOps;
-}
-
 static mlir::LogicalResult verifyUnfinalized(mlir::func::FuncOp taskGraphFunc) {
   if (taskGraphFunc->hasAttr(runtime_attrs::kTaskGraphResourceCountAttrName)) {
     return taskGraphFunc.emitError(
@@ -275,34 +232,18 @@ collectMatrixSetups(mlir::ModuleOp module, mlir::func::FuncOp taskGraphFunc) {
 static mlir::FailureOr<DigitalMVM>
 matchDigitalMVM(mlir::ModuleOp module, mlir::sculptor::TaskCreateOp task,
                 llvm::ArrayRef<MatrixSetup> setups,
-                const llvm::DenseMap<mlir::Value, unsigned> &setupByResource) {
-  auto callee = lookupTaskCallee(module, task);
-  if (mlir::failed(callee))
+                const llvm::DenseMap<mlir::Operation *, unsigned> &setupByTask,
+                const task_graph::ResourceProducerMap &producerByResource) {
+  auto geometry = task_graph::resolveDigitalMatmulGeometry(module, task,
+                                                           producerByResource);
+  if (mlir::failed(geometry))
     return mlir::failure();
-  auto coreId = getScheduledCore(task, *callee);
+  auto coreId = getScheduledCore(task, geometry->mvmCallee);
   if (mlir::failed(coreId))
     return mlir::failure();
 
-  unsigned logicalInputIndex = 0;
-  unsigned logicalInputCount = 0;
-  llvm::SmallVector<unsigned, 2> retainedInputIndices;
-  for (auto indexedInput : llvm::enumerate(task.getInputs())) {
-    if (isLogicalArrayType(indexedInput.value().getType())) {
-      logicalInputIndex = indexedInput.index();
-      ++logicalInputCount;
-    } else {
-      retainedInputIndices.push_back(indexedInput.index());
-    }
-  }
-  if (logicalInputCount != 1 || retainedInputIndices.size() != 1 ||
-      task.getOutputs().size() != 1) {
-    return task.emitOpError(
-        "expected a scheduled MVM task to have one tensor input, one "
-        "logical-array input, and one tensor output");
-  }
-
-  auto setupIt = setupByResource.find(task.getInputs()[logicalInputIndex]);
-  if (setupIt == setupByResource.end()) {
+  auto setupIt = setupByTask.find(geometry->matrixSetupTask.getOperation());
+  if (setupIt == setupByTask.end()) {
     return task.emitOpError(
         "expected logical-array input to be produced by a matrix-setup task");
   }
@@ -312,98 +253,42 @@ matchDigitalMVM(mlir::ModuleOp module, mlir::sculptor::TaskCreateOp task,
         "expected MVM and matrix-setup tasks to occupy the same core");
   }
 
-  if ((*callee).getNumArguments() != task.getInputs().size() ||
-      (*callee).getNumResults() != task.getOutputs().size() ||
-      logicalInputIndex >= (*callee).getNumArguments() ||
-      !isLogicalArrayType((*callee).getArgument(logicalInputIndex).getType())) {
-    return task.emitOpError(
-        "expected MVM task resources to match its callee signature");
-  }
-
-  unsigned vectorInputIndex = retainedInputIndices.front();
-  auto vectorType = getStaticRank2F32Tensor(
-      getTaskResourceValueType(task.getInputs()[vectorInputIndex]), task,
-      "MVM vector input resource");
-  auto resultType = getStaticRank2F32Tensor(
-      getTaskResourceValueType(task.getOutputs().front()), task,
-      "MVM result resource");
-  if (mlir::failed(vectorType) || mlir::failed(resultType))
+  auto replacementOps = task_graph::computeDigitalMatmulScalarOps(
+      task, geometry->executionRows, geometry->physicalRows,
+      geometry->physicalColumns);
+  auto existingDigitalOps = task_graph::estimateTaskDigitalOps(module, task);
+  if (mlir::failed(replacementOps) || mlir::failed(existingDigitalOps))
     return mlir::failure();
-  if ((*callee).getArgument(vectorInputIndex).getType() != *vectorType ||
-      (*callee).getResultTypes().front() != *resultType) {
-    return task.emitOpError(
-        "expected MVM callee tensor types to match task resources");
-  }
-
-  int64_t physicalRows = setup.weightType.getDimSize(0);
-  int64_t physicalCols = setup.weightType.getDimSize(1);
-  int64_t executionRows = (*vectorType).getDimSize(0);
-  int64_t validRows = (*resultType).getDimSize(1);
-  if ((*resultType).getDimSize(0) != executionRows || validRows <= 0 ||
-      validRows > physicalRows) {
-    return task.emitOpError(
-        "expected MVM result shape to fit the physical weight rows");
-  }
-
-  bool needsVectorTileExtraction =
-      task.getTaskKind() == task_graph_names::kConvTileMVMTaskKind;
-  int64_t vectorTile = 0;
-  int64_t validCols = physicalCols;
-  if (needsVectorTileExtraction) {
-    auto vectorTileValue =
-        getRequiredI64Attr(*callee, task, tiling_attrs::kVectorTileAttrName,
-                           "convolution MVM vector tile");
-    auto validColsValue = getRequiredI64Attr(
-        *callee, task, tiling_attrs::kVectorTileValidColsAttrName,
-        "convolution MVM valid column count");
-    auto physicalColsValue = getRequiredI64Attr(
-        *callee, task, tiling_attrs::kVectorTilePhysicalColsAttrName,
-        "convolution MVM physical column count");
-    if (mlir::failed(vectorTileValue) || mlir::failed(validColsValue) ||
-        mlir::failed(physicalColsValue))
-      return mlir::failure();
-    vectorTile = *vectorTileValue;
-    validCols = *validColsValue;
-    int64_t sourceCols = (*vectorType).getDimSize(1);
-    if (vectorTile < 0 || validCols <= 0 || validCols > physicalCols ||
-        *physicalColsValue != physicalCols ||
-        vectorTile > (std::numeric_limits<int64_t>::max() / physicalCols) ||
-        vectorTile * physicalCols > sourceCols - validCols) {
-      return task.emitOpError("invalid convolution MVM vector tile geometry");
-    }
-  } else if ((*vectorType).getDimSize(1) != physicalCols) {
-    return task.emitOpError(
-        "expected MVM vector width to equal physical weight columns");
-  }
-
-  auto digitalOps =
-      computeDigitalOps(task, executionRows, physicalRows, physicalCols);
-  if (mlir::failed(digitalOps))
-    return mlir::failure();
+  std::optional<int64_t> digitalOps =
+      llvm::checkedAdd(*existingDigitalOps, *replacementOps);
+  if (!digitalOps)
+    return task.emitOpError("digital operation count overflow");
 
   bool hasArrayLoad = false;
   bool hasArrayExecute = false;
   bool hasArrayStore = false;
-  (*callee).walk([&](mlir::sculptor::ArrayLoadOp) { hasArrayLoad = true; });
-  (*callee).walk(
+  geometry->mvmCallee.walk(
+      [&](mlir::sculptor::ArrayLoadOp) { hasArrayLoad = true; });
+  geometry->mvmCallee.walk(
       [&](mlir::sculptor::ArrayExecuteOp) { hasArrayExecute = true; });
-  (*callee).walk([&](mlir::sculptor::ArrayStoreOp) { hasArrayStore = true; });
+  geometry->mvmCallee.walk(
+      [&](mlir::sculptor::ArrayStoreOp) { hasArrayStore = true; });
   if (!hasArrayLoad || !hasArrayExecute || !hasArrayStore) {
     return task.emitOpError(
         "expected scheduled MVM callee to contain load, execute, and store");
   }
 
   return DigitalMVM{task,
-                    *callee,
+                    geometry->mvmCallee,
                     setupIt->second,
-                    logicalInputIndex,
-                    *vectorType,
-                    *resultType,
+                    geometry->logicalArrayInputIndex,
+                    geometry->inputType,
+                    geometry->resultType,
                     *coreId,
                     *digitalOps,
-                    needsVectorTileExtraction,
-                    vectorTile,
-                    validCols};
+                    geometry->needsVectorTileExtraction,
+                    geometry->vectorTile,
+                    geometry->validColumns};
 }
 
 static llvm::SmallVector<mlir::OpFoldResult>
@@ -695,14 +580,22 @@ static mlir::LogicalResult lowerTaskGraphMVMs(mlir::ModuleOp module,
   if (mlir::failed(setups))
     return mlir::failure();
 
-  llvm::DenseMap<mlir::Value, unsigned> setupByResource;
+  auto dag = task_graph::parseTaskGraphDAG(taskGraphFunc);
+  if (mlir::failed(dag))
+    return mlir::failure();
+  task_graph::ResourceProducerMap producerByResource;
+  if (mlir::failed(
+          task_graph::collectResourceProducers(*dag, producerByResource)))
+    return mlir::failure();
+
+  llvm::DenseMap<mlir::Operation *, unsigned> setupByTask;
   for (auto indexedSetup : llvm::enumerate(*setups)) {
-    if (!setupByResource
-             .try_emplace(indexedSetup.value().logicalResource,
+    if (!setupByTask
+             .try_emplace(indexedSetup.value().task.getOperation(),
                           indexedSetup.index())
              .second) {
       return indexedSetup.value().task.emitOpError(
-          "duplicate matrix-setup producer for one logical array");
+          "duplicate matrix-setup task");
     }
   }
 
@@ -712,7 +605,8 @@ static mlir::LogicalResult lowerTaskGraphMVMs(mlir::ModuleOp module,
        taskGraphFunc.getOps<mlir::sculptor::TaskCreateOp>()) {
     if (!task_graph::isAnalogComputeTask(task))
       continue;
-    auto mvm = matchDigitalMVM(module, task, *setups, setupByResource);
+    auto mvm =
+        matchDigitalMVM(module, task, *setups, setupByTask, producerByResource);
     if (mlir::failed(mvm))
       return mlir::failure();
     if (!seenMVMCallees.insert(mvm->callee.getOperation()).second) {

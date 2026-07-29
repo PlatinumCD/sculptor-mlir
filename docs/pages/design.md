@@ -83,11 +83,15 @@ isolated scheduled core graphs.
 3. `sculptor-analyze-task-graph-timing`
    Combines explicit task dependencies with resource producer-consumer edges,
    validates the resulting execution DAG, and attaches timing metadata used by
-   `greedy-timing` and preserved for post-fusion reporting. Standalone ordinary
-   schedulers do not require this pass before scheduling.
+   `greedy-timing`. Its `mvm-cost-mode=analog|digital` option selects the
+   placement cost model without changing tasks, dependencies, islands, or
+   logical arrays. Standalone ordinary schedulers do not require this pass
+   before scheduling.
 4. `sculptor-schedule-task-graph`
    Consumes the prebuilt islands, assigns cores and arrays, and records transfer
-   metadata and the placement score without changing graph topology.
+   metadata and the placement score without changing graph topology. A
+   timing-aware schedule retains its cost model in
+   `sculptor.schedule.placement_cost_mode`.
    `sculptor-lower-scheduled-mvm-to-digital` may be inserted immediately after
    this pass to create a controlled digital-compute baseline. It preserves the
    scheduled task graph and replaces only the analog tile implementations with
@@ -97,6 +101,9 @@ isolated scheduled core graphs.
    `streaming-convolution` pattern replaces a co-located patch/MVM/recombine
    chain with one bounded-buffer task while retaining setup dependencies and
    per-array placement.
+   Analyze timing for the selected execution backend before fusion, then
+   analyze it again after any graph optimization or fusion. This prevents a
+   pre-placement cost estimate from being mistaken for actual backend timing.
 5. `sculptor-fuse-task-graph`
    Fuses connected tasks only when they share both a logical island and a core,
    then removes task callees and intermediate resources made dead by fusion.
@@ -140,7 +147,7 @@ task or a cross-core tensor route.
 | `sculptor-materialize-tasks` | `sculptor.task_region` boundaries. | Private task functions with task metadata, called from `forward`. |
 | `sculptor-assemble-task-graph` | A `forward` function that calls materialized task functions. | Materialized task functions plus `generate_task_graph` with `sculptor.task_graph.*` resources and `sculptor.task.create` nodes. |
 | `sculptor-build-task-graph-islands` | An assembled task graph. | Placement-island members annotated with stable logical island IDs. |
-| `sculptor-analyze-task-graph-timing` | An island-annotated task graph. | Task-level execution order and latency metadata plus graph critical-path and island-work summaries. |
+| `sculptor-analyze-task-graph-timing` | An island-annotated task graph plus `mvm-cost-mode=analog|digital`. | Task-level execution order and backend-costed latency metadata plus graph critical-path and island-work summaries. |
 | `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |
 | `sculptor-lower-scheduled-mvm-to-digital` | A scheduled, unfinalized Golem task graph. | A placement-preserving digital baseline: analog MVM task bodies become tiled `linalg.matmul_transpose_b` operations while core assignments, islands, tensor communication, setup dependencies, and physical tile geometry remain fixed. |
 | `sculptor-optimize-task-graph` | A scheduled, unfinalized task graph plus an optional comma-separated pattern list. | A placement-preserving optimized graph with structural metadata refreshed and stale timing metadata removed. The initial `streaming-convolution` pattern eliminates full im2col resources for eligible co-located convolutions. |

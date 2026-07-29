@@ -45,10 +45,17 @@ struct LogicalIslandPlacement {
   std::optional<int64_t> physicalArrayId;
 };
 
+struct TimingPlacementObjective {
+  double predictedMakespanNs = 0.0;
+  double criticalCommunicationNs = 0.0;
+  double maximumResourceWorkNs = 0.0;
+};
+
 // Indexed by LogicalPlacementIslandGraph::islands. Analog islands own an array;
 // digital-only reduction islands own an exclusive core.
 struct IslandPlacementPlan {
   llvm::SmallVector<LogicalIslandPlacement, 16> placements;
+  std::optional<TimingPlacementObjective> timingObjective;
 };
 
 struct IslandPlacementResources {

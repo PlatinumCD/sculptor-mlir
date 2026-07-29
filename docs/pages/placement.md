@@ -82,6 +82,11 @@ validates that complete execution view, and computes:
 5. graph critical-path and execution-depth summaries; and
 6. total, analog, and digital work for every logical island.
 
+The pass option `mvm-cost-mode=analog|digital` controls how MVM tasks are
+costed. It changes timing estimates only; task identity, dependencies, logical
+arrays, islands, and the feasible placement space remain unchanged. The
+default is `analog`.
+
 An analog compute task is modeled as three sequential phases on its logical
 array:
 
@@ -94,6 +99,30 @@ store_ns   = ceil(output_bits / analog_io_bits_per_cycle) / digital_clock_ghz
 latency_ns = load_ns + execute_ns + store_ns
 ```
 
+In digital cost mode, the same static MVM is estimated as a digital
+replacement:
+
+```text
+digital_replacement_ops = 2 * M * N * K
+effective_digital_ops   = digital_ops + digital_replacement_ops
+ops_per_cycle           = max(digital_issue_width,
+                              digital_vector_bits_per_cycle / 32)
+latency_cycles          = ceil(effective_digital_ops / ops_per_cycle)
+```
+
+Its analog load, execute, and store phase latencies are zero in this mode.
+Existing non-MVM digital tasks retain the same cost in both modes. The
+replacement count uses the same checked static-geometry utility as
+`sculptor-lower-scheduled-mvm-to-digital`, including physical padded tile
+dimensions. Missing geometry, dynamic shapes, or arithmetic overflow are
+diagnosed rather than silently estimated. A mixed streaming-convolution task
+must provide `sculptor.runtime.digital_replacement_ops` before it can be
+costed digitally.
+
+This comparison is warm execution: matrix setup work does not contribute
+placement-critical programming latency, and setup tasks and logical-array
+resources remain in the shared graph.
+
 The pass attaches all three phase durations to the task. It does not introduce
 dependencies between different logical arrays, so independent arrays can have
 overlapping load, execute, or store phases. Serialization of repeated work on
@@ -104,6 +133,15 @@ The first invocation produces a placement-independent critical-path lower
 bound. Exact mesh hops and network contention are absent because the physical
 schedule does not exist yet. The scheduler can consume this timing metadata
 together with placement-dependent communication costs.
+
+For a timing-aware schedule, the selected mode survives as
+`sculptor.schedule.placement_cost_mode`. This provenance is intentionally
+separate from ephemeral `sculptor.timing.*` attributes, so later execution
+lowering, fusion, partitioning, and core extraction do not erase which model
+selected the placement. The scheduler summary CSV appends the placement mode
+and the predicted makespan, critical-communication, and maximum-resource-work
+objectives. GraphML and simulation-model JSON exports include the placement
+mode and digital replacement counts.
 
 After placement, the pipeline invokes the timing pass again. Data transfers use
 deterministic XY routing over directed mesh links. A transfer is divided into
@@ -123,6 +161,23 @@ core, mesh hops, transfer window, latency, and contention delay. Control-only
 dependencies remain zero-byte, zero-latency ordering edges. This model does not
 yet serialize processor execution, physical-array reuse, shared analog I/O, or
 network backpressure beyond directed-link availability.
+
+Placement cost and execution backend can therefore be swept independently:
+
+| Placement timing | Execution path |
+|---|---|
+| `mvm-cost-mode=analog` | Leave scheduled MVM tasks unchanged for analog execution. |
+| `mvm-cost-mode=analog` | Run `sculptor-lower-scheduled-mvm-to-digital` for analog-costed digital execution. |
+| `mvm-cost-mode=digital` | Leave scheduled MVM tasks unchanged for digital-costed analog execution. |
+| `mvm-cost-mode=digital` | Run `sculptor-lower-scheduled-mvm-to-digital` for digital-costed digital execution. |
+
+The two schedules must be produced independently from the same unscheduled,
+island-annotated graph. For actual backend reporting, use this order:
+
+```text
+cost timing -> schedule -> select execution backend -> actual timing
+            -> optimize/fuse -> post-fusion timing
+```
 
 `sculptor-schedule-task-graph` consumes those islands and owns physical
 placement and placement metadata:
@@ -192,7 +247,7 @@ The placement pass receives a hardware budget through pass parameters.
 | `annealing-plateau-acceptance-rate` | Maximum fraction of worse proposals accepted in the last epoch for a stagnant search to be considered plateaued. The default is `0.01` (1%). |
 | `annealing-maximum-evaluations` | Hard candidate-evaluation limit, or `0` to disable it. The default is `100000`. |
 | `annealing-maximum-runtime-seconds` | Internal wall-clock limit, or `0` to disable it. The default is `420` seconds. |
-| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. Annealing rows also include their stop reason, epoch and evaluation counts, initial and best scores, final uphill acceptance rate, and search time. |
+| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. Rows also record placement cost mode and timing-aware objective values when available. Annealing rows include their stop reason, epoch and evaluation counts, initial and best scores, final uphill acceptance rate, and search time. |
 
 `reduction-width` belongs to `sculptor-balance-task-graph-reductions`, not to
 the scheduling pass. It controls reduction parallelism and therefore the size

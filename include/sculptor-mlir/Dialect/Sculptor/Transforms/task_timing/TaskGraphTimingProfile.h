@@ -2,12 +2,38 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_TIMING_TASKGRAPHTIMINGPROFILE_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace mlir {
 namespace sculptor {
 namespace task_timing {
+
+enum class MVMCostMode {
+  Analog,
+  Digital,
+};
+
+inline llvm::StringRef stringifyMVMCostMode(MVMCostMode mode) {
+  switch (mode) {
+  case MVMCostMode::Analog:
+    return "analog";
+  case MVMCostMode::Digital:
+    return "digital";
+  }
+  llvm_unreachable("unknown MVM cost mode");
+}
+
+inline std::optional<MVMCostMode> symbolizeMVMCostMode(llvm::StringRef value) {
+  if (value == "analog")
+    return MVMCostMode::Analog;
+  if (value == "digital")
+    return MVMCostMode::Digital;
+  return std::nullopt;
+}
 
 struct TimingModel {
   int64_t analogMVMLatencyNs = 100;
@@ -29,6 +55,7 @@ struct TaskTiming {
   int64_t incomingDataBytes = 0;
   int64_t outgoingDataBytes = 0;
   int64_t digitalOps = 0;
+  int64_t digitalReplacementOps = 0;
   double analogLoadLatencyNs = 0.0;
   double analogExecuteLatencyNs = 0.0;
   double analogStoreLatencyNs = 0.0;
@@ -70,6 +97,7 @@ struct SchedulingTimingProfile {
   llvm::SmallVector<IslandTimingProfile, 16> islands;
   llvm::SmallVector<TimedIslandEdge, 16> islandEdges;
   double criticalPathNs = 0.0;
+  MVMCostMode mvmCostMode = MVMCostMode::Analog;
 };
 
 } // namespace task_timing

@@ -5,6 +5,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -29,6 +30,7 @@ namespace {
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_graph_attrs = mlir::sculptor::task_graph_attrs;
+namespace timing_attrs = mlir::sculptor::timing_attrs;
 
 struct ResourceModel {
   mlir::Value value;
@@ -57,6 +59,7 @@ struct TaskModel {
   std::optional<int64_t> physicalArrayId;
   std::optional<int64_t> localArrayId;
   std::optional<int64_t> digitalOps;
+  std::optional<int64_t> digitalReplacementOps;
   std::optional<int64_t> reductionTreeId;
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
@@ -72,6 +75,8 @@ struct GraphModel {
   unsigned graphIndex = 0;
   std::optional<int64_t> arraysPerCore;
   std::optional<int64_t> meshCols;
+  std::optional<std::string> placementCostMode;
+  std::optional<std::string> mvmCostMode;
   llvm::SmallVector<int64_t> logicalArrayToAnalogArray;
   llvm::SmallVector<ResourceModel, 0> resources;
   llvm::SmallVector<TaskModel, 0> tasks;
@@ -90,6 +95,13 @@ std::optional<int64_t> getOptionalI64Attr(mlir::Operation *op,
                                           llvm::StringRef attrName) {
   if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(attrName))
     return attr.getInt();
+  return std::nullopt;
+}
+
+std::optional<std::string> getOptionalStringAttr(mlir::Operation *op,
+                                                 llvm::StringRef attrName) {
+  if (auto attr = op->getAttrOfType<mlir::StringAttr>(attrName))
+    return attr.getValue().str();
   return std::nullopt;
 }
 
@@ -372,6 +384,8 @@ mlir::LogicalResult collectTasks(mlir::ModuleOp module, GraphModel &graph) {
         getOptionalI64Attr(taskOp, runtime_attrs::kTaskPhysicalArrayIdAttrName);
     task.digitalOps =
         getOptionalI64Attr(taskOp, runtime_attrs::kTaskDigitalOpsAttrName);
+    task.digitalReplacementOps = getOptionalI64Attr(
+        taskOp, timing_attrs::kDigitalReplacementOpsAttrName);
     task.reductionTreeId = getOptionalI64Attr(
         taskOp, task_graph_attrs::kTaskReductionTreeIdAttrName);
     task.reductionLevel = getOptionalI64Attr(
@@ -431,6 +445,10 @@ mlir::FailureOr<GraphModel> buildGraphModel(mlir::ModuleOp module,
   graph.arraysPerCore =
       getOptionalI64Attr(func, schedule_attrs::kArraysPerCoreAttrName);
   graph.meshCols = getOptionalI64Attr(func, schedule_attrs::kMeshColsAttrName);
+  graph.placementCostMode =
+      getOptionalStringAttr(func, schedule_attrs::kPlacementCostModeAttrName);
+  graph.mvmCostMode =
+      getOptionalStringAttr(func, timing_attrs::kMVMCostModeAttrName);
   auto logicalArrayMap = getOptionalI64ArrayAttr(
       func, schedule_attrs::kLogicalArrayToAnalogArrayAttrName);
   if (mlir::failed(logicalArrayMap))
@@ -569,6 +587,7 @@ void emitGraphMLNode(llvm::raw_ostream &os, const TaskModel &task) {
   emitGraphMLI64Data(os, "physical_array_id", task.physicalArrayId);
   emitGraphMLI64Data(os, "local_array_id", task.localArrayId);
   emitGraphMLI64Data(os, "digital_ops", task.digitalOps);
+  emitGraphMLI64Data(os, "digital_replacement_ops", task.digitalReplacementOps);
   emitGraphMLI64Data(os, "analog_ops", task.analogOps);
   emitGraphMLI64Data(os, "reduction_tree_id", task.reductionTreeId);
   emitGraphMLI64Data(os, "reduction_level", task.reductionLevel);
@@ -623,6 +642,10 @@ void emitGraphMLDataEdge(llvm::raw_ostream &os, const GraphModel &graph,
 void emitGraphMLGraph(llvm::raw_ostream &os, const GraphModel &graph) {
   os << "  <graph id=\"" << sanitizeId(graph.name)
      << "\" edgedefault=\"directed\">\n";
+  if (graph.placementCostMode)
+    emitGraphMLStringData(os, "placement_cost_mode", *graph.placementCostMode);
+  if (graph.mvmCostMode)
+    emitGraphMLStringData(os, "mvm_cost_mode", *graph.mvmCostMode);
   for (const TaskModel &task : graph.tasks)
     emitGraphMLNode(os, task);
 
@@ -678,11 +701,17 @@ void emitGraphML(llvm::raw_ostream &os, llvm::ArrayRef<GraphModel> graphs) {
   emitGraphMLKey(os, "physical_array_id", "node", "physical_array_id", "long");
   emitGraphMLKey(os, "local_array_id", "node", "local_array_id", "long");
   emitGraphMLKey(os, "digital_ops", "node", "digital_ops", "long");
+  emitGraphMLKey(os, "digital_replacement_ops", "node",
+                 "digital_replacement_ops", "long");
   emitGraphMLKey(os, "analog_ops", "node", "analog_ops", "long");
   emitGraphMLKey(os, "reduction_tree_id", "node", "reduction_tree_id", "long");
   emitGraphMLKey(os, "reduction_level", "node", "reduction_level", "long");
   emitGraphMLKey(os, "reduction_lane", "node", "reduction_lane", "long");
   emitGraphMLKey(os, "reduction_width", "node", "reduction_width", "long");
+
+  emitGraphMLKey(os, "placement_cost_mode", "graph", "placement_cost_mode",
+                 "string");
+  emitGraphMLKey(os, "mvm_cost_mode", "graph", "mvm_cost_mode", "string");
 
   emitGraphMLKey(os, "edge_kind", "edge", "edge_kind", "string");
   emitGraphMLKey(os, "producer_task", "edge", "producer_task", "long");

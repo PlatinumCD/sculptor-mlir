@@ -1,8 +1,8 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_TIMING_TASKGRAPHTIMINGANALYSIS_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_TIMING_TASKGRAPHTIMINGANALYSIS_H
 
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphExecutionGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TimingCostModel.h"
 
@@ -45,10 +45,12 @@ struct TimingAnalysis {
   unsigned dataEdgeCount = 0;
   unsigned executionDepth = 0;
   int64_t totalDataBytes = 0;
+  int64_t totalDigitalReplacementOps = 0;
   double criticalPathNs = 0.0;
   double totalNetworkLatencyNs = 0.0;
   double totalNetworkContentionDelayNs = 0.0;
   bool placementAware = false;
+  MVMCostMode mvmCostMode = MVMCostMode::Analog;
 };
 
 FailureOr<TimingAnalysis> analyzeTaskGraphTiming(
@@ -56,7 +58,7 @@ FailureOr<TimingAnalysis> analyzeTaskGraphTiming(
     const task_graph::TaskGraphDAG &dag,
     const task_graph::TaskExecutionGraph &executionGraph,
     const task_graph::LogicalPlacementIslandGraph &islandGraph,
-    const TimingModel &model);
+    const TimingModel &model, MVMCostMode mvmCostMode);
 
 } // namespace task_timing
 } // namespace sculptor

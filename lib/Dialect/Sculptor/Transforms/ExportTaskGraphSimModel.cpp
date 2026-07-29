@@ -61,6 +61,10 @@ struct SummaryModel {
   double transferCostPerInterCoreByte = 0.0;
   int64_t totalDigitalOps = 0;
   int64_t numLogicalArrays = 0;
+  std::optional<std::string> placementCostMode;
+  std::optional<double> predictedMakespanNs;
+  std::optional<double> criticalCommunicationNs;
+  std::optional<double> maximumResourceWorkNs;
   llvm::SmallVector<int64_t> coreTransferBytes;
   llvm::SmallVector<int64_t> coreTransferCost;
   llvm::SmallVector<int64_t> logicalArrayToAnalogArray;
@@ -92,6 +96,7 @@ struct TaskTimingModel {
   std::optional<int64_t> dependencyDepth;
   std::optional<int64_t> incomingDataBytes;
   std::optional<int64_t> outgoingDataBytes;
+  std::optional<int64_t> digitalReplacementOps;
   std::optional<double> analogLoadLatencyNs;
   std::optional<double> analogExecuteLatencyNs;
   std::optional<double> analogStoreLatencyNs;
@@ -143,6 +148,8 @@ struct GraphTimingModel {
   std::optional<int64_t> executionEdgeCount;
   std::optional<int64_t> executionDepth;
   std::optional<int64_t> totalDataBytes;
+  std::optional<int64_t> totalDigitalReplacementOps;
+  std::optional<std::string> mvmCostMode;
   std::optional<double> criticalPathNs;
   std::optional<bool> placementAware;
   std::optional<double> totalNetworkLatencyNs;
@@ -230,6 +237,13 @@ std::optional<bool> getOptionalBoolAttr(mlir::Operation *op,
                                         llvm::StringRef attrName) {
   if (auto attr = op->getAttrOfType<mlir::BoolAttr>(attrName))
     return attr.getValue();
+  return std::nullopt;
+}
+
+std::optional<std::string> getOptionalStringAttr(mlir::Operation *op,
+                                                 llvm::StringRef attrName) {
+  if (auto attr = op->getAttrOfType<mlir::StringAttr>(attrName))
+    return attr.getValue().str();
   return std::nullopt;
 }
 
@@ -359,6 +373,14 @@ mlir::FailureOr<SummaryModel> buildSummaryModel(mlir::func::FuncOp func) {
   }
   summary.totalDigitalOps = *totalDigitalOps;
   summary.numLogicalArrays = *numLogicalArrays;
+  summary.placementCostMode =
+      getOptionalStringAttr(func, schedule_attrs::kPlacementCostModeAttrName);
+  summary.predictedMakespanNs =
+      getOptionalF64Attr(func, schedule_attrs::kPredictedMakespanNsAttrName);
+  summary.criticalCommunicationNs = getOptionalF64Attr(
+      func, schedule_attrs::kCriticalCommunicationNsAttrName);
+  summary.maximumResourceWorkNs =
+      getOptionalF64Attr(func, schedule_attrs::kMaximumResourceWorkNsAttrName);
   summary.logicalArrayToAnalogArray = std::move(*logicalArrayToAnalogArray);
   return summary;
 }
@@ -372,6 +394,10 @@ GraphTimingModel buildGraphTimingModel(mlir::func::FuncOp func) {
       getOptionalI64Attr(func, timing_attrs::kExecutionDepthAttrName);
   timing.totalDataBytes =
       getOptionalI64Attr(func, timing_attrs::kTotalDataBytesAttrName);
+  timing.totalDigitalReplacementOps = getOptionalI64Attr(
+      func, timing_attrs::kTotalDigitalReplacementOpsAttrName);
+  timing.mvmCostMode =
+      getOptionalStringAttr(func, timing_attrs::kMVMCostModeAttrName);
   timing.criticalPathNs =
       getOptionalF64Attr(func, timing_attrs::kCriticalPathNsAttrName);
   timing.placementAware =
@@ -587,6 +613,8 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
         getOptionalI64Attr(taskOp, timing_attrs::kIncomingDataBytesAttrName);
     task.timing.outgoingDataBytes =
         getOptionalI64Attr(taskOp, timing_attrs::kOutgoingDataBytesAttrName);
+    task.timing.digitalReplacementOps = getOptionalI64Attr(
+        taskOp, timing_attrs::kDigitalReplacementOpsAttrName);
     task.timing.analogLoadLatencyNs =
         getOptionalF64Attr(taskOp, timing_attrs::kAnalogLoadLatencyNsAttrName);
     task.timing.analogExecuteLatencyNs = getOptionalF64Attr(
@@ -823,6 +851,15 @@ void emitOptionalBoolAttr(llvm::json::OStream &json, llvm::StringRef key,
   json.attribute(key, nullptr);
 }
 
+void emitOptionalStringAttr(llvm::json::OStream &json, llvm::StringRef key,
+                            const std::optional<std::string> &value) {
+  if (value) {
+    json.attribute(key, *value);
+    return;
+  }
+  json.attribute(key, nullptr);
+}
+
 void emitI64ArrayAttr(llvm::json::OStream &json, llvm::StringRef key,
                       llvm::ArrayRef<int64_t> values) {
   json.attributeArray(key, [&] {
@@ -920,6 +957,8 @@ void emitTaskTiming(llvm::json::OStream &json, const TaskTimingModel &timing) {
     emitOptionalI64Attr(json, "dependency_depth", timing.dependencyDepth);
     emitOptionalI64Attr(json, "incoming_data_bytes", timing.incomingDataBytes);
     emitOptionalI64Attr(json, "outgoing_data_bytes", timing.outgoingDataBytes);
+    emitOptionalI64Attr(json, "digital_replacement_ops",
+                        timing.digitalReplacementOps);
     emitOptionalF64Attr(json, "analog_load_latency_ns",
                         timing.analogLoadLatencyNs);
     emitOptionalF64Attr(json, "analog_execute_latency_ns",
@@ -1088,6 +1127,14 @@ void emitSummary(llvm::json::OStream &json, const SummaryModel &summary) {
     json.attribute("transfer_cost_per_inter_core_byte",
                    summary.transferCostPerInterCoreByte);
     json.attribute("total_digital_ops", summary.totalDigitalOps);
+    emitOptionalStringAttr(json, "placement_cost_mode",
+                           summary.placementCostMode);
+    emitOptionalF64Attr(json, "predicted_makespan_ns",
+                        summary.predictedMakespanNs);
+    emitOptionalF64Attr(json, "critical_communication_ns",
+                        summary.criticalCommunicationNs);
+    emitOptionalF64Attr(json, "maximum_resource_work_ns",
+                        summary.maximumResourceWorkNs);
     json.attribute("num_logical_arrays", summary.numLogicalArrays);
     emitI64ArrayAttr(json, "core_transfer_bytes", summary.coreTransferBytes);
     emitI64ArrayAttr(json, "core_transfer_cost", summary.coreTransferCost);
@@ -1104,6 +1151,9 @@ void emitGraphTiming(llvm::json::OStream &json,
                         timing.executionEdgeCount);
     emitOptionalI64Attr(json, "execution_depth", timing.executionDepth);
     emitOptionalI64Attr(json, "total_data_bytes", timing.totalDataBytes);
+    emitOptionalI64Attr(json, "total_digital_replacement_ops",
+                        timing.totalDigitalReplacementOps);
+    emitOptionalStringAttr(json, "mvm_cost_mode", timing.mvmCostMode);
     emitOptionalF64Attr(json, "critical_path_ns", timing.criticalPathNs);
     emitOptionalBoolAttr(json, "placement_aware", timing.placementAware);
     emitOptionalF64Attr(json, "total_network_latency_ns",

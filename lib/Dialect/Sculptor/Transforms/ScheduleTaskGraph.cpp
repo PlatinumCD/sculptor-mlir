@@ -5,6 +5,7 @@
 // arrays.
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphExecutionGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphHardwareConfig.h"
@@ -24,6 +25,7 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
 #include <utility>
 
 namespace {
@@ -123,6 +125,7 @@ void ScheduleTaskGraphPass::runOnOperation() {
 
     task_schedulers::TaskGraphPlacementProblem placementProblem{
         func, *budget, dag, *executionGraph, *islandGraph, *constraints};
+    std::optional<task_timing::SchedulingTimingProfile> schedulingTimingProfile;
     auto buildPlacementPlan =
         [&]() -> FailureOr<task_schedulers::IslandPlacementPlan> {
       if (!selectedScheduler->requiresTimingProfile())
@@ -136,8 +139,9 @@ void ScheduleTaskGraphPass::runOnOperation() {
             "failed to load pre-placement scheduling timing profile");
         return failure();
       }
+      schedulingTimingProfile = std::move(*timingProfile);
       return selectedScheduler->buildTimingPlacementPlan(
-          placementProblem, *timingProfile, *schedulerOptions);
+          placementProblem, *schedulingTimingProfile, *schedulerOptions);
     };
     auto placementPlan = buildPlacementPlan();
     if (failed(placementPlan)) {
@@ -168,6 +172,32 @@ void ScheduleTaskGraphPass::runOnOperation() {
       func.emitError("failed to finalize task graph schedule metadata");
       signalPassFailure();
       return;
+    }
+
+    for (Operation *owner : {module.getOperation(), func.getOperation()}) {
+      if (schedulingTimingProfile) {
+        owner->setAttr(schedule_attrs::kPlacementCostModeAttrName,
+                       builder.getStringAttr(task_timing::stringifyMVMCostMode(
+                           schedulingTimingProfile->mvmCostMode)));
+      } else {
+        owner->removeAttr(schedule_attrs::kPlacementCostModeAttrName);
+      }
+
+      if (placementPlan->timingObjective) {
+        const auto &objective = *placementPlan->timingObjective;
+        owner->setAttr(schedule_attrs::kPredictedMakespanNsAttrName,
+                       builder.getF64FloatAttr(objective.predictedMakespanNs));
+        owner->setAttr(
+            schedule_attrs::kCriticalCommunicationNsAttrName,
+            builder.getF64FloatAttr(objective.criticalCommunicationNs));
+        owner->setAttr(
+            schedule_attrs::kMaximumResourceWorkNsAttrName,
+            builder.getF64FloatAttr(objective.maximumResourceWorkNs));
+      } else {
+        owner->removeAttr(schedule_attrs::kPredictedMakespanNsAttrName);
+        owner->removeAttr(schedule_attrs::kCriticalCommunicationNsAttrName);
+        owner->removeAttr(schedule_attrs::kMaximumResourceWorkNsAttrName);
+      }
     }
 
     if (failed(task_schedulers::appendScheduleSummary(

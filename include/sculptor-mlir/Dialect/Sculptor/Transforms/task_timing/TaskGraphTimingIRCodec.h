@@ -17,7 +17,8 @@ struct TimingAnalysis;
 void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                                    const task_graph::TaskGraphDAG &dag,
                                    const TimingAnalysis &analysis,
-                                   const TimingModel &model);
+                                   const TimingModel &model,
+                                   MVMCostMode mvmCostMode);
 
 FailureOr<TimingModel> loadTimingModel(func::FuncOp taskGraphFunc);
 

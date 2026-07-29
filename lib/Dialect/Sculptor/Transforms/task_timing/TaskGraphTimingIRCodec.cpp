@@ -8,6 +8,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +23,8 @@ using task_graph::TaskGraphDAG;
 void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                                    const TaskGraphDAG &dag,
                                    const TimingAnalysis &analysis,
-                                   const TimingModel &model) {
+                                   const TimingModel &model,
+                                   MVMCostMode mvmCostMode) {
   Builder builder(taskGraphFunc.getContext());
   auto i64Attr = [&](int64_t value) {
     return builder.getI64IntegerAttr(value);
@@ -45,6 +47,8 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                      i64Attr(timing.outgoingDataBytes));
     node.op->setAttr(timing_attrs::kDigitalOpsAttrName,
                      i64Attr(timing.digitalOps));
+    node.op->setAttr(timing_attrs::kDigitalReplacementOpsAttrName,
+                     i64Attr(timing.digitalReplacementOps));
     node.op->setAttr(timing_attrs::kAnalogLoadLatencyNsAttrName,
                      f64Attr(timing.analogLoadLatencyNs));
     node.op->setAttr(timing_attrs::kAnalogExecuteLatencyNsAttrName,
@@ -80,6 +84,11 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                          f64Attr(analysis.criticalPathNs));
   taskGraphFunc->setAttr(timing_attrs::kTotalDataBytesAttrName,
                          i64Attr(analysis.totalDataBytes));
+  taskGraphFunc->setAttr(timing_attrs::kTotalDigitalReplacementOpsAttrName,
+                         i64Attr(analysis.totalDigitalReplacementOps));
+  taskGraphFunc->setAttr(
+      timing_attrs::kMVMCostModeAttrName,
+      builder.getStringAttr(stringifyMVMCostMode(mvmCostMode)));
   taskGraphFunc->setAttr(timing_attrs::kPlacementAwareAttrName,
                          builder.getBoolAttr(analysis.placementAware));
   taskGraphFunc->setAttr(timing_attrs::kTotalNetworkLatencyNsAttrName,
@@ -256,7 +265,10 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
       getRequiredI64(taskGraphFunc, timing_attrs::kTaskCountAttrName);
   auto criticalPathNs =
       getRequiredF64(taskGraphFunc, timing_attrs::kCriticalPathNsAttrName);
-  if (failed(taskCount) || failed(criticalPathNs))
+  auto totalDigitalReplacementOps = getRequiredI64(
+      taskGraphFunc, timing_attrs::kTotalDigitalReplacementOpsAttrName);
+  if (failed(taskCount) || failed(criticalPathNs) ||
+      failed(totalDigitalReplacementOps))
     return failure();
   if (*taskCount < 0 || static_cast<size_t>(*taskCount) != dag.nodes.size()) {
     taskGraphFunc.emitError(
@@ -265,8 +277,21 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
   }
 
   SchedulingTimingProfile profile;
+  auto mvmCostModeAttr = getRequiredAttr<StringAttr>(
+      taskGraphFunc, timing_attrs::kMVMCostModeAttrName);
+  if (failed(mvmCostModeAttr))
+    return failure();
+  std::optional<MVMCostMode> mvmCostMode =
+      symbolizeMVMCostMode(mvmCostModeAttr->getValue());
+  if (!mvmCostMode) {
+    taskGraphFunc.emitError("unknown timing MVM cost mode '")
+        << mvmCostModeAttr->getValue() << "'";
+    return failure();
+  }
+  profile.mvmCostMode = *mvmCostMode;
   profile.criticalPathNs = *criticalPathNs;
   profile.tasks.resize(dag.nodes.size());
+  int64_t observedDigitalReplacementOps = 0;
   llvm::SmallVector<bool, 16> seenTopologicalIndex(dag.nodes.size(), false);
   for (const task_graph::TaskGraphNode &node : dag.nodes) {
     TaskTiming timing;
@@ -284,6 +309,8 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
         getRequiredI64(node.op, timing_attrs::kOutgoingDataBytesAttrName);
     auto digitalOps =
         getRequiredI64(node.op, timing_attrs::kDigitalOpsAttrName);
+    auto digitalReplacementOps =
+        getRequiredI64(node.op, timing_attrs::kDigitalReplacementOpsAttrName);
     auto analogLoad =
         getRequiredF64(node.op, timing_attrs::kAnalogLoadLatencyNsAttrName);
     auto analogExecute =
@@ -306,14 +333,16 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
     if (failed(topologicalIndex) || failed(dependencyDepth) ||
         failed(controlPredecessors) || failed(dataPredecessors) ||
         failed(incomingBytes) || failed(outgoingBytes) || failed(digitalOps) ||
-        failed(analogLoad) || failed(analogExecute) || failed(analogStore) ||
-        failed(intrinsic) || failed(earliestStart) || failed(earliestFinish) ||
+        failed(digitalReplacementOps) || failed(analogLoad) ||
+        failed(analogExecute) || failed(analogStore) || failed(intrinsic) ||
+        failed(earliestStart) || failed(earliestFinish) ||
         failed(criticalRemaining) || failed(slack) ||
         failed(incomingNetworkDelay) || failed(isCritical))
       return failure();
     if (*topologicalIndex < 0 || *dependencyDepth < 0 ||
         *controlPredecessors < 0 || *dataPredecessors < 0 ||
-        *incomingBytes < 0 || *outgoingBytes < 0 || *digitalOps < 0) {
+        *incomingBytes < 0 || *outgoingBytes < 0 || *digitalOps < 0 ||
+        *digitalReplacementOps < 0) {
       node.op->emitError("expected non-negative task timing counters");
       return failure();
     }
@@ -332,6 +361,14 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
     timing.incomingDataBytes = *incomingBytes;
     timing.outgoingDataBytes = *outgoingBytes;
     timing.digitalOps = *digitalOps;
+    timing.digitalReplacementOps = *digitalReplacementOps;
+    std::optional<int64_t> replacementTotal = llvm::checkedAdd(
+        observedDigitalReplacementOps, timing.digitalReplacementOps);
+    if (!replacementTotal) {
+      node.op->emitError("digital replacement operation count overflow");
+      return failure();
+    }
+    observedDigitalReplacementOps = *replacementTotal;
     timing.analogLoadLatencyNs = *analogLoad;
     timing.analogExecuteLatencyNs = *analogExecute;
     timing.analogStoreLatencyNs = *analogStore;
@@ -343,6 +380,13 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
     timing.incomingNetworkDelayNs = *incomingNetworkDelay;
     timing.isCritical = *isCritical;
     profile.tasks[node.index] = timing;
+  }
+  if (*totalDigitalReplacementOps < 0 ||
+      observedDigitalReplacementOps != *totalDigitalReplacementOps) {
+    taskGraphFunc.emitError(
+        "timing profile total digital replacement operation count does not "
+        "match task records");
+    return failure();
   }
 
   auto islandAttrs = getRequiredAttr<ArrayAttr>(

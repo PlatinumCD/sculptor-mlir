@@ -61,7 +61,7 @@ The compiler is staged around explicit IR boundaries:
 | Materialize tasks | task regions -> callable task-stage functions | `sculptor-materialize-tasks` |
 | Assemble graph | outlined work and resources -> symbolic task graph | `sculptor-assemble-task-graph` |
 | Build islands | symbolic tasks -> stable logical placement islands | `sculptor-build-task-graph-islands` |
-| Analyze timing | logical islands -> task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
+| Analyze timing | logical islands -> backend-costed task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
 | Schedule graph | island-annotated tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
 | Optional digital baseline | scheduled analog tile bodies -> placement-preserving tiled digital matmuls | `sculptor-lower-scheduled-mvm-to-digital` |
 | Fuse graph | placed tasks -> same-island, same-core component tasks | `sculptor-fuse-task-graph` |
@@ -71,6 +71,13 @@ The compiler is staged around explicit IR boundaries:
 | Finalize core resources | one extracted core graph -> private slots and offsets | `sculptor-finalize-task-graph-resources` |
 | Emit Golem tile ABI | finalized, LLVM-lowered core -> immutable task/route tables and Golem task adapters | `sculptor-emit-golem-tile-abi` |
 | Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
+
+Timing-aware placement and execution lowering are independent choices.
+`sculptor-analyze-task-graph-timing="mvm-cost-mode=analog|digital"` selects
+how MVM work is costed before scheduling without changing graph topology.
+After scheduling, leaving MVM tasks unchanged selects analog execution, while
+`sculptor-lower-scheduled-mvm-to-digital` selects the matched-topology digital
+baseline and preserves the chosen placement.
 
 ## Repository Layout
 

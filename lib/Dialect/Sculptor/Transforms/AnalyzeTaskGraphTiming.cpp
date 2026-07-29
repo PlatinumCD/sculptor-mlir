@@ -22,6 +22,15 @@ namespace mlir {
 namespace sculptor {
 
 void AnalyzeTaskGraphTimingPass::runOnOperation() {
+  std::optional<task_timing::MVMCostMode> parsedMVMCostMode =
+      task_timing::symbolizeMVMCostMode(mvmCostMode);
+  if (!parsedMVMCostMode) {
+    getOperation().emitError("unknown MVM cost mode '")
+        << mvmCostMode << "'; expected 'analog' or 'digital'";
+    signalPassFailure();
+    return;
+  }
+
   task_timing::TimingModel model;
   model.analogMVMLatencyNs = analogMVMLatencyNs;
   model.analogIOBitsPerCycle = analogIOBitsPerCycle;
@@ -66,13 +75,15 @@ void AnalyzeTaskGraphTimingPass::runOnOperation() {
     }
 
     auto analysis = task_timing::analyzeTaskGraphTiming(
-        module, func, *dag, *executionGraph, *islandGraph, model);
+        module, func, *dag, *executionGraph, *islandGraph, model,
+        *parsedMVMCostMode);
     if (failed(analysis)) {
       signalPassFailure();
       return;
     }
 
-    task_timing::attachTaskGraphTimingAnalysis(func, *dag, *analysis, model);
+    task_timing::attachTaskGraphTimingAnalysis(func, *dag, *analysis, model,
+                                               *parsedMVMCostMode);
     foundTaskGraph = true;
   }
 

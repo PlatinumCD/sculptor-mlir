@@ -87,6 +87,14 @@ inline constexpr llvm::StringLiteral kLogicalArrayToAnalogArrayAttrName(
     "sculptor.schedule.logical_array_to_analog_array");
 inline constexpr llvm::StringLiteral
     kIslandIdAttrName("sculptor.schedule.island_id");
+inline constexpr llvm::StringLiteral
+    kPlacementCostModeAttrName("sculptor.schedule.placement_cost_mode");
+inline constexpr llvm::StringLiteral
+    kPredictedMakespanNsAttrName("sculptor.schedule.predicted_makespan_ns");
+inline constexpr llvm::StringLiteral kCriticalCommunicationNsAttrName(
+    "sculptor.schedule.critical_communication_ns");
+inline constexpr llvm::StringLiteral kMaximumResourceWorkNsAttrName(
+    "sculptor.schedule.maximum_resource_work_ns");
 
 } // namespace schedule_attrs
 } // namespace sculptor

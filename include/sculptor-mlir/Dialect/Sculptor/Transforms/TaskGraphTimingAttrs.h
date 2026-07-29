@@ -22,6 +22,8 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral
     kDigitalOpsAttrName("sculptor.timing.digital_ops");
 inline constexpr llvm::StringLiteral
+    kDigitalReplacementOpsAttrName("sculptor.timing.digital_replacement_ops");
+inline constexpr llvm::StringLiteral
     kAnalogLoadLatencyNsAttrName("sculptor.timing.analog_load_latency_ns");
 inline constexpr llvm::StringLiteral kAnalogExecuteLatencyNsAttrName(
     "sculptor.timing.analog_execute_latency_ns");
@@ -56,6 +58,10 @@ inline constexpr llvm::StringLiteral
     kCriticalPathNsAttrName("sculptor.timing.critical_path_ns");
 inline constexpr llvm::StringLiteral
     kTotalDataBytesAttrName("sculptor.timing.total_data_bytes");
+inline constexpr llvm::StringLiteral kTotalDigitalReplacementOpsAttrName(
+    "sculptor.timing.total_digital_replacement_ops");
+inline constexpr llvm::StringLiteral
+    kMVMCostModeAttrName("sculptor.timing.mvm_cost_mode");
 inline constexpr llvm::StringLiteral
     kPlacementAwareAttrName("sculptor.timing.placement_aware");
 inline constexpr llvm::StringLiteral

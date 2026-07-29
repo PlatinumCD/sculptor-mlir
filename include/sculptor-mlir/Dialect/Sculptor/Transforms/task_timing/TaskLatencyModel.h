@@ -21,7 +21,7 @@ struct TaskLatencyEstimate {
 
 FailureOr<TaskLatencyEstimate>
 estimateTaskLatency(sculptor::TaskCreateOp taskOp, int64_t digitalOps,
-                    const TimingModel &model);
+                    const TimingModel &model, MVMCostMode mvmCostMode);
 
 } // namespace task_timing
 } // namespace sculptor

@@ -9,6 +9,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include <cstdint>
+#include <string>
 
 namespace mlir {
 namespace sculptor {
@@ -16,6 +17,11 @@ namespace sculptor {
 struct AnalyzeTaskGraphTimingPass
     : public PassWrapper<AnalyzeTaskGraphTimingPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeTaskGraphTimingPass)
+
+  Option<std::string> mvmCostMode{
+      *this, "mvm-cost-mode",
+      llvm::cl::desc("MVM placement cost model: analog or digital"),
+      llvm::cl::init("analog")};
 
   Option<int64_t> analogMVMLatencyNs{
       *this, "analog-mvm-latency-ns",
@@ -67,6 +73,10 @@ struct AnalyzeTaskGraphTimingPass
 
   AnalyzeTaskGraphTimingPass(const AnalyzeTaskGraphTimingPass &pass)
       : PassWrapper(pass),
+        mvmCostMode(
+            *this, "mvm-cost-mode",
+            llvm::cl::desc("MVM placement cost model: analog or digital"),
+            llvm::cl::init("analog")),
         analogMVMLatencyNs(
             *this, "analog-mvm-latency-ns",
             llvm::cl::desc(
@@ -108,6 +118,7 @@ struct AnalyzeTaskGraphTimingPass
             llvm::cl::desc(
                 "Whether communication across network hops is pipelined"),
             llvm::cl::init(true)) {
+    mvmCostMode = pass.mvmCostMode;
     analogMVMLatencyNs = pass.analogMVMLatencyNs;
     analogIOBitsPerCycle = pass.analogIOBitsPerCycle;
     analogIOShared = pass.analogIOShared;

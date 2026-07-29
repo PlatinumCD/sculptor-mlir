@@ -135,6 +135,27 @@ LogicalResult appendScheduleSummary(
     annealingSearchSeconds = *searchSeconds;
   }
 
+  StringRef placementCostMode = "n/a";
+  double predictedMakespanNs = 0.0;
+  double criticalCommunicationNs = 0.0;
+  double maximumResourceWorkNs = 0.0;
+  if (auto mode = taskGraphFunc->getAttrOfType<StringAttr>(
+          schedule_attrs::kPlacementCostModeAttrName)) {
+    auto predictedMakespan = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kPredictedMakespanNsAttrName);
+    auto criticalCommunication = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kCriticalCommunicationNsAttrName);
+    auto maximumResourceWork = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kMaximumResourceWorkNsAttrName);
+    if (failed(predictedMakespan) || failed(criticalCommunication) ||
+        failed(maximumResourceWork))
+      return failure();
+    placementCostMode = mode.getValue();
+    predictedMakespanNs = *predictedMakespan;
+    criticalCommunicationNs = *criticalCommunication;
+    maximumResourceWorkNs = *maximumResourceWork;
+  }
+
   std::error_code ec;
   llvm::raw_fd_ostream os(outputPath, ec, llvm::sys::fs::OF_Append);
   if (ec) {
@@ -167,6 +188,10 @@ LogicalResult appendScheduleSummary(
   } else {
     os << ",,,,,,,";
   }
+  os << ',';
+  writeCsvString(os, placementCostMode);
+  os << ',' << predictedMakespanNs << ',' << criticalCommunicationNs << ','
+     << maximumResourceWorkNs;
   os << '\n';
   return success();
 }
