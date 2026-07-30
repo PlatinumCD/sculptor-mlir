@@ -27,6 +27,7 @@ struct LogicalPlacementIsland {
   LogicalPlacementIslandKind kind = LogicalPlacementIslandKind::Analog;
   std::optional<unsigned> matrixSetupTaskIndex;
   std::optional<int64_t> reductionTreeId;
+  std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
   std::optional<int64_t> reductionWidth;
   llvm::SmallVector<unsigned, 4> mvmTaskIndices;
@@ -40,6 +41,15 @@ inline bool isAnalogIsland(const LogicalPlacementIsland &island) {
 
 inline bool isReductionIsland(const LogicalPlacementIsland &island) {
   return island.kind == LogicalPlacementIslandKind::Reduction;
+}
+
+inline bool isReductionLaneIsland(const LogicalPlacementIsland &island) {
+  return isReductionIsland(island) && island.reductionLevel == 0;
+}
+
+inline bool isReductionRootIsland(const LogicalPlacementIsland &island) {
+  return isReductionIsland(island) && island.reductionLevel &&
+         *island.reductionLevel > 0;
 }
 
 struct IslandExecutionEdge {

@@ -64,11 +64,11 @@ module {
 // SCHEDULED-LABEL: func.func private @generate_task_graph()
 // SCHEDULED-SAME: sculptor.schedule.task_count = 13 : i64
 // SCHEDULED-SAME: sculptor.timing.critical_path_ns
-// SCHEDULED-DAG: task_name = "star.level0.lane0"{{.*}}sculptor.runtime.core_id = 0 : i64{{.*}}sculptor.schedule.island_id = 8 : i64
-// SCHEDULED-DAG: task_name = "star.level0.lane1"{{.*}}sculptor.runtime.core_id = 1 : i64{{.*}}sculptor.schedule.island_id = 9 : i64
-// SCHEDULED-DAG: task_name = "star.level1.lane0"{{.*}}sculptor.runtime.core_id = 0 : i64{{.*}}sculptor.schedule.island_id = 8 : i64
+// SCHEDULED-DAG: task_name = "star.level0.lane0"{{.*}}sculptor.runtime.core_id = 1 : i64{{.*}}sculptor.schedule.island_id = 8 : i64
+// SCHEDULED-DAG: task_name = "star.level0.lane1"{{.*}}sculptor.runtime.core_id = 2 : i64{{.*}}sculptor.schedule.island_id = 9 : i64
+// SCHEDULED-DAG: task_name = "star.level1.root"{{.*}}sculptor.runtime.core_id = 2 : i64{{.*}}sculptor.schedule.island_id = 10 : i64
 // SCHEDULED-NOT: task_name = "star"
-// SCHEDULED: task_name = "bridge"{{.*}}sculptor.runtime.core_id = 0 : i64
+// SCHEDULED: task_name = "bridge"{{.*}}sculptor.runtime.core_id = 2 : i64
 // SCHEDULED: task_name = "sink"{{.*}}sculptor.schedule.island_id = 3 : i64
 
 // FINAL-NOT: func.func private @star_add

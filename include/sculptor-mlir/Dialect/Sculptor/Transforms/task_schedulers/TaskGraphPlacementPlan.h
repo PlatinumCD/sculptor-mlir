@@ -52,7 +52,7 @@ struct TimingPlacementObjective {
 };
 
 // Indexed by LogicalPlacementIslandGraph::islands. Analog islands own an array;
-// digital-only reduction islands own an exclusive core.
+// digital-only reduction islands own a core but no analog array.
 struct IslandPlacementPlan {
   llvm::SmallVector<LogicalIslandPlacement, 16> placements;
   std::optional<TimingPlacementObjective> timingObjective;
@@ -60,7 +60,6 @@ struct IslandPlacementPlan {
 
 struct IslandPlacementResources {
   llvm::SmallVector<int64_t, 16> analogPhysicalArrayOrder;
-  llvm::DenseMap<unsigned, int64_t> reductionCoreByIsland;
 };
 
 LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,

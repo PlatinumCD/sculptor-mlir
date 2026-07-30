@@ -28,6 +28,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphIslandDigitalAssignment.cpp
   task_schedulers/TaskGraphPlacementUtils.cpp
   task_schedulers/TaskGraphPlacementPlan.cpp
+  task_schedulers/TaskGraphReductionPlacement.cpp
   task_schedulers/TaskGraphPlacementConstraints.cpp
   task_schedulers/TaskGraphHardwareConfig.cpp
   task_schedulers/TaskGraphPlacementObjective.cpp

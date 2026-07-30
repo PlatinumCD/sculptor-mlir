@@ -61,7 +61,8 @@ static void recordInitialMatrixSetupIslands(
 
 struct ReductionIslandMetadata {
   int64_t treeId = 0;
-  int64_t lane = 0;
+  int64_t level = 0;
+  std::optional<int64_t> lane;
   int64_t width = 0;
 };
 
@@ -69,17 +70,35 @@ static mlir::FailureOr<ReductionIslandMetadata>
 getReductionIslandMetadata(const TaskGraphNode &node) {
   auto treeId = node.op->getAttrOfType<mlir::IntegerAttr>(
       mlir::sculptor::task_graph_attrs::kTaskReductionTreeIdAttrName);
+  auto level = node.op->getAttrOfType<mlir::IntegerAttr>(
+      mlir::sculptor::task_graph_attrs::kTaskReductionLevelAttrName);
   auto lane = node.op->getAttrOfType<mlir::IntegerAttr>(
       mlir::sculptor::task_graph_attrs::kTaskReductionLaneAttrName);
   auto width = node.op->getAttrOfType<mlir::IntegerAttr>(
       mlir::sculptor::task_graph_attrs::kTaskReductionWidthAttrName);
-  if (!treeId || !lane || !width || treeId.getInt() < 0 || lane.getInt() < 0 ||
-      width.getInt() < 2 || lane.getInt() >= width.getInt()) {
+  if (!treeId || !level || !width || treeId.getInt() < 0 ||
+      level.getInt() < 0 || level.getInt() > 1 || width.getInt() < 2) {
     node.op->emitError(
-        "expected valid reduction tree, lane, and width metadata");
+        "expected valid reduction tree, level, and width metadata");
     return mlir::failure();
   }
-  return ReductionIslandMetadata{treeId.getInt(), lane.getInt(),
+
+  if (level.getInt() == 0 &&
+      (!lane || lane.getInt() < 0 || lane.getInt() >= width.getInt())) {
+    node.op->emitError(
+        "expected a first-stage reduction to carry a valid lane");
+    return mlir::failure();
+  }
+  if (level.getInt() == 1 && lane && lane.getInt() != 0) {
+    node.op->emitError(
+        "expected a legacy root reduction lane, when present, to be zero");
+    return mlir::failure();
+  }
+
+  return ReductionIslandMetadata{treeId.getInt(), level.getInt(),
+                                 level.getInt() == 0
+                                     ? std::optional<int64_t>(lane.getInt())
+                                     : std::nullopt,
                                  width.getInt()};
 }
 
@@ -94,7 +113,8 @@ static mlir::LogicalResult recordInitialReductionIslands(
     auto metadata = getReductionIslandMetadata(node);
     if (mlir::failed(metadata))
       return mlir::failure();
-    auto key = std::make_pair(metadata->treeId, metadata->lane);
+    int64_t branch = metadata->lane.value_or(metadata->width);
+    auto key = std::make_pair(metadata->treeId, branch);
     auto inserted = islandByTreeLane.try_emplace(key, node.index);
     islandByTaskIndex[node.index] = inserted.first->second;
   }
@@ -233,14 +253,16 @@ assembleLogicalPlacementIslandGraph(
         return mlir::failure();
       if (!foundReductionTask) {
         island.reductionTreeId = metadata->treeId;
+        island.reductionLevel = metadata->level;
         island.reductionLane = metadata->lane;
         island.reductionWidth = metadata->width;
         foundReductionTask = true;
       } else if (island.reductionTreeId != metadata->treeId ||
+                 island.reductionLevel != metadata->level ||
                  island.reductionLane != metadata->lane ||
                  island.reductionWidth != metadata->width) {
         node->op->emitError(
-            "expected a reduction island to contain one tree lane");
+            "expected a reduction island to contain one tree branch");
         return mlir::failure();
       }
     }

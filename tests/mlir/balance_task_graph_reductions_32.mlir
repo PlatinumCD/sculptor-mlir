@@ -57,7 +57,7 @@ module {
 // CHECK-NOT: func.func private @star32
 // CHECK-LABEL: func.func private @generate_task_graph()
 // CHECK-COUNT-4: task_name = "wide.level0.lane{{[0-3]}}"
-// CHECK: task_name = "wide.level1.lane0"
+// CHECK: task_name = "wide.level1.root"
 // CHECK-NOT: task_name = "wide.level"
 
 // STAR-LABEL: func.func private @generate_task_graph()
@@ -71,7 +71,7 @@ module {
 // TREE-SAME: sculptor.timing.critical_path_ns = 3.200000e+02 : f64
 // TREE-SAME: sculptor.timing.execution_depth = 2 : i64
 // TREE-SAME: sculptor.timing.task_count = 5 : i64
-// TREE: task_name = "wide.level1.lane0"
+// TREE: task_name = "wide.level1.root"
 // TREE-SAME: sculptor.timing.critical_path_remaining_ns = 9.600000e+01 : f64
 // TREE-SAME: sculptor.timing.digital_ops = 768 : i64
 // TREE-SAME: sculptor.timing.intrinsic_latency_ns = 9.600000e+01 : f64
@@ -81,10 +81,10 @@ module {
 // PLACED: task_name = "wide.level0.lane1"
 // PLACED-SAME: sculptor.runtime.core_id = 1 : i64
 // PLACED: task_name = "wide.level0.lane2"
-// PLACED-SAME: sculptor.runtime.core_id = 3 : i64
-// PLACED: task_name = "wide.level0.lane3"
 // PLACED-SAME: sculptor.runtime.core_id = 2 : i64
-// PLACED: task_name = "wide.level1.lane0"
+// PLACED: task_name = "wide.level0.lane3"
+// PLACED-SAME: sculptor.runtime.core_id = 3 : i64
+// PLACED: task_name = "wide.level1.root"
 // PLACED-SAME: sculptor.runtime.core_id = 0 : i64
 
 // GRAPHML: <key id="reduction_tree_id" for="node" attr.name="reduction_tree_id" attr.type="long"/>
@@ -106,4 +106,4 @@ module {
 // JSON: "reduction_lane": 0
 // JSON: "reduction_width": 4
 
-// INSUFFICIENT-CORES: error: expected at least 4 cores for the reduction core pool
+// INSUFFICIENT-CORES: error: could not find a distinct core for a reduction lane

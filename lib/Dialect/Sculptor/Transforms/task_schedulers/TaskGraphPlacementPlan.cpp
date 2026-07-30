@@ -1,5 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementPlan.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphReductionPlacement.h"
+
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -30,9 +32,9 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
     return failure();
   }
 
-  llvm::DenseMap<int64_t, int64_t> reductionCoreByLane;
-  llvm::DenseSet<int64_t> reductionCores;
-  llvm::DenseSet<int64_t> analogCores;
+  llvm::DenseMap<int64_t, llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>
+      laneCoresByTree;
+  llvm::DenseMap<int64_t, unsigned> rootCountByTree;
   for (auto indexedIsland : llvm::enumerate(problem.islandGraph.islands)) {
     const auto &island = indexedIsland.value();
     const LogicalIslandPlacement &placement =
@@ -61,36 +63,57 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
             << " to belong to its assigned core and hardware budget";
         return failure();
       }
-      analogCores.insert(placement.coreId);
       continue;
     }
 
-    if (placement.physicalArrayId || !island.reductionLane) {
+    if (placement.physicalArrayId || !island.reductionTreeId ||
+        !island.reductionLevel || !island.reductionWidth) {
       emitPlacementError(problem)
           << "expected reduction island " << island.islandIndex
-          << " to own a core but no analog array";
+          << " to own a core, no analog array, and complete tree metadata";
       return failure();
     }
-    auto laneCore = reductionCoreByLane.try_emplace(*island.reductionLane,
-                                                    placement.coreId);
-    if (!laneCore.second && laneCore.first->second != placement.coreId) {
+    if (task_graph::isReductionRootIsland(island)) {
+      ++rootCountByTree[*island.reductionTreeId];
+      continue;
+    }
+    if (!task_graph::isReductionLaneIsland(island) || !island.reductionLane) {
       emitPlacementError(problem)
-          << "expected reduction lane " << *island.reductionLane
-          << " to reuse one dedicated core";
+          << "expected a reduction island to be a first-stage lane or root";
       return failure();
     }
-    reductionCores.insert(placement.coreId);
+    laneCoresByTree[*island.reductionTreeId].push_back(
+        {*island.reductionLane, placement.coreId});
   }
 
-  if (reductionCores.size() != reductionCoreByLane.size()) {
-    emitPlacementError(problem)
-        << "expected distinct reduction lanes to use distinct cores";
-    return failure();
+  for (const auto &entry : rootCountByTree) {
+    if (entry.second != 1) {
+      emitPlacementError(problem)
+          << "expected reduction tree " << entry.first
+          << " to contain one independently placed root";
+      return failure();
+    }
   }
-  for (int64_t core : reductionCores) {
-    if (analogCores.contains(core)) {
-      emitPlacementError(problem) << "expected reduction core " << core
-                                  << " to remain exclusive from analog islands";
+  for (const auto &entry : laneCoresByTree) {
+    llvm::DenseSet<int64_t> seenCores;
+    llvm::DenseSet<int64_t> seenLanes;
+    for (const auto &[lane, core] : entry.second) {
+      if (!seenLanes.insert(lane).second) {
+        emitPlacementError(problem) << "expected one island for reduction tree "
+                                    << entry.first << " lane " << lane;
+        return failure();
+      }
+      if (!seenCores.insert(core).second) {
+        emitPlacementError(problem)
+            << "expected active lanes in reduction tree " << entry.first
+            << " to use distinct cores";
+        return failure();
+      }
+    }
+    if (rootCountByTree.lookup(entry.first) != 1) {
+      emitPlacementError(problem)
+          << "expected reduction tree " << entry.first
+          << " to contain one independently placed root";
       return failure();
     }
   }
@@ -113,7 +136,7 @@ FailureOr<IslandPlacementPlan> buildPlacementPlanFromPhysicalArrayOrder(
     if (resources->analogPhysicalArrayOrder.empty()) {
       emitPlacementError(problem)
           << "expected analog island placement to have at least one physical "
-             "array outside the reduction core pool";
+             "array";
       return failure();
     }
     physicalArrayByAnalogIsland[island.islandIndex] =
@@ -127,59 +150,19 @@ FailureOr<IslandPlacementPlan> buildPlacementPlanFromPhysicalArrayOrder(
 FailureOr<IslandPlacementResources>
 buildIslandPlacementResources(const TaskGraphPlacementProblem &problem,
                               llvm::ArrayRef<int64_t> physicalArrayOrder) {
-  if (!problem.islandGraph.islands.empty() && physicalArrayOrder.empty()) {
+  bool hasAnalogIsland =
+      llvm::any_of(problem.islandGraph.islands, [](const auto &island) {
+        return task_graph::isAnalogIsland(island);
+      });
+  if (hasAnalogIsland && physicalArrayOrder.empty()) {
     emitPlacementError(problem)
-        << "expected logical island placement to have a physical array order";
-    return failure();
-  }
-
-  int64_t reductionWidth = 0;
-  for (const auto &island : problem.islandGraph.islands) {
-    if (!task_graph::isReductionIsland(island))
-      continue;
-    if (!island.reductionWidth || !island.reductionLane) {
-      emitPlacementError(problem)
-          << "expected reduction island to carry width and lane metadata";
-      return failure();
-    }
-    reductionWidth = std::max(reductionWidth, *island.reductionWidth);
-  }
-
-  llvm::SmallVector<int64_t, 8> reductionCoreByLane;
-  llvm::DenseSet<int64_t> seenCores;
-  for (int64_t physicalArrayId : physicalArrayOrder) {
-    int64_t coreId = physicalArrayId / problem.budget.arraysPerCore;
-    if (!seenCores.insert(coreId).second)
-      continue;
-    if (static_cast<int64_t>(reductionCoreByLane.size()) < reductionWidth)
-      reductionCoreByLane.push_back(coreId);
-  }
-  if (static_cast<int64_t>(reductionCoreByLane.size()) != reductionWidth) {
-    emitPlacementError(problem) << "expected at least " << reductionWidth
-                                << " cores for the reduction core pool";
+        << "expected analog island placement to have a physical array order";
     return failure();
   }
 
   IslandPlacementResources resources;
-  llvm::DenseSet<int64_t> reductionCores(reductionCoreByLane.begin(),
-                                         reductionCoreByLane.end());
-  for (int64_t physicalArrayId : physicalArrayOrder) {
-    int64_t coreId = physicalArrayId / problem.budget.arraysPerCore;
-    if (!reductionCores.contains(coreId))
-      resources.analogPhysicalArrayOrder.push_back(physicalArrayId);
-  }
-  for (const auto &island : problem.islandGraph.islands) {
-    if (!task_graph::isReductionIsland(island))
-      continue;
-    if (*island.reductionLane >=
-        static_cast<int64_t>(reductionCoreByLane.size())) {
-      emitPlacementError(problem)
-          << "expected reduction lane to fit the reduction core pool";
-      return failure();
-    }
-    resources.reductionCoreByIsland[island.islandIndex] =
-        reductionCoreByLane[*island.reductionLane];
-  }
+  resources.analogPhysicalArrayOrder.append(physicalArrayOrder.begin(),
+                                            physicalArrayOrder.end());
   return resources;
 }
 
@@ -187,12 +170,34 @@ FailureOr<IslandPlacementPlan> buildPlacementPlanFromAnalogPlacements(
     const TaskGraphPlacementProblem &problem,
     const IslandPlacementResources &resources,
     const llvm::DenseMap<unsigned, int64_t> &physicalArrayByAnalogIsland) {
+  llvm::DenseMap<unsigned, int64_t> coreByAnalogIsland;
+  for (const auto &island : problem.islandGraph.islands) {
+    if (!task_graph::isAnalogIsland(island))
+      continue;
+    auto physicalArray = physicalArrayByAnalogIsland.find(island.islandIndex);
+    if (physicalArray == physicalArrayByAnalogIsland.end() ||
+        !llvm::is_contained(resources.analogPhysicalArrayOrder,
+                            physicalArray->second)) {
+      emitPlacementError(problem)
+          << "expected a physical array for analog island "
+          << island.islandIndex;
+      return failure();
+    }
+    coreByAnalogIsland[island.islandIndex] =
+        physicalArray->second / problem.budget.arraysPerCore;
+  }
+
+  auto reductionCoreByIsland =
+      buildSpatialReductionCorePlacements(problem, coreByAnalogIsland);
+  if (failed(reductionCoreByIsland))
+    return failure();
+
   IslandPlacementPlan plan;
   plan.placements.reserve(problem.islandGraph.islands.size());
   for (const auto &island : problem.islandGraph.islands) {
     if (task_graph::isReductionIsland(island)) {
-      auto core = resources.reductionCoreByIsland.find(island.islandIndex);
-      if (core == resources.reductionCoreByIsland.end()) {
+      auto core = reductionCoreByIsland->find(island.islandIndex);
+      if (core == reductionCoreByIsland->end()) {
         emitPlacementError(problem)
             << "expected a core for reduction island " << island.islandIndex;
         return failure();

@@ -80,8 +80,7 @@ buildIslandPlacements(
     llvm::ArrayRef<int64_t> physicalArrayOrder,
     llvm::ArrayRef<IslandAffinityEdge> islandAffinityEdges,
     llvm::ArrayRef<IslandExecutionEdge> islandExecutionEdges,
-    const task_schedulers::PlacementConstraints &constraints,
-    const task_schedulers::IslandPlacementResources &resources) {
+    const task_schedulers::PlacementConstraints &constraints) {
   if (matrixSetupTasks.empty())
     return llvm::SmallVector<greedy::IslandPlacement, 8>();
 
@@ -100,7 +99,7 @@ buildIslandPlacements(
 
   if (physicalArrayOrder.empty()) {
     taskGraphFunc.emitError("expected greedy island placement to have an "
-                            "analog array outside the reduction core pool");
+                            "analog array");
     return mlir::failure();
   }
 
@@ -125,8 +124,6 @@ buildIslandPlacements(
   initialState.usedSlotsByCore.assign(static_cast<size_t>(budget.numCores), 0);
   initialState.islandPlacements.reserve(matrixSetupTasks.size());
   initialState.currentCore = physicalArrayOrder.front() / budget.arraysPerCore;
-  for (const auto &entry : resources.reductionCoreByIsland)
-    initialState.coreByPlacedIsland[entry.first] = entry.second;
 
   mlir::FailureOr<greedy::PlacementState> finalState =
       config.beamWidth > 1
@@ -193,8 +190,7 @@ buildGreedyPlacementPlan(const TaskGraphPlacementProblem &problem,
       problem.taskGraphFunc, matrixSetupTasks, problem.budget, config,
       heuristic, resources->analogPhysicalArrayOrder,
       problem.islandGraph.affinityGraph.edges,
-      problem.islandGraph.executionGraph.edges, problem.constraints,
-      *resources);
+      problem.islandGraph.executionGraph.edges, problem.constraints);
   if (failed(islandPlacements))
     return failure();
 

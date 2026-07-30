@@ -30,12 +30,12 @@ module {
 // TREE-LABEL: func.func private @generate_task_graph()
 // TREE: task_name = "wide_reduction_tile_recombine.level0.lane0"
 // TREE: task_name = "wide_reduction_tile_recombine.level0.lane1"
-// TREE: task_name = "wide_reduction_tile_recombine.level1.lane0"
+// TREE: task_name = "wide_reduction_tile_recombine.level1.root"
 // TREE-NOT: task_name = "wide_reduction_tile_recombine"
 
 // PIPELINE-LABEL: module attributes
 // PIPELINE-SAME: sculptor.deployment.active_core_ids = [0, 1, 2, 3]
-// PIPELINE-SAME: sculptor.deployment.model_inputs = [{global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 2 : i64}, {global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 3 : i64}]
+// PIPELINE-SAME: sculptor.deployment.model_inputs = [{global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 0 : i64}, {global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 1 : i64}, {global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 2 : i64}, {global_resource_id = 0 : i64, input_index = 0 : i64, owner_core = 3 : i64}]
 // PIPELINE-SAME: sculptor.timing.critical_path_ns
 // PIPELINE: module @core_
 // PIPELINE-LABEL: func.func private @generate_task_graph()

@@ -35,7 +35,7 @@ module {
 }
 
 // HELPERS-NOT: func.func private @star_
-// HELPERS-COUNT-6: attributes {sculptor.task.reduction_helper = #sculptor.task_reduction
+// HELPERS-COUNT-12: attributes {sculptor.task.reduction_helper = #sculptor.task_reduction
 // HELPERS-NOT: attributes {sculptor.task.reduction_helper = #sculptor.task_reduction
 
 // OPS-DAG: arith.addf
@@ -44,16 +44,16 @@ module {
 // OPS-LABEL: func.func private @generate_task_graph()
 // OPS: task_name = "add_a.level0.lane0"
 // OPS: task_name = "add_a.level0.lane1"
-// OPS: task_name = "add_a.level1.lane0"
+// OPS: task_name = "add_a.level1.root"
 // OPS: task_name = "add_b.level0.lane0"
 // OPS: task_name = "add_b.level0.lane1"
-// OPS: task_name = "add_b.level1.lane0"
+// OPS: task_name = "add_b.level1.root"
 // OPS: task_name = "maximum.level0.lane0"
 // OPS: task_name = "maximum.level0.lane1"
-// OPS: task_name = "maximum.level1.lane0"
+// OPS: task_name = "maximum.level1.root"
 // OPS: task_name = "minimum.level0.lane0"
 // OPS: task_name = "minimum.level0.lane1"
-// OPS: task_name = "minimum.level1.lane0"
+// OPS: task_name = "minimum.level1.root"
 
 // REUSE-DAG: task_name = "add_a.level0.lane0"{{.*}}sculptor.runtime.core_id = 0 : i64
 // REUSE-DAG: task_name = "add_a.level0.lane1"{{.*}}sculptor.runtime.core_id = 1 : i64
@@ -61,3 +61,5 @@ module {
 // REUSE-DAG: task_name = "add_b.level0.lane1"{{.*}}sculptor.runtime.core_id = 1 : i64
 // REUSE-DAG: task_name = "maximum.level0.lane0"{{.*}}sculptor.runtime.core_id = 0 : i64
 // REUSE-DAG: task_name = "maximum.level0.lane1"{{.*}}sculptor.runtime.core_id = 1 : i64
+// REUSE-DAG: task_name = "add_a.level1.root"{{.*}}sculptor.runtime.core_id = 0 : i64
+// REUSE-DAG: task_name = "add_b.level1.root"{{.*}}sculptor.runtime.core_id = 1 : i64

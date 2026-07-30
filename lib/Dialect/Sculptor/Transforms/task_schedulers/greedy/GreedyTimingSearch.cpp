@@ -118,6 +118,8 @@ selectNextIsland(const TimingPlacementState &state,
                  const TimingSearchContext &context) {
   const IslandTimingProfile *best = nullptr;
   for (const auto &island : context.problem.islandGraph.islands) {
+    if (!task_graph::isAnalogIsland(island))
+      continue;
     unsigned islandId = island.islandIndex;
     if (state.placement.coreByPlacedIsland.contains(islandId))
       continue;
@@ -411,22 +413,6 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
         placementResources->analogPhysicalArrayOrder.front() /
         problem.budget.arraysPerCore;
   }
-  for (const auto &entry : placementResources->reductionCoreByIsland) {
-    initialState.placement.coreByPlacedIsland[entry.first] = entry.second;
-    const IslandTimingProfile *timing =
-        model->timingByIsland.lookup(entry.first);
-    if (!timing)
-      continue;
-    initialState.finishByIsland[entry.first] = timing->earliestFinishNs;
-    initialState.digitalReadyByCore[entry.second] =
-        std::max(initialState.digitalReadyByCore[entry.second],
-                 timing->earliestFinishNs);
-    initialState.digitalWorkByCore[entry.second] += timing->digitalWorkNs;
-    initialState.score.maximumResourceWorkNs =
-        std::max(initialState.score.maximumResourceWorkNs,
-                 initialState.digitalWorkByCore[entry.second]);
-  }
-
   auto isComplete = [&](const TimingPlacementState &state) {
     return state.placement.islandPlacements.size() == analogIslandCount;
   };

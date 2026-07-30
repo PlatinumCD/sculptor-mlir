@@ -33,6 +33,7 @@ The scheduler implementation is split by responsibility:
 | `TaskGraphIslandCommunication.cpp` | Island-level communication edge construction and compaction. |
 | `TaskGraphIslandInternals.h` | Private island-builder helpers shared by the island implementation files. |
 | `TaskGraphPlacementPlan.h/.cpp` | Canonical scheduler output and placement-plan validation. |
+| `TaskGraphReductionPlacement.h/.cpp` | Shared byte-weighted, topology-aware placement for balanced-reduction lanes and roots. |
 | `TaskGraphPlacementObjective.h/.cpp` | Shared island transfer and boundary objective. |
 | `TaskGraphPlacement.h` | Central placement-plan commit and placement attachment API. |
 | `TaskGraphPlacementUtils.cpp` | Physical placement materialization and fallback core propagation. |
@@ -50,9 +51,10 @@ The scheduler implementation is split by responsibility:
 reassociable fan-in operations before island construction. For an original
 fan-in `F` and `reduction-width=W`, reductions with `F <= W` are unchanged. A
 larger reduction is divided as evenly as possible among `W` first-stage lanes,
-and one final reduction combines the lane results. Generated tasks carry stable
-tree, level, lane, and width metadata. For example, `F=32,W=4` produces four
-fan-in-8 lane tasks followed by one fan-in-4 final task.
+and one independently placeable root reduction combines the lane results.
+Generated tasks carry stable tree, level, lane, and width metadata; root tasks
+carry no lane number. For example, `F=32,W=4` produces four fan-in-8 lane tasks
+followed by one fan-in-4 root task.
 `require-change=true` makes the pass fail when it finds no eligible marked
 reduction. Production pipelines normally leave this disabled; experiment
 runners enable it to prevent stale or incompatible checkpoints from silently
@@ -61,8 +63,8 @@ producing an unchanged comparison graph.
 `sculptor-build-task-graph-islands` owns logical grouping:
 
 1. Parse each task graph function into a `TaskGraphDAG`.
-2. Seed matrix setup/MVM analog islands and `(reduction tree, lane)` reduction
-   islands.
+2. Seed matrix setup/MVM analog islands, `(reduction tree, lane)` first-stage
+   islands, and one root island per balanced reduction.
 3. Assign digital tasks and construct island communication edges.
 4. Attach stable island IDs to the resulting island members.
 
@@ -191,11 +193,16 @@ placement and placement metadata:
    islands.
 7. Finalize transfer summaries and the placement score on the unfused graph.
 
-When reduction islands are present, scheduling reserves a reusable pool of
-`W` cores, where `W` is the largest generated reduction width in the graph.
-Reduction lane `i` always maps to pool core `i` for every reduction tree. The
-final task belongs to lane `0`. Analog islands cannot consume arrays on these
-reserved cores, and reduction tasks never receive physical-array metadata.
+Reduction placement is topology-aware and happens after a scheduler has chosen
+the analog-island locations. For each reduction tree, first-stage lanes are
+placed near their producer islands and a provisional root using byte-weighted
+Manhattan distance. Active lanes in one tree use distinct cores. The root is a
+separate island placed from the resulting lane locations and downstream
+consumer affinity. Existing work on a core and distance from the weighted
+median provide deterministic tie-breaking. Lane numbers have no permanent
+relationship to core numbers, different trees may map the same lane to
+different cores, and reduction tasks never receive physical-array metadata.
+Reduction work may share a core with an analog island.
 
 Topology changes and runtime allocation are deliberately separate. The
 `sculptor-fuse-task-graph` pass runs after scheduling, placement-aware timing is
@@ -251,8 +258,8 @@ The placement pass receives a hardware budget through pass parameters.
 
 `reduction-width` belongs to `sculptor-balance-task-graph-reductions`, not to
 the scheduling pass. It controls reduction parallelism and therefore the size
-of the dedicated reduction-core pool. Its default is `2`, and it must be at
-least `2`.
+of the independently placed first-stage lane set. Its default is `2`, and it
+must be at least `2`.
 
 The total analog array budget is:
 
@@ -325,11 +332,10 @@ before physical placement. Clear same-source-layer components between analog
 anchors are assigned by a byte-only min-cut. Components that do not have an
 unambiguous analog boundary use the producer/consumer fallback.
 
-A reduction island is digital-only. It groups generated reduction tasks by
-`(reduction_tree_id, reduction_lane)`. The first-stage lane-0 task and final
-task therefore share one island and core, while other lanes use distinct
-islands and cores. Ordinary digital tasks are not absorbed into reduction
-islands.
+A reduction island is digital-only. First-stage tasks are grouped by
+`(reduction_tree_id, reduction_lane)`, while the root receives its own island.
+This lets the scheduler place the final combination independently from every
+lane. Ordinary digital tasks are not absorbed into reduction islands.
 
 Every strategy returns the same `IslandPlacementPlan`: one placement record per
 logical island, in island order. Every record has a core ID; only an analog

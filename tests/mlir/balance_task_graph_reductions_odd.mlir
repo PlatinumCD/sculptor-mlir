@@ -20,5 +20,5 @@ module {
 // CHECK-SAME: inputs[%{{.*}}, %{{.*}}, %{{.*}}]
 // CHECK: task_name = "odd.level0.lane1"
 // CHECK-SAME: inputs[%{{.*}}, %{{.*}}]
-// CHECK: task_name = "odd.level1.lane0"
+// CHECK: task_name = "odd.level1.root"
 // CHECK-NOT: task_name = "odd.level"

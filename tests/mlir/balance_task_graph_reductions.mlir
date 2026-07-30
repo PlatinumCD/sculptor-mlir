@@ -50,9 +50,10 @@ module {
 // CHECK-SAME: sculptor.task.reduction_width = 2 : i64
 // CHECK: task_kind = "digital.reduction", task_name = "star.level0.lane1"
 // CHECK-SAME: sculptor.task.reduction_lane = 1 : i64
-// CHECK: %[[ROOT:.*]] = sculptor.task.create {{.*}} task_name = "star.level1.lane0"
+// CHECK: %[[ROOT:.*]] = sculptor.task.create {{.*}} task_name = "star.level1.root"
 // CHECK-SAME: outputs[%{{.*}}]
 // CHECK-SAME: sculptor.task.reduction = #sculptor.task_reduction<kind = add, reassociate = true>
+// CHECK-NOT: sculptor.task.reduction_lane
 // CHECK-NOT: task_name = "star.level"
 // CHECK: task_name = "sink"
 // CHECK-SAME: deps[%[[ROOT]]]

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace mlir {
@@ -80,7 +81,9 @@ static std::string getReductionKindName(TaskReductionKind kind) {
 
 static std::string getReductionHelperBaseName(TaskReductionKind kind,
                                               RankedTensorType tensorType,
-                                              unsigned arity, int64_t lane) {
+                                              unsigned arity, int64_t treeId,
+                                              int64_t level,
+                                              std::optional<int64_t> lane) {
   std::string typeText;
   llvm::raw_string_ostream stream(typeText);
   tensorType.print(stream);
@@ -88,7 +91,9 @@ static std::string getReductionHelperBaseName(TaskReductionKind kind,
   uint64_t typeHash =
       static_cast<uint64_t>(static_cast<size_t>(llvm::hash_value(typeText)));
   return "__sculptor_reduce_" + getReductionKindName(kind) + "_" +
-         std::to_string(arity) + "_lane" + std::to_string(lane) + "_" +
+         std::to_string(arity) + "_tree" + std::to_string(treeId) + "_level" +
+         std::to_string(level) +
+         (lane ? "_lane" + std::to_string(*lane) : "_root") + "_" +
          llvm::utohexstr(typeHash, /*LowerCase=*/true);
 }
 
@@ -111,13 +116,17 @@ public:
 
   FailureOr<func::FuncOp> getOrCreate(Location loc, TaskReductionAttr reduction,
                                       RankedTensorType tensorType,
-                                      unsigned arity, int64_t lane) {
+                                      unsigned arity, int64_t treeId,
+                                      int64_t level,
+                                      std::optional<int64_t> lane) {
     if (arity < 2)
       return failure();
 
     std::string cacheKey = getReductionKindName(reduction.getKind()) + ":" +
-                           std::to_string(arity) + ":" + std::to_string(lane) +
-                           ":";
+                           std::to_string(arity) + ":" +
+                           std::to_string(treeId) + ":" +
+                           std::to_string(level) + ":" +
+                           (lane ? std::to_string(*lane) : "root") + ":";
     llvm::raw_string_ostream keyStream(cacheKey);
     tensorType.print(keyStream);
     keyStream.flush();
@@ -128,8 +137,8 @@ public:
     llvm::SmallVector<Type, 8> inputTypes(arity, tensorType);
     FunctionType functionType =
         FunctionType::get(module.getContext(), inputTypes, tensorType);
-    std::string baseName = getReductionHelperBaseName(reduction.getKind(),
-                                                      tensorType, arity, lane);
+    std::string baseName = getReductionHelperBaseName(
+        reduction.getKind(), tensorType, arity, treeId, level, lane);
     std::string functionName = baseName;
     unsigned suffix = 0;
     while (func::FuncOp existing =
@@ -138,9 +147,16 @@ public:
           task_graph_attrs::kTaskReductionHelperAttrName);
       auto existingLane = existing->getAttrOfType<IntegerAttr>(
           task_graph_attrs::kTaskReductionLaneAttrName);
+      auto existingTree = existing->getAttrOfType<IntegerAttr>(
+          task_graph_attrs::kTaskReductionTreeIdAttrName);
+      auto existingLevel = existing->getAttrOfType<IntegerAttr>(
+          task_graph_attrs::kTaskReductionLevelAttrName);
       if (existing.getFunctionType() == functionType &&
-          existingReduction == reduction && existingLane &&
-          existingLane.getInt() == lane) {
+          existingReduction == reduction && existingTree &&
+          existingTree.getInt() == treeId && existingLevel &&
+          existingLevel.getInt() == level &&
+          ((!lane && !existingLane) ||
+           (lane && existingLane && existingLane.getInt() == *lane))) {
         helperByKey.try_emplace(cacheKey, existing);
         return existing;
       }
@@ -152,8 +168,14 @@ public:
     auto helper = builder.create<func::FuncOp>(loc, functionName, functionType);
     helper.setPrivate();
     helper->setAttr(task_graph_attrs::kTaskReductionHelperAttrName, reduction);
-    helper->setAttr(task_graph_attrs::kTaskReductionLaneAttrName,
-                    builder.getI64IntegerAttr(lane));
+    helper->setAttr(task_graph_attrs::kTaskReductionTreeIdAttrName,
+                    builder.getI64IntegerAttr(treeId));
+    helper->setAttr(task_graph_attrs::kTaskReductionLevelAttrName,
+                    builder.getI64IntegerAttr(level));
+    if (lane) {
+      helper->setAttr(task_graph_attrs::kTaskReductionLaneAttrName,
+                      builder.getI64IntegerAttr(*lane));
+    }
 
     Block *entry = helper.addEntryBlock();
     builder.setInsertionPointToStart(entry);
@@ -238,13 +260,16 @@ static int64_t collectNextReductionTreeId(func::FuncOp taskGraphFunc) {
 
 static void attachReductionTreeMetadata(TaskCreateOp taskOp, OpBuilder &builder,
                                         int64_t treeId, int64_t level,
-                                        int64_t lane, int64_t width) {
+                                        std::optional<int64_t> lane,
+                                        int64_t width) {
   taskOp->setAttr(task_graph_attrs::kTaskReductionTreeIdAttrName,
                   builder.getI64IntegerAttr(treeId));
   taskOp->setAttr(task_graph_attrs::kTaskReductionLevelAttrName,
                   builder.getI64IntegerAttr(level));
-  taskOp->setAttr(task_graph_attrs::kTaskReductionLaneAttrName,
-                  builder.getI64IntegerAttr(lane));
+  if (lane) {
+    taskOp->setAttr(task_graph_attrs::kTaskReductionLaneAttrName,
+                    builder.getI64IntegerAttr(*lane));
+  }
   taskOp->setAttr(task_graph_attrs::kTaskReductionWidthAttrName,
                   builder.getI64IntegerAttr(width));
 }
@@ -254,10 +279,11 @@ static FailureOr<TaskCreateOp> createReductionTask(
     ReductionCalleeCache &calleeCache, TaskReductionAttr reduction,
     RankedTensorType tensorType, llvm::ArrayRef<ReductionLeaf> inputs,
     Value outputResource, llvm::StringRef suffix, int64_t treeId, int64_t level,
-    int64_t lane, int64_t width, llvm::StringMap<int64_t> &nextOrdinalByLayer,
-    OpBuilder &builder) {
-  auto callee = calleeCache.getOrCreate(originalTask.getLoc(), reduction,
-                                        tensorType, inputs.size(), lane);
+    std::optional<int64_t> lane, int64_t width,
+    llvm::StringMap<int64_t> &nextOrdinalByLayer, OpBuilder &builder) {
+  auto callee =
+      calleeCache.getOrCreate(originalTask.getLoc(), reduction, tensorType,
+                              inputs.size(), treeId, level, lane);
   if (failed(callee))
     return failure();
 
@@ -392,8 +418,9 @@ static LogicalResult rewriteReductionTask(
 
   auto rootTask = createReductionTask(
       module, reductionTask, calleeCache, reduction, *tensorType, laneOutputs,
-      reductionTask.getOutputs().front(), ".level1.lane0", treeId,
-      /*level=*/1, /*lane=*/0, reductionWidth, nextOrdinalByLayer, builder);
+      reductionTask.getOutputs().front(), ".level1.root", treeId,
+      /*level=*/1, /*lane=*/std::nullopt, reductionWidth, nextOrdinalByLayer,
+      builder);
 
   if (failed(rootTask))
     return reductionTask.emitError("failed to create a reduction tree root");

@@ -32,7 +32,8 @@ inline bool isAnalogComputeTask(sculptor::TaskCreateOp taskOp) {
 inline bool isReductionTask(sculptor::TaskCreateOp taskOp) {
   return hasTaskKind(taskOp, task_graph_names::kReductionTaskKind) &&
          taskOp->hasAttr(task_graph_attrs::kTaskReductionTreeIdAttrName) &&
-         taskOp->hasAttr(task_graph_attrs::kTaskReductionLaneAttrName);
+         taskOp->hasAttr(task_graph_attrs::kTaskReductionLevelAttrName) &&
+         taskOp->hasAttr(task_graph_attrs::kTaskReductionWidthAttrName);
 }
 
 inline bool sameNonEmptySourceLayer(sculptor::TaskCreateOp lhs,
