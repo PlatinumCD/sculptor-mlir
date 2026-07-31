@@ -166,8 +166,10 @@ LogicalResult emitTaskAdapter(ModuleOp module, TaskModel &task,
   auto *tensorBlock = new Block();
   auto *descriptorBlock = new Block();
   auto *invokeBlock = new Block();
-  Block *copyBlock = task.outputTypes.empty() ? nullptr : new Block();
-  Block *resultFailureBlock = task.outputTypes.empty() ? nullptr : new Block();
+  bool returnsOutputDescriptors =
+      !task.outputTypes.empty() && !task.usesOutputParameters;
+  Block *copyBlock = returnsOutputDescriptors ? new Block() : nullptr;
+  Block *resultFailureBlock = returnsOutputDescriptors ? new Block() : nullptr;
   auto *failureBlock = new Block();
   adapter.getBody().push_back(tensorBlock);
   adapter.getBody().push_back(descriptorBlock);
@@ -280,9 +282,15 @@ LogicalResult emitTaskAdapter(ModuleOp module, TaskModel &task,
   for (auto indexedDescriptor : llvm::enumerate(inputDescriptors))
     flattenDescriptor(invokeBuilder, loc, indexedDescriptor.value(),
                       task.inputTypes[indexedDescriptor.index()], callOperands);
+  if (task.usesOutputParameters) {
+    for (auto indexedDescriptor : llvm::enumerate(outputDescriptors))
+      flattenDescriptor(invokeBuilder, loc, indexedDescriptor.value(),
+                        task.outputTypes[indexedDescriptor.index()],
+                        callOperands);
+  }
   auto call =
       invokeBuilder.create<LLVM::CallOp>(loc, task.callee, callOperands);
-  if (task.outputTypes.empty()) {
+  if (task.outputTypes.empty() || task.usesOutputParameters) {
     invokeBuilder.create<LLVM::ReturnOp>(
         loc, buildI32(invokeBuilder, loc, kTaskSuccess));
   } else {

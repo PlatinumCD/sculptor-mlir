@@ -20,6 +20,8 @@
 // CHECK: llvm.call @task_setup_0()
 // CHECK: llvm.func internal @__golem_tile_execute_task_1
 // CHECK: llvm.call @task_mvm_0
+// CHECK-NOT: llvm.intr.memcpy
+// CHECK-NOT: llvm.call @free
 // CHECK: llvm.func @golem_tile_core_id()
 // CHECK: llvm.mlir.constant(0 : i32) : i32
 // CHECK: llvm.mlir.global internal constant @__golem_tile_boot_tasks()
@@ -67,10 +69,9 @@ module attributes {
     sculptor.runtime.physical_array_id = 0 : i64
   }
   llvm.func @task_mvm_0(
+    !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64,
     !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64
-  ) -> !llvm.struct<(
-    ptr, ptr, i64, array<2 x i64>, array<2 x i64>
-  )> attributes {
+  ) attributes {
     sculptor.runtime.core_id = 0 : i64,
     sculptor.runtime.local_array_id = 0 : i64,
     sculptor.runtime.physical_array_id = 0 : i64

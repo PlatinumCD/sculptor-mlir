@@ -1,6 +1,11 @@
 // RUN: sculptor-mlir-opt %s --sculptor-emit-golem-tile-abi | FileCheck %s
 // RUN: sculptor-mlir-opt %s --sculptor-emit-golem-tile-abi --sculptor-finalize-golem-intrinsics | mlir-translate --mlir-to-llvmir | FileCheck %s --check-prefix=LLVM
 
+// CHECK-LABEL: llvm.func internal @__golem_tile_execute_task_1
+// CHECK: llvm.call @multi_input_output
+// CHECK-NOT: llvm.intr.memcpy
+// CHECK-NOT: llvm.call @free
+// CHECK: llvm.func internal @__golem_tile_execute_task_2
 // CHECK: llvm.mlir.global internal constant @__golem_tile_resources
 // CHECK: llvm.func @golem_tile_resource_count
 // CHECK: llvm.mlir.constant(6 : i32) : i32
@@ -77,11 +82,10 @@ module attributes {
     !llvm.ptr, !llvm.ptr, i64,
     i64, i64, i64, i64,
     i64, i64, i64, i64,
+    !llvm.ptr, !llvm.ptr, i64, i64, i64,
+    !llvm.ptr, !llvm.ptr, i64, i64, i64,
     !llvm.ptr, !llvm.ptr, i64, i64, i64
-  ) -> !llvm.struct<(
-    struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>,
-    struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-  )>
+  )
   llvm.func @route_output_task(
     !llvm.ptr, !llvm.ptr, i64, i64, i64
   ) -> !llvm.struct<(

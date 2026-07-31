@@ -364,25 +364,46 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
   return result;
 }
 
+static void appendFlattenedMemRefParameters(SmallVectorImpl<Type> &parameters,
+                                            ShapedType shapedType,
+                                            Type ptrType, Type i64Type) {
+  parameters.push_back(ptrType);
+  parameters.push_back(ptrType);
+  parameters.push_back(i64Type);
+  parameters.append(shapedType.getRank(), i64Type);
+  parameters.append(shapedType.getRank(), i64Type);
+}
+
 LogicalResult validateCalleeSignature(TaskModel &task) {
   auto functionType = task.callee.getFunctionType();
-  SmallVector<Type> expectedParameters;
+  SmallVector<Type> expectedInputParameters;
   Type ptrType = LLVM::LLVMPointerType::get(task.op.getContext());
   Type i64Type = IntegerType::get(task.op.getContext(), 64);
-  for (ShapedType inputType : task.inputTypes) {
-    expectedParameters.push_back(ptrType);
-    expectedParameters.push_back(ptrType);
-    expectedParameters.push_back(i64Type);
-    expectedParameters.append(inputType.getRank(), i64Type);
-    expectedParameters.append(inputType.getRank(), i64Type);
-  }
+  for (ShapedType inputType : task.inputTypes)
+    appendFlattenedMemRefParameters(expectedInputParameters, inputType, ptrType,
+                                    i64Type);
 
-  if (functionType.getParams() != ArrayRef<Type>(expectedParameters)) {
+  SmallVector<Type> expectedOutputParameters(expectedInputParameters);
+  for (ShapedType outputType : task.outputTypes)
+    appendFlattenedMemRefParameters(expectedOutputParameters, outputType,
+                                    ptrType, i64Type);
+
+  bool hasInputParameters =
+      functionType.getParams() == ArrayRef<Type>(expectedInputParameters);
+  bool hasOutputParameters = !task.outputTypes.empty() &&
+                             functionType.getParams() ==
+                                 ArrayRef<Type>(expectedOutputParameters) &&
+                             isa<LLVM::LLVMVoidType>(
+                                 functionType.getReturnType());
+  if (!hasInputParameters && !hasOutputParameters) {
     task.op.emitError("LLVM task callee '")
         << task.callee.getName()
-        << "' does not match the flattened memref input ABI";
+        << "' does not match the flattened memref input or output-parameter "
+           "ABI";
     return failure();
   }
+
+  task.usesOutputParameters = hasOutputParameters;
 
   Type returnType = functionType.getReturnType();
   if (task.outputTypes.empty()) {
@@ -393,6 +414,9 @@ LogicalResult validateCalleeSignature(TaskModel &task) {
     }
     return success();
   }
+
+  if (task.usesOutputParameters)
+    return success();
 
   if (isa<LLVM::LLVMVoidType>(returnType)) {
     task.op.emitError("expected an LLVM descriptor result for a task with "
