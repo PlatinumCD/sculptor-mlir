@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseSlicesOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/StreamingConvolutionOptimizer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/VectorizedElementwiseOptimizer.h"
 
 #include "llvm/ADT/StringMap.h"
 
@@ -14,6 +15,7 @@ getTaskGraphOptimizationPatterns() {
   static const TaskGraphOptimizationPattern patterns[] = {
       {"streaming-convolution", optimizeStreamingConvolution},
       {"elementwise-slices", optimizeElementwiseSlices},
+      {"vectorized-elementwise", optimizeVectorizedElementwise},
   };
   return patterns;
 }
