@@ -1,5 +1,5 @@
 // RUN: sculptor-mlir-opt %s --sculptor-optimize-task-graph="patterns=vectorized-elementwise require-change=true" --canonicalize --cse | FileCheck %s
-// RUN: sculptor-mlir-opt %s --sculptor-optimize-task-graph="patterns=vectorized-elementwise require-change=true" --symbol-dce --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --buffer-results-to-out-params --convert-bufferization-to-memref --buffer-deallocation-pipeline --convert-scf-to-cf --expand-strided-metadata --convert-vector-to-llvm --convert-arith-to-llvm --convert-index-to-llvm --convert-cf-to-llvm --finalize-memref-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts | mlir-translate --mlir-to-llvmir | FileCheck %s --check-prefix=LLVM
+// RUN: sculptor-mlir-opt %s --sculptor-optimize-task-graph="patterns=vectorized-elementwise require-change=true" --symbol-dce --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --buffer-results-to-out-params="hoist-static-allocs" --sculptor-vectorize-marked-elementwise="require-change=true" --convert-bufferization-to-memref --buffer-deallocation-pipeline --convert-scf-to-cf --expand-strided-metadata --convert-vector-to-llvm --convert-arith-to-llvm --convert-index-to-llvm --convert-cf-to-llvm --finalize-memref-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts | mlir-translate --mlir-to-llvmir | FileCheck %s --check-prefix=LLVM
 
 #identity = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
@@ -81,18 +81,17 @@ module {
 }
 
 // CHECK-LABEL: func.func @task_residual_add(
-// CHECK: scf.for
-// CHECK-COUNT-2: vector.transfer_read
-// CHECK: arith.addf {{.*}} : vector<8xf32>
-// CHECK: vector.transfer_write
-// CHECK: sculptor.optimization.vector_width = 8 : i64
-// CHECK-NOT: linalg.generic
+// CHECK: linalg.generic
+// CHECK-SAME: sculptor.optimization.vector_width = 8 : i64
+// CHECK-NOT: vector.transfer_read
 
 // CHECK-LABEL: func.func private @task_residual_add_nondivisible(
 // CHECK: linalg.generic
 // CHECK-NOT: vector.transfer_read
 
 // LLVM-LABEL: define void @task_residual_add(
+// LLVM-NOT: call ptr @malloc
+// LLVM-NOT: call void @free
 // LLVM: load <8 x float>
 // LLVM: load <8 x float>
 // LLVM: fadd <8 x float>

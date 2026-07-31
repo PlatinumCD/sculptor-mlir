@@ -4,14 +4,9 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 
 #include "llvm/ADT/SmallVector.h"
-
-#include <array>
-#include <optional>
 
 namespace mlir {
 namespace sculptor {
@@ -76,72 +71,6 @@ getSupportedResultType(linalg::GenericOp generic) {
   return resultType;
 }
 
-static void rewriteResidualAdd(linalg::GenericOp generic,
-                               RankedTensorType resultType,
-                               IRRewriter &rewriter) {
-  Location loc = generic.getLoc();
-  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-  Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-  Value vectorWidth =
-      rewriter.create<arith::ConstantIndexOp>(loc, kVectorWidth);
-  Value dim0 =
-      rewriter.create<arith::ConstantIndexOp>(loc, resultType.getDimSize(0));
-  Value dim1 =
-      rewriter.create<arith::ConstantIndexOp>(loc, resultType.getDimSize(1));
-  Value dim2 =
-      rewriter.create<arith::ConstantIndexOp>(loc, resultType.getDimSize(2));
-  Value padding = rewriter.create<arith::ConstantFloatOp>(
-      loc, rewriter.getF32Type(), APFloat(0.0f));
-  auto vectorType =
-      mlir::VectorType::get({kVectorWidth}, rewriter.getF32Type());
-  Value lhs = generic.getDpsInputs()[0];
-  Value rhs = generic.getDpsInputs()[1];
-  Value initial = generic.getDpsInits()[0];
-  std::array<bool, 1> inBoundsStorage{true};
-  ArrayRef<bool> inBounds(inBoundsStorage);
-
-  auto batchLoop = rewriter.create<scf::ForOp>(
-      loc, zero, dim0, one, ValueRange{initial},
-      [&](OpBuilder &batchBuilder, Location batchLoc, Value batch,
-          ValueRange batchArguments) {
-        auto rowLoop = batchBuilder.create<scf::ForOp>(
-            batchLoc, zero, dim1, one, batchArguments,
-            [&](OpBuilder &rowBuilder, Location rowLoc, Value row,
-                ValueRange rowArguments) {
-              auto columnLoop = rowBuilder.create<scf::ForOp>(
-                  rowLoc, zero, dim2, vectorWidth, rowArguments,
-                  [&](OpBuilder &columnBuilder, Location columnLoc,
-                      Value column, ValueRange columnArguments) {
-                    SmallVector<Value, 3> indices{batch, row, column};
-                    Value left = columnBuilder.create<vector::TransferReadOp>(
-                        columnLoc, vectorType, lhs, indices,
-                        std::optional<Value>(padding),
-                        std::optional<ArrayRef<bool>>(inBounds));
-                    Value right = columnBuilder.create<vector::TransferReadOp>(
-                        columnLoc, vectorType, rhs, indices,
-                        std::optional<Value>(padding),
-                        std::optional<ArrayRef<bool>>(inBounds));
-                    Value sum = columnBuilder.create<arith::AddFOp>(
-                        columnLoc, left, right);
-                    Value next =
-                        columnBuilder
-                            .create<vector::TransferWriteOp>(
-                                columnLoc, sum, columnArguments.front(),
-                                indices,
-                                std::optional<ArrayRef<bool>>(inBounds))
-                            .getResult();
-                    columnBuilder.create<scf::YieldOp>(columnLoc, next);
-                  });
-              columnLoop->setAttr("sculptor.optimization.vector_width",
-                                  rewriter.getI64IntegerAttr(kVectorWidth));
-              rowBuilder.create<scf::YieldOp>(rowLoc, columnLoop.getResult(0));
-            });
-        batchBuilder.create<scf::YieldOp>(batchLoc, rowLoop.getResult(0));
-      });
-
-  rewriter.replaceOp(generic, batchLoop.getResult(0));
-}
-
 } // namespace
 
 LogicalResult optimizeVectorizedElementwise(ModuleOp module,
@@ -156,15 +85,16 @@ LogicalResult optimizeVectorizedElementwise(ModuleOp module,
   module.walk(
       [&](linalg::GenericOp generic) { candidates.push_back(generic); });
 
-  IRRewriter rewriter(module.getContext());
+  Builder builder(module.getContext());
   for (linalg::GenericOp candidate : candidates) {
-    if (!candidate->getBlock())
+    if (!candidate->getBlock() ||
+        candidate->hasAttr(kVectorizedElementwiseWidthAttrName))
       continue;
     FailureOr<RankedTensorType> resultType = getSupportedResultType(candidate);
     if (failed(resultType))
       continue;
-    rewriter.setInsertionPoint(candidate);
-    rewriteResidualAdd(candidate, *resultType, rewriter);
+    candidate->setAttr(kVectorizedElementwiseWidthAttrName,
+                       builder.getI64IntegerAttr(kVectorWidth));
     changed = true;
   }
   return success();

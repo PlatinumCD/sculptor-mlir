@@ -6,9 +6,14 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "llvm/ADT/StringRef.h"
+
 namespace mlir {
 namespace sculptor {
 namespace task_graph {
+
+inline constexpr llvm::StringLiteral kVectorizedElementwiseWidthAttrName =
+    "sculptor.optimization.vector_width";
 
 LogicalResult optimizeVectorizedElementwise(ModuleOp module,
                                             func::FuncOp taskGraphFunc,

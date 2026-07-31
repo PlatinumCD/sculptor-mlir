@@ -24,6 +24,7 @@ add_mlir_library(MLIRSculptorTransforms
   PartitionTaskGraphByCore.cpp
   ScheduleTaskGraph.cpp
   TaskGraphTaskMetadata.cpp
+  VectorizeMarkedElementwise.cpp
   assemblers/TaskGraphExecutionPlanAssembler.cpp
   assemblers/TaskGraphGeneratorAssembler.cpp
   assemblers/TaskGraphResourceAssembler.cpp

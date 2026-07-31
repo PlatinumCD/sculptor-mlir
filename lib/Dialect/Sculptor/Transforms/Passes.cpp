@@ -19,6 +19,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/OptimizeTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/VectorizeMarkedElementwise.h"
 
 namespace mlir {
 namespace sculptor {
@@ -45,6 +46,7 @@ void registerSculptorPasses() {
   registerOptimizeTaskGraphPass();
   registerPartitionTaskGraphByCorePass();
   registerScheduleTaskGraphPass();
+  registerVectorizeMarkedElementwisePass();
 }
 
 } // namespace sculptor
