@@ -365,8 +365,8 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
 }
 
 static void appendFlattenedMemRefParameters(SmallVectorImpl<Type> &parameters,
-                                            ShapedType shapedType,
-                                            Type ptrType, Type i64Type) {
+                                            ShapedType shapedType, Type ptrType,
+                                            Type i64Type) {
   parameters.push_back(ptrType);
   parameters.push_back(ptrType);
   parameters.push_back(i64Type);
@@ -383,18 +383,50 @@ LogicalResult validateCalleeSignature(TaskModel &task) {
     appendFlattenedMemRefParameters(expectedInputParameters, inputType, ptrType,
                                     i64Type);
 
+  bool hasDenseResultIndices = true;
+  if (!task.outputTypes.empty()) {
+    unsigned maximumResultIndex = *llvm::max_element(task.resultIndices);
+    if (maximumResultIndex == std::numeric_limits<unsigned>::max()) {
+      task.op.emitError("task result index exceeds the Golem tile ABI");
+      return failure();
+    }
+    unsigned resultCount = maximumResultIndex + 1;
+    task.canonicalOutputIndices.assign(resultCount,
+                                       std::numeric_limits<unsigned>::max());
+    for (auto indexedOutput : llvm::enumerate(task.outputTypes)) {
+      unsigned outputIndex = indexedOutput.index();
+      unsigned resultIndex = task.resultIndices[outputIndex];
+      unsigned &canonicalOutputIndex = task.canonicalOutputIndices[resultIndex];
+      if (canonicalOutputIndex == std::numeric_limits<unsigned>::max()) {
+        canonicalOutputIndex = outputIndex;
+        continue;
+      }
+      if (task.outputTypes[canonicalOutputIndex] != indexedOutput.value()) {
+        task.op.emitError("task outputs selecting result index ")
+            << resultIndex << " must have the same tensor type";
+        return failure();
+      }
+    }
+    hasDenseResultIndices =
+        llvm::none_of(task.canonicalOutputIndices, [](unsigned outputIndex) {
+          return outputIndex == std::numeric_limits<unsigned>::max();
+        });
+  }
+
   SmallVector<Type> expectedOutputParameters(expectedInputParameters);
-  for (ShapedType outputType : task.outputTypes)
-    appendFlattenedMemRefParameters(expectedOutputParameters, outputType,
-                                    ptrType, i64Type);
+  if (hasDenseResultIndices) {
+    for (unsigned outputIndex : task.canonicalOutputIndices)
+      appendFlattenedMemRefParameters(expectedOutputParameters,
+                                      task.outputTypes[outputIndex], ptrType,
+                                      i64Type);
+  }
 
   bool hasInputParameters =
       functionType.getParams() == ArrayRef<Type>(expectedInputParameters);
-  bool hasOutputParameters = !task.outputTypes.empty() &&
-                             functionType.getParams() ==
-                                 ArrayRef<Type>(expectedOutputParameters) &&
-                             isa<LLVM::LLVMVoidType>(
-                                 functionType.getReturnType());
+  bool hasOutputParameters =
+      !task.outputTypes.empty() && hasDenseResultIndices &&
+      functionType.getParams() == ArrayRef<Type>(expectedOutputParameters) &&
+      isa<LLVM::LLVMVoidType>(functionType.getReturnType());
   if (!hasInputParameters && !hasOutputParameters) {
     task.op.emitError("LLVM task callee '")
         << task.callee.getName()

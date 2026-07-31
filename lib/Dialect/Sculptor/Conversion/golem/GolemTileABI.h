@@ -127,6 +127,7 @@ struct TaskModel {
   SmallVector<uint32_t> outputSlots;
   SmallVector<uint32_t> dispatchDependencyIds;
   SmallVector<unsigned> resultIndices;
+  SmallVector<unsigned> canonicalOutputIndices;
   bool usesOutputParameters = false;
   bool isBoot = false;
 };

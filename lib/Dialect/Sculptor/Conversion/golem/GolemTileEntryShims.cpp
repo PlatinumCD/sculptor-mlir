@@ -4,6 +4,7 @@
 
 #include "mlir/IR/SymbolTable.h"
 
+#include <limits>
 #include <string>
 
 namespace mlir {
@@ -123,6 +124,29 @@ void flattenDescriptor(OpBuilder &builder, Location loc, Value descriptor,
   for (int64_t dim = 0; dim < shapedType.getRank(); ++dim)
     operands.push_back(builder.create<LLVM::ExtractValueOp>(
         loc, descriptor, ArrayRef<int64_t>{4, dim}));
+}
+
+void copyDescriptorData(OpBuilder &builder, Location loc,
+                        Value sourceDescriptor, Value destinationDescriptor,
+                        ShapedType shapedType) {
+  Type ptrType = LLVM::LLVMPointerType::get(builder.getContext());
+  Type f32Type = Float32Type::get(builder.getContext());
+  Value sourceAligned = builder.create<LLVM::ExtractValueOp>(
+      loc, sourceDescriptor, ArrayRef<int64_t>{1});
+  Value sourceOffset = builder.create<LLVM::ExtractValueOp>(
+      loc, sourceDescriptor, ArrayRef<int64_t>{2});
+  Value destinationAligned = builder.create<LLVM::ExtractValueOp>(
+      loc, destinationDescriptor, ArrayRef<int64_t>{1});
+  Value destinationOffset = builder.create<LLVM::ExtractValueOp>(
+      loc, destinationDescriptor, ArrayRef<int64_t>{2});
+  Value source = builder.create<LLVM::GEPOp>(loc, ptrType, f32Type,
+                                             sourceAligned, sourceOffset);
+  Value destination = builder.create<LLVM::GEPOp>(
+      loc, ptrType, f32Type, destinationAligned, destinationOffset);
+  int64_t byteSize = shapedType.getNumElements() * sizeof(float);
+  builder.create<LLVM::MemcpyOp>(loc, destination, source,
+                                 buildI64(builder, loc, byteSize),
+                                 /*isVolatile=*/false);
 }
 
 FailureOr<Value> selectResultDescriptor(OpBuilder &builder, Location loc,
@@ -283,14 +307,26 @@ LogicalResult emitTaskAdapter(ModuleOp module, TaskModel &task,
     flattenDescriptor(invokeBuilder, loc, indexedDescriptor.value(),
                       task.inputTypes[indexedDescriptor.index()], callOperands);
   if (task.usesOutputParameters) {
-    for (auto indexedDescriptor : llvm::enumerate(outputDescriptors))
-      flattenDescriptor(invokeBuilder, loc, indexedDescriptor.value(),
-                        task.outputTypes[indexedDescriptor.index()],
-                        callOperands);
+    for (unsigned outputIndex : task.canonicalOutputIndices)
+      flattenDescriptor(invokeBuilder, loc, outputDescriptors[outputIndex],
+                        task.outputTypes[outputIndex], callOperands);
   }
   auto call =
       invokeBuilder.create<LLVM::CallOp>(loc, task.callee, callOperands);
-  if (task.outputTypes.empty() || task.usesOutputParameters) {
+  if (task.usesOutputParameters) {
+    for (auto indexedOutput : llvm::enumerate(task.outputTypes)) {
+      unsigned outputIndex = indexedOutput.index();
+      unsigned canonicalOutputIndex =
+          task.canonicalOutputIndices[task.resultIndices[outputIndex]];
+      if (outputIndex == canonicalOutputIndex)
+        continue;
+      copyDescriptorData(invokeBuilder, loc,
+                         outputDescriptors[canonicalOutputIndex],
+                         outputDescriptors[outputIndex], indexedOutput.value());
+    }
+    invokeBuilder.create<LLVM::ReturnOp>(
+        loc, buildI32(invokeBuilder, loc, kTaskSuccess));
+  } else if (task.outputTypes.empty()) {
     invokeBuilder.create<LLVM::ReturnOp>(
         loc, buildI32(invokeBuilder, loc, kTaskSuccess));
   } else {
@@ -317,26 +353,19 @@ LogicalResult emitTaskAdapter(ModuleOp module, TaskModel &task,
                                                      call, indexedType.index());
       if (failed(resultDescriptor))
         return failure();
+      copyDescriptorData(copyBuilder, loc, *resultDescriptor,
+                         outputDescriptors[indexedType.index()],
+                         indexedType.value());
+    }
+    for (unsigned outputIndex : task.canonicalOutputIndices) {
+      if (outputIndex == std::numeric_limits<unsigned>::max())
+        continue;
+      auto resultDescriptor =
+          selectResultDescriptor(copyBuilder, loc, task, call, outputIndex);
+      if (failed(resultDescriptor))
+        return failure();
       Value sourceBase = copyBuilder.create<LLVM::ExtractValueOp>(
           loc, *resultDescriptor, ArrayRef<int64_t>{0});
-      Value sourceAligned = copyBuilder.create<LLVM::ExtractValueOp>(
-          loc, *resultDescriptor, ArrayRef<int64_t>{1});
-      Value sourceOffset = copyBuilder.create<LLVM::ExtractValueOp>(
-          loc, *resultDescriptor, ArrayRef<int64_t>{2});
-      Value destinationAligned = copyBuilder.create<LLVM::ExtractValueOp>(
-          loc, outputDescriptors[indexedType.index()], ArrayRef<int64_t>{1});
-      Value destinationOffset = copyBuilder.create<LLVM::ExtractValueOp>(
-          loc, outputDescriptors[indexedType.index()], ArrayRef<int64_t>{2});
-
-      Type f32Type = Float32Type::get(context);
-      Value source = copyBuilder.create<LLVM::GEPOp>(
-          loc, ptrType, f32Type, sourceAligned, sourceOffset);
-      Value destination = copyBuilder.create<LLVM::GEPOp>(
-          loc, ptrType, f32Type, destinationAligned, destinationOffset);
-      int64_t byteSize = indexedType.value().getNumElements() * sizeof(float);
-      copyBuilder.create<LLVM::MemcpyOp>(loc, destination, source,
-                                         buildI64(copyBuilder, loc, byteSize),
-                                         /*isVolatile=*/false);
       copyBuilder.create<LLVM::CallOp>(loc, freeFunc, ValueRange{sourceBase});
     }
     copyBuilder.create<LLVM::ReturnOp>(
@@ -344,8 +373,9 @@ LogicalResult emitTaskAdapter(ModuleOp module, TaskModel &task,
 
     OpBuilder resultFailureBuilder =
         OpBuilder::atBlockBegin(resultFailureBlock);
-    for (unsigned outputIndex = 0; outputIndex < task.outputTypes.size();
-         ++outputIndex) {
+    for (unsigned outputIndex : task.canonicalOutputIndices) {
+      if (outputIndex == std::numeric_limits<unsigned>::max())
+        continue;
       auto resultDescriptor = selectResultDescriptor(resultFailureBuilder, loc,
                                                      task, call, outputIndex);
       if (failed(resultDescriptor))
