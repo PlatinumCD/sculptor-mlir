@@ -57,6 +57,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphDeploymentPartitioner.cpp
   task_graph/TaskGraphRoutineFuser.cpp
   task_graph/TaskGraphOptimizer.cpp
+  task_graph/ElementwiseSlicesOptimizer.cpp
   task_graph/StreamingConvolutionOptimizer.cpp
   task_timing/TaskGraphTimingAnalysis.cpp
   task_timing/TaskGraphTimingIRCodec.cpp

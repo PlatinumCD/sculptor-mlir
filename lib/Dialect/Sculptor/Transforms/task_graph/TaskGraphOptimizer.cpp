@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphOptimizer.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseSlicesOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/StreamingConvolutionOptimizer.h"
 
 #include "llvm/ADT/StringMap.h"
@@ -12,6 +13,7 @@ llvm::ArrayRef<TaskGraphOptimizationPattern>
 getTaskGraphOptimizationPatterns() {
   static const TaskGraphOptimizationPattern patterns[] = {
       {"streaming-convolution", optimizeStreamingConvolution},
+      {"elementwise-slices", optimizeElementwiseSlices},
   };
   return patterns;
 }
