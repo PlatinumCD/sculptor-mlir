@@ -177,6 +177,7 @@ struct CausalTimingEventModel {
 struct TaskModel {
   mlir::sculptor::TaskCreateOp op;
   int64_t index = 0;
+  int64_t globalTaskId = 0;
   std::string callee;
   std::string domain;
   std::string kind;
@@ -756,13 +757,32 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
       continue;
 
     auto taskIndex =
-        getRequiredI64Attr(taskOp, runtime_attrs::kTaskIndexAttrName);
+        getOptionalI64Attr(taskOp, runtime_attrs::kTaskIndexAttrName);
+    if (!taskIndex) {
+      taskIndex = getOptionalI64Attr(
+          taskOp, timing_attrs::kLocalRuntimeIndexAttrName);
+    }
     auto coreId =
         getRequiredI64Attr(taskOp, runtime_attrs::kTaskCoreIdAttrName);
     auto digitalOps =
-        getRequiredI64Attr(taskOp, runtime_attrs::kTaskDigitalOpsAttrName);
-    if (mlir::failed(taskIndex) || mlir::failed(coreId) ||
-        mlir::failed(digitalOps))
+        getOptionalI64Attr(taskOp, workload_attrs::kDigitalOpsAttrName);
+    if (!digitalOps) {
+      digitalOps =
+          getOptionalI64Attr(taskOp, runtime_attrs::kTaskDigitalOpsAttrName);
+    }
+    if (!taskIndex) {
+      taskOp.emitError("expected task to have either '")
+          << runtime_attrs::kTaskIndexAttrName << "' or '"
+          << timing_attrs::kLocalRuntimeIndexAttrName << "'";
+      return mlir::failure();
+    }
+    if (!digitalOps) {
+      taskOp.emitError("expected task to have either '")
+          << workload_attrs::kDigitalOpsAttrName << "' or '"
+          << runtime_attrs::kTaskDigitalOpsAttrName << "'";
+      return mlir::failure();
+    }
+    if (mlir::failed(coreId))
       return mlir::failure();
 
     if (*coreId < 0 || *coreId >= hardware.numCores) {
@@ -780,6 +800,11 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
     TaskModel task;
     task.op = taskOp;
     task.index = static_cast<int64_t>(tasks.size());
+    // Per-core partitioning assigns global task IDs in this same operation
+    // order. Export the identity explicitly so compiler predictions can be
+    // joined with deployment and runtime records without relying on an
+    // undocumented interpretation of `index`.
+    task.globalTaskId = task.index;
     task.callee = taskOp.getCallee().str();
     task.domain = taskOp.getDomain().str();
     task.kind = taskOp.getTaskKind().str();
@@ -1282,6 +1307,7 @@ void emitTasks(llvm::json::OStream &json, llvm::ArrayRef<TaskModel> tasks) {
     for (const TaskModel &task : tasks) {
       json.object([&] {
         json.attribute("index", task.index);
+        json.attribute("global_task_id", task.globalTaskId);
         json.attribute("callee", task.callee);
         json.attribute("domain", task.domain);
         json.attribute("kind", task.kind);

@@ -2,6 +2,7 @@
 // RUN: sculptor-mlir-opt %s --sculptor-export-task-graph-sim-model 2>&1 | FileCheck %s --check-prefix=MISSING-OUTPUT
 // RUN: sculptor-mlir-opt %s --sculptor-export-task-graph-sim-model="output=%t.json" > /dev/null
 // RUN: FileCheck %s --input-file=%t.json
+// RUN: sculptor-mlir-opt %s --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core | FileCheck %s --check-prefix=PARTITION-ID
 
 module {
   func.func private @task_matrix() -> !sculptor.logical.array {
@@ -13,7 +14,7 @@ module {
   func.func private @task_mvm(%arg0: tensor<1x2xf32>, %arg1: !sculptor.logical.array) -> tensor<1x2xf32> {
     sculptor.array.load %arg0, %arg1 : tensor<1x2xf32>, !sculptor.logical.array
     %result = sculptor.array.execute %arg1 : !sculptor.logical.array -> !sculptor.array.result
-    %stored = sculptor.array.store %result : !sculptor.array.result -> tensor<1x2xf32>
+    %stored = sculptor.array.store %result {sculptor.tile_physical_shape = [2, 2], sculptor.tile_valid_shape = [2, 2]} : !sculptor.array.result -> tensor<1x2xf32>
     return %stored : tensor<1x2xf32>
   }
   func.func private @task_bias(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32>
@@ -53,16 +54,16 @@ module {
     sculptor.timing.sum_edge_network_service_ns = 4.000000e+00 : f64
   } {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
-    %input = sculptor.task_graph.input %graph {sculptor.runtime.byte_size = 8 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %output = sculptor.task_graph.output %graph {sculptor.runtime.byte_size = 8 : i64, sculptor.runtime.slot = 1 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %array = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 0 : i64, sculptor.runtime.slot = 2 : i64, sculptor.runtime.temp_index = 0 : i64, sculptor.runtime.temp_offset = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
-    %tile = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 8 : i64, sculptor.runtime.slot = 3 : i64, sculptor.runtime.temp_index = 1 : i64, sculptor.runtime.temp_offset = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
-    %mvm_out = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 8 : i64, sculptor.runtime.slot = 4 : i64, sculptor.runtime.temp_index = 2 : i64, sculptor.runtime.temp_offset = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    %input = sculptor.task_graph.input %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    %output = sculptor.task_graph.output %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    %array = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 0 : i64, sculptor.schedule.logical_array_index = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<!sculptor.logical.array>
+    %tile = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
+    %mvm_out = sculptor.task_graph.intermediate %graph {sculptor.runtime.byte_size = 8 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
 
-    %setup = sculptor.task.create %graph, @task_matrix, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linear_matrix_tile_0_0", source_layer = "linear_0", source_task_ordinal = 0, inputs[], outputs[%array], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
-    %vector = sculptor.task.create %graph, @task_vector, domain = "digital", task_kind = "digital.vector_tile", task_name = "linear_vector_tile_0", source_layer = "linear_0", source_task_ordinal = 1, inputs[%input], outputs[%tile], deps[] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.digital_ops = 3 : i64, sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>) -> !sculptor.task
-    %mvm = sculptor.task.create %graph, @task_mvm, domain = "analog", task_kind = "sculptor.mvm", task_name = "linear_mvm_0_0", source_layer = "linear_0", source_task_ordinal = 2, inputs[%tile, %array], outputs[%mvm_out], deps[%setup, %vector] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 2 : i64, sculptor.schedule.island_id = 0 : i64, sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64, sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64, sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64, sculptor.timing.critical_path_remaining_ns = 1.020000e+02 : f64, sculptor.timing.dependency_depth = 1 : i64, sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64, sculptor.timing.earliest_start_ns = 0.000000e+00 : f64, sculptor.workload.analog_execution_count = 1 : i64, sculptor.workload.analog_load_bytes = 8 : i64, sculptor.workload.analog_store_bytes = 8 : i64, sculptor.workload.incoming_data_bytes = 8 : i64, sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64, sculptor.timing.is_critical = true, sculptor.workload.outgoing_data_bytes = 8 : i64, sculptor.timing.topological_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
-    %bias = sculptor.task.create %graph, @task_bias, domain = "digital", task_kind = "digital.bias_add", task_name = "linear_bias_add", source_layer = "linear_0", source_task_ordinal = 3, inputs[%mvm_out], outputs[%output], deps[%mvm] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.digital_ops = 2 : i64, sculptor.runtime.task_index = 3 : i64, sculptor.timing.incoming_network_delay_ns = 3.000000e+00 : f64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task) -> !sculptor.task
+    %setup = sculptor.task.create %graph, @task_matrix, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linear_matrix_tile_0_0", source_layer = "linear_0", source_task_ordinal = 0, inputs[], outputs[%array], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.timing.local_runtime_index = 0 : i64, sculptor.workload.digital_ops = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
+    %vector = sculptor.task.create %graph, @task_vector, domain = "digital", task_kind = "digital.vector_tile", task_name = "linear_vector_tile_0", source_layer = "linear_0", source_task_ordinal = 1, inputs[%input], outputs[%tile], deps[] {sculptor.runtime.core_id = 1 : i64, sculptor.timing.local_runtime_index = 0 : i64, sculptor.workload.digital_ops = 3 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>) -> !sculptor.task
+    %mvm = sculptor.task.create %graph, @task_mvm, domain = "analog", task_kind = "sculptor.mvm", task_name = "linear_mvm_0_0", source_layer = "linear_0", source_task_ordinal = 2, inputs[%tile, %array], outputs[%mvm_out], deps[%setup, %vector] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.local_array_id = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.schedule.island_id = 0 : i64, sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64, sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64, sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64, sculptor.timing.critical_path_remaining_ns = 1.020000e+02 : f64, sculptor.timing.dependency_depth = 1 : i64, sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64, sculptor.timing.earliest_start_ns = 0.000000e+00 : f64, sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64, sculptor.timing.is_critical = true, sculptor.timing.local_runtime_index = 1 : i64, sculptor.timing.topological_index = 2 : i64, sculptor.workload.analog_execution_count = 1 : i64, sculptor.workload.analog_load_bytes = 8 : i64, sculptor.workload.analog_store_bytes = 8 : i64, sculptor.workload.digital_ops = 0 : i64, sculptor.workload.incoming_data_bytes = 8 : i64, sculptor.workload.outgoing_data_bytes = 8 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
+    %bias = sculptor.task.create %graph, @task_bias, domain = "digital", task_kind = "digital.bias_add", task_name = "linear_bias_add", source_layer = "linear_0", source_task_ordinal = 3, inputs[%mvm_out], outputs[%output], deps[%mvm] {sculptor.runtime.core_id = 1 : i64, sculptor.timing.incoming_network_delay_ns = 3.000000e+00 : f64, sculptor.timing.local_runtime_index = 1 : i64, sculptor.workload.digital_ops = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task) -> !sculptor.task
 
     return %graph : !sculptor.task_graph
   }
@@ -70,6 +71,15 @@ module {
 
 // HELP: --sculptor-export-task-graph-sim-model
 // MISSING-OUTPUT: expected non-empty output path for sculptor-export-task-graph-sim-model
+
+// The exporter and deployment partitioner use the same deterministic global
+// task identity even though partitioned modules are grouped by core.
+// PARTITION-ID: module @core_0
+// PARTITION-ID: task_name = "linear_matrix_tile_0_0"{{.*}}sculptor.deployment.global_task_id = 0 : i64
+// PARTITION-ID: task_name = "linear_mvm_0_0"{{.*}}sculptor.deployment.global_task_id = 2 : i64
+// PARTITION-ID: module @core_1
+// PARTITION-ID: task_name = "linear_vector_tile_0"{{.*}}sculptor.deployment.global_task_id = 1 : i64
+// PARTITION-ID: task_name = "linear_bias_add"{{.*}}sculptor.deployment.global_task_id = 3 : i64
 
 // CHECK: "schema_version": 1
 // CHECK: "format": "sculptor.task_graph.sim_model"
@@ -93,6 +103,7 @@ module {
 // CHECK: "local_array_id": 0
 // CHECK: "tasks": [
 // CHECK: "index": 0
+// CHECK: "global_task_id": 0
 // CHECK: "callee": "task_matrix"
 // CHECK: "kind": "sculptor.matrix_setup"
 // CHECK: "physical_array_id": 0
@@ -103,6 +114,7 @@ module {
 // CHECK: "name": "sculptor.array.set"
 // CHECK: "count": 1
 // CHECK: "index": 2
+// CHECK: "global_task_id": 2
 // CHECK: "callee": "task_mvm"
 // CHECK: "island_id": 0
 // CHECK: "timing": {
