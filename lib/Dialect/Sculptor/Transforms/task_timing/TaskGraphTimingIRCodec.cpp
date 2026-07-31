@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphWorkloadAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingAnalysis.h"
 
 #include "mlir/IR/Builders.h"
@@ -20,6 +21,49 @@ namespace task_timing {
 using task_graph::LogicalPlacementIslandGraph;
 using task_graph::TaskGraphDAG;
 
+static void removeAttrsWithPrefix(Operation *op, StringRef prefix) {
+  llvm::SmallVector<StringAttr, 16> toRemove;
+  for (NamedAttribute attr : op->getAttrs()) {
+    if (attr.getName().getValue().starts_with(prefix))
+      toRemove.push_back(attr.getName());
+  }
+  for (StringAttr name : toRemove)
+    op->removeAttr(name);
+}
+
+static void removeTaskGraphAttrsWithPrefix(func::FuncOp taskGraphFunc,
+                                           StringRef prefix) {
+  removeAttrsWithPrefix(taskGraphFunc, prefix);
+  taskGraphFunc.walk([&](sculptor::TaskCreateOp task) {
+    removeAttrsWithPrefix(task, prefix);
+  });
+}
+
+void invalidateTaskGraphTiming(func::FuncOp taskGraphFunc,
+                               bool advanceGeneration) {
+  int64_t generation = 0;
+  if (auto current = taskGraphFunc->getAttrOfType<IntegerAttr>(
+          timing_attrs::kGraphGenerationAttrName))
+    generation = current.getInt();
+  if (advanceGeneration)
+    ++generation;
+
+  removeTaskGraphAttrsWithPrefix(taskGraphFunc, "sculptor.timing.");
+  taskGraphFunc->setAttr(
+      timing_attrs::kGraphGenerationAttrName,
+      IntegerAttr::get(IntegerType::get(taskGraphFunc.getContext(), 64),
+                       generation));
+}
+
+void invalidateTaskGraphWorkload(func::FuncOp taskGraphFunc) {
+  removeTaskGraphAttrsWithPrefix(taskGraphFunc, "sculptor.workload.");
+}
+
+void invalidateTaskGraphStructure(func::FuncOp taskGraphFunc) {
+  invalidateTaskGraphWorkload(taskGraphFunc);
+  invalidateTaskGraphTiming(taskGraphFunc, /*advanceGeneration=*/true);
+}
+
 void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                                    const TaskGraphDAG &dag,
                                    const TimingAnalysis &analysis,
@@ -30,31 +74,81 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
     return builder.getI64IntegerAttr(value);
   };
   auto f64Attr = [&](double value) { return builder.getF64FloatAttr(value); };
+  int64_t generation = 0;
+  if (auto attr = taskGraphFunc->getAttrOfType<IntegerAttr>(
+          timing_attrs::kGraphGenerationAttrName))
+    generation = attr.getInt();
+  taskGraphFunc->setAttr(timing_attrs::kGraphGenerationAttrName,
+                         i64Attr(generation));
+  taskGraphFunc->setAttr(timing_attrs::kAnalysisGenerationAttrName,
+                         i64Attr(generation));
 
   for (const task_graph::TaskGraphNode &node : dag.nodes) {
     const TaskTiming &timing = analysis.tasks[node.index];
     node.op->setAttr(timing_attrs::kTopologicalIndexAttrName,
                      i64Attr(timing.topologicalIndex));
+    node.op->setAttr(timing_attrs::kLocalRuntimeIndexAttrName,
+                     i64Attr(timing.localRuntimeIndex));
     node.op->setAttr(timing_attrs::kDependencyDepthAttrName,
                      i64Attr(timing.dependencyDepth));
     node.op->setAttr(timing_attrs::kControlPredecessorCountAttrName,
-                     i64Attr(timing.controlPredecessorCount));
+                     i64Attr(timing.workload.controlPredecessorCount));
     node.op->setAttr(timing_attrs::kDataPredecessorCountAttrName,
-                     i64Attr(timing.dataPredecessorCount));
-    node.op->setAttr(timing_attrs::kIncomingDataBytesAttrName,
-                     i64Attr(timing.incomingDataBytes));
-    node.op->setAttr(timing_attrs::kOutgoingDataBytesAttrName,
-                     i64Attr(timing.outgoingDataBytes));
-    node.op->setAttr(timing_attrs::kDigitalOpsAttrName,
-                     i64Attr(timing.digitalOps));
-    node.op->setAttr(timing_attrs::kDigitalReplacementOpsAttrName,
-                     i64Attr(timing.digitalReplacementOps));
+                     i64Attr(timing.workload.dataPredecessorCount));
+    node.op->setAttr(workload_attrs::kIncomingDataBytesAttrName,
+                     i64Attr(timing.workload.incomingDataBytes));
+    node.op->setAttr(workload_attrs::kOutgoingDataBytesAttrName,
+                     i64Attr(timing.workload.outgoingDataBytes));
+    node.op->setAttr(workload_attrs::kDigitalOpsAttrName,
+                     i64Attr(timing.workload.digitalOps));
+    node.op->setAttr(workload_attrs::kDigitalReplacementOpsAttrName,
+                     i64Attr(timing.workload.digitalReplacementOps));
+    node.op->setAttr(workload_attrs::kAnalogLoadBytesAttrName,
+                     i64Attr(timing.workload.analogLoadBytes));
+    node.op->setAttr(workload_attrs::kAnalogExecutionCountAttrName,
+                     i64Attr(timing.workload.analogExecutionCount));
+    node.op->setAttr(workload_attrs::kAnalogStoreBytesAttrName,
+                     i64Attr(timing.workload.analogStoreBytes));
+    node.op->setAttr(workload_attrs::kStaticElementsAttrName,
+                     i64Attr(timing.workload.staticElements));
+    node.op->setAttr(workload_attrs::kLocalBytesReadAttrName,
+                     i64Attr(timing.workload.localBytesRead));
+    node.op->setAttr(workload_attrs::kLocalBytesWrittenAttrName,
+                     i64Attr(timing.workload.localBytesWritten));
+    node.op->setAttr(workload_attrs::kLoopIterationsAttrName,
+                     i64Attr(timing.workload.loopIterations));
+    node.op->setAttr(timing_attrs::kScalarInstructionEstimateAttrName,
+                     i64Attr(timing.cost.scalarInstructions));
+    node.op->setAttr(timing_attrs::kVectorInstructionEstimateAttrName,
+                     i64Attr(timing.cost.vectorInstructions));
+    node.op->setAttr(timing_attrs::kLoadInstructionEstimateAttrName,
+                     i64Attr(timing.cost.loadInstructions));
+    node.op->setAttr(timing_attrs::kStoreInstructionEstimateAttrName,
+                     i64Attr(timing.cost.storeInstructions));
+    node.op->setAttr(timing_attrs::kControlInstructionEstimateAttrName,
+                     i64Attr(timing.cost.controlInstructions));
+    node.op->setAttr(timing_attrs::kRuntimeDispatchCyclesAttrName,
+                     i64Attr(timing.cost.runtimeDispatchCycles));
+    node.op->setAttr(timing_attrs::kTaskEntryCyclesAttrName,
+                     i64Attr(timing.cost.taskEntryCycles));
+    node.op->setAttr(timing_attrs::kTaskExitCyclesAttrName,
+                     i64Attr(timing.cost.taskExitCycles));
+    node.op->setAttr(timing_attrs::kPredictedCpuCyclesAttrName,
+                     f64Attr(timing.cost.predictedCpuCycles));
+    node.op->setAttr(
+        timing_attrs::kCostSourceAttrName,
+        builder.getStringAttr(stringifyTaskCostSource(timing.cost.source)));
+    node.op->setAttr(timing_attrs::kCostConfidenceAttrName,
+                     builder.getStringAttr(
+                         stringifyTaskCostConfidence(timing.cost.confidence)));
     node.op->setAttr(timing_attrs::kAnalogLoadLatencyNsAttrName,
                      f64Attr(timing.analogLoadLatencyNs));
     node.op->setAttr(timing_attrs::kAnalogExecuteLatencyNsAttrName,
                      f64Attr(timing.analogExecuteLatencyNs));
     node.op->setAttr(timing_attrs::kAnalogStoreLatencyNsAttrName,
                      f64Attr(timing.analogStoreLatencyNs));
+    node.op->setAttr(timing_attrs::kAnalogPipelineLatencyNsAttrName,
+                     f64Attr(timing.analogPipelineLatencyNs));
     node.op->setAttr(timing_attrs::kIntrinsicLatencyNsAttrName,
                      f64Attr(timing.intrinsicLatencyNs));
     node.op->setAttr(timing_attrs::kEarliestStartNsAttrName,
@@ -66,6 +160,12 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
     node.op->setAttr(timing_attrs::kSlackNsAttrName, f64Attr(timing.slackNs));
     node.op->setAttr(timing_attrs::kIncomingNetworkDelayNsAttrName,
                      f64Attr(timing.incomingNetworkDelayNs));
+    node.op->setAttr(timing_attrs::kCoreQueueDelayNsAttrName,
+                     f64Attr(timing.coreQueueDelayNs));
+    node.op->setAttr(timing_attrs::kCausalInputEdgeAttrName,
+                     i64Attr(timing.causalInputEdge));
+    node.op->setAttr(timing_attrs::kCausalPreviousTaskAttrName,
+                     i64Attr(timing.causalPreviousTask));
     node.op->setAttr(timing_attrs::kIsCriticalAttrName,
                      builder.getBoolAttr(timing.isCritical));
   }
@@ -91,10 +191,34 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
       builder.getStringAttr(stringifyMVMCostMode(mvmCostMode)));
   taskGraphFunc->setAttr(timing_attrs::kPlacementAwareAttrName,
                          builder.getBoolAttr(analysis.placementAware));
-  taskGraphFunc->setAttr(timing_attrs::kTotalNetworkLatencyNsAttrName,
-                         f64Attr(analysis.totalNetworkLatencyNs));
-  taskGraphFunc->setAttr(timing_attrs::kTotalNetworkContentionDelayNsAttrName,
-                         f64Attr(analysis.totalNetworkContentionDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumEdgeNetworkServiceNsAttrName,
+                         f64Attr(analysis.sumEdgeNetworkServiceNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumEdgeNetworkQueueDelayNsAttrName,
+                         f64Attr(analysis.sumEdgeNetworkQueueDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumTaskWorkNsAttrName,
+                         f64Attr(analysis.sumTaskWorkNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumCoreQueueDelayNsAttrName,
+                         f64Attr(analysis.sumCoreQueueDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumNicQueueDelayNsAttrName,
+                         f64Attr(analysis.sumNicQueueDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumLinkQueueDelayNsAttrName,
+                         f64Attr(analysis.sumLinkQueueDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kSumReceiveQueueDelayNsAttrName,
+                         f64Attr(analysis.sumReceiveQueueDelayNs));
+  taskGraphFunc->setAttr(timing_attrs::kNoContentionMakespanNsAttrName,
+                         f64Attr(analysis.noContentionMakespanNs));
+  taskGraphFunc->setAttr(timing_attrs::kZeroNetworkMakespanNsAttrName,
+                         f64Attr(analysis.zeroNetworkMakespanNs));
+  taskGraphFunc->setAttr(timing_attrs::kExposedTransportNsAttrName,
+                         f64Attr(analysis.exposedTransportNs));
+  taskGraphFunc->setAttr(timing_attrs::kExposedContentionNsAttrName,
+                         f64Attr(analysis.exposedContentionNs));
+  taskGraphFunc->setAttr(timing_attrs::kTotalPayloadWordsAttrName,
+                         i64Attr(analysis.totalPayloadWords));
+  taskGraphFunc->setAttr(timing_attrs::kTotalProtocolWordsAttrName,
+                         i64Attr(analysis.totalProtocolWords));
+  taskGraphFunc->setAttr(timing_attrs::kTotalWordHopsAttrName,
+                         i64Attr(analysis.totalWordHops));
 
   llvm::SmallVector<Attribute, 16> networkEdges;
   networkEdges.reserve(analysis.executionEdges.size());
@@ -103,8 +227,15 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
         taskGraphFunc.getContext(), i64Attr(edge.producerTask),
         i64Attr(edge.consumerTask), i64Attr(edge.sourceCore),
         i64Attr(edge.destinationCore), i64Attr(edge.meshHops),
-        f64Attr(edge.transferStartNs), f64Attr(edge.transferFinishNs),
-        f64Attr(edge.networkLatencyNs), f64Attr(edge.contentionDelayNs)));
+        i64Attr(edge.payloadWords), i64Attr(edge.protocolWords),
+        f64Attr(edge.transferStartNs), f64Attr(edge.injectionStartNs),
+        f64Attr(edge.injectionFinishNs), f64Attr(edge.routeArrivalNs),
+        f64Attr(edge.receiveStartNs), f64Attr(edge.receiveCompleteNs),
+        f64Attr(edge.transferFinishNs), f64Attr(edge.networkLatencyNs),
+        f64Attr(edge.contentionDelayNs), f64Attr(edge.nicQueueDelayNs),
+        f64Attr(edge.linkQueueDelayNs), f64Attr(edge.receiveQueueDelayNs),
+        i64Attr(edge.causalParentTask), i64Attr(edge.causalParentEdge),
+        builder.getStringAttr(edge.causalResource)));
   }
   taskGraphFunc->setAttr(timing_attrs::kNetworkEdgesAttrName,
                          builder.getArrayAttr(networkEdges));
@@ -137,17 +268,45 @@ void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
   taskGraphFunc->setAttr(timing_attrs::kTimedIslandEdgesAttrName,
                          builder.getArrayAttr(timedIslandEdges));
 
+  llvm::SmallVector<Attribute, 16> causalEvents;
+  causalEvents.reserve(analysis.causalCriticalChain.size());
+  for (const CausalTimingEvent &event : analysis.causalCriticalChain) {
+    causalEvents.push_back(CausalTimingEventAttr::get(
+        taskGraphFunc.getContext(), i64Attr(event.id),
+        builder.getStringAttr(event.kind), i64Attr(event.taskIndex),
+        i64Attr(event.edgeIndex), i64Attr(event.coreId), f64Attr(event.startNs),
+        f64Attr(event.finishNs), i64Attr(event.parentEvent),
+        builder.getStringAttr(event.resource)));
+  }
+  taskGraphFunc->setAttr(timing_attrs::kCausalCriticalChainAttrName,
+                         builder.getArrayAttr(causalEvents));
+
   taskGraphFunc->setAttr(
       timing_attrs::kTimingModelAttrName,
       TimingModelAttr::get(
-          taskGraphFunc.getContext(), i64Attr(model.analogMVMLatencyNs),
+          taskGraphFunc.getContext(), builder.getStringAttr(model.costModel),
+          i64Attr(model.costModelRevision),
+          builder.getStringAttr(model.compilerRevision),
+          builder.getStringAttr(model.timingBoundary),
+          builder.getStringAttr(model.runtimeTaskPolicy),
+          builder.getStringAttr(model.runtimeTransmitPolicy),
+          builder.getStringAttr(model.memoryBackend),
+          i64Attr(model.analogMVMLatencyNs),
           i64Attr(model.analogIOBitsPerCycle),
           builder.getBoolAttr(model.analogIOShared),
           f64Attr(model.digitalClockGHz), i64Attr(model.digitalIssueWidth),
           i64Attr(model.digitalVectorBitsPerCycle),
+          i64Attr(model.fixedRuntimeDispatchCycles),
+          i64Attr(model.fixedTaskEntryCycles),
+          i64Attr(model.fixedTaskExitCycles),
           i64Attr(model.networkLinkBitsPerCycle),
           i64Attr(model.networkHopLatencyCycles),
-          builder.getBoolAttr(model.networkPipelined)));
+          builder.getBoolAttr(model.networkPipelined),
+          i64Attr(model.networkLinkWordBits),
+          i64Attr(model.protocolWordsPerRoute),
+          i64Attr(model.nicInjectionWordsPerCycle),
+          i64Attr(model.rxDmaWordsPerCycle),
+          builder.getStringAttr(model.routingPolicy)));
 }
 
 namespace {
@@ -229,6 +388,16 @@ FailureOr<TimingModel> loadTimingModel(func::FuncOp taskGraphFunc) {
     return failure();
 
   TimingModel model;
+  model.costModel = timingModelAttr->getCostModel().getValue().str();
+  model.costModelRevision = timingModelAttr->getCostModelRevision().getInt();
+  model.compilerRevision =
+      timingModelAttr->getCompilerRevision().getValue().str();
+  model.timingBoundary = timingModelAttr->getTimingBoundary().getValue().str();
+  model.runtimeTaskPolicy =
+      timingModelAttr->getRuntimeTaskPolicy().getValue().str();
+  model.runtimeTransmitPolicy =
+      timingModelAttr->getRuntimeTransmitPolicy().getValue().str();
+  model.memoryBackend = timingModelAttr->getMemoryBackend().getValue().str();
   model.analogMVMLatencyNs = timingModelAttr->getAnalogMVMLatencyNs().getInt();
   model.analogIOBitsPerCycle =
       timingModelAttr->getAnalogIOBitsPerCycle().getInt();
@@ -238,11 +407,25 @@ FailureOr<TimingModel> loadTimingModel(func::FuncOp taskGraphFunc) {
   model.digitalIssueWidth = timingModelAttr->getDigitalIssueWidth().getInt();
   model.digitalVectorBitsPerCycle =
       timingModelAttr->getDigitalVectorBitsPerCycle().getInt();
+  model.fixedRuntimeDispatchCycles =
+      timingModelAttr->getFixedRuntimeDispatchCycles().getInt();
+  model.fixedTaskEntryCycles =
+      timingModelAttr->getFixedTaskEntryCycles().getInt();
+  model.fixedTaskExitCycles =
+      timingModelAttr->getFixedTaskExitCycles().getInt();
   model.networkLinkBitsPerCycle =
       timingModelAttr->getNetworkLinkBitsPerCycle().getInt();
   model.networkHopLatencyCycles =
       timingModelAttr->getNetworkHopLatencyCycles().getInt();
   model.networkPipelined = timingModelAttr->getNetworkPipelined().getValue();
+  model.networkLinkWordBits =
+      timingModelAttr->getNetworkLinkWordBits().getInt();
+  model.protocolWordsPerRoute =
+      timingModelAttr->getProtocolWordsPerRoute().getInt();
+  model.nicInjectionWordsPerCycle =
+      timingModelAttr->getNicInjectionWordsPerCycle().getInt();
+  model.rxDmaWordsPerCycle = timingModelAttr->getRxDmaWordsPerCycle().getInt();
+  model.routingPolicy = timingModelAttr->getRoutingPolicy().getValue().str();
   if (failed(validateTimingModel(taskGraphFunc, model)))
     return failure();
   return model;
@@ -251,6 +434,22 @@ FailureOr<TimingModel> loadTimingModel(func::FuncOp taskGraphFunc) {
 FailureOr<SchedulingTimingProfile>
 loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
                             const LogicalPlacementIslandGraph &islandGraph) {
+  int64_t graphGeneration = 0;
+  if (auto attr = taskGraphFunc->getAttrOfType<IntegerAttr>(
+          timing_attrs::kGraphGenerationAttrName))
+    graphGeneration = attr.getInt();
+  auto analysisGeneration =
+      getRequiredI64(taskGraphFunc, timing_attrs::kAnalysisGenerationAttrName);
+  if (failed(analysisGeneration))
+    return failure();
+  if (*analysisGeneration != graphGeneration) {
+    taskGraphFunc.emitError(
+        "stale timing metadata: timing generation does not match the latest "
+        "task-graph structural generation; rerun "
+        "--sculptor-analyze-task-graph-timing");
+    return failure();
+  }
+
   auto placementAware =
       getRequiredBool(taskGraphFunc, timing_attrs::kPlacementAwareAttrName);
   if (failed(placementAware))
@@ -299,24 +498,64 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
         getRequiredI64(node.op, timing_attrs::kTopologicalIndexAttrName);
     auto dependencyDepth =
         getRequiredI64(node.op, timing_attrs::kDependencyDepthAttrName);
+    auto localRuntimeIndex =
+        getRequiredI64(node.op, timing_attrs::kLocalRuntimeIndexAttrName);
     auto controlPredecessors =
         getRequiredI64(node.op, timing_attrs::kControlPredecessorCountAttrName);
     auto dataPredecessors =
         getRequiredI64(node.op, timing_attrs::kDataPredecessorCountAttrName);
     auto incomingBytes =
-        getRequiredI64(node.op, timing_attrs::kIncomingDataBytesAttrName);
+        getRequiredI64(node.op, workload_attrs::kIncomingDataBytesAttrName);
     auto outgoingBytes =
-        getRequiredI64(node.op, timing_attrs::kOutgoingDataBytesAttrName);
+        getRequiredI64(node.op, workload_attrs::kOutgoingDataBytesAttrName);
     auto digitalOps =
-        getRequiredI64(node.op, timing_attrs::kDigitalOpsAttrName);
+        getRequiredI64(node.op, workload_attrs::kDigitalOpsAttrName);
     auto digitalReplacementOps =
-        getRequiredI64(node.op, timing_attrs::kDigitalReplacementOpsAttrName);
+        getRequiredI64(node.op, workload_attrs::kDigitalReplacementOpsAttrName);
+    auto analogLoadBytes =
+        getRequiredI64(node.op, workload_attrs::kAnalogLoadBytesAttrName);
+    auto analogExecutionCount =
+        getRequiredI64(node.op, workload_attrs::kAnalogExecutionCountAttrName);
+    auto analogStoreBytes =
+        getRequiredI64(node.op, workload_attrs::kAnalogStoreBytesAttrName);
+    auto staticElements =
+        getRequiredI64(node.op, workload_attrs::kStaticElementsAttrName);
+    auto localBytesRead =
+        getRequiredI64(node.op, workload_attrs::kLocalBytesReadAttrName);
+    auto localBytesWritten =
+        getRequiredI64(node.op, workload_attrs::kLocalBytesWrittenAttrName);
+    auto loopIterations =
+        getRequiredI64(node.op, workload_attrs::kLoopIterationsAttrName);
+    auto scalarInstructions = getRequiredI64(
+        node.op, timing_attrs::kScalarInstructionEstimateAttrName);
+    auto vectorInstructions = getRequiredI64(
+        node.op, timing_attrs::kVectorInstructionEstimateAttrName);
+    auto loadInstructions =
+        getRequiredI64(node.op, timing_attrs::kLoadInstructionEstimateAttrName);
+    auto storeInstructions = getRequiredI64(
+        node.op, timing_attrs::kStoreInstructionEstimateAttrName);
+    auto controlInstructions = getRequiredI64(
+        node.op, timing_attrs::kControlInstructionEstimateAttrName);
+    auto runtimeDispatchCycles =
+        getRequiredI64(node.op, timing_attrs::kRuntimeDispatchCyclesAttrName);
+    auto taskEntryCycles =
+        getRequiredI64(node.op, timing_attrs::kTaskEntryCyclesAttrName);
+    auto taskExitCycles =
+        getRequiredI64(node.op, timing_attrs::kTaskExitCyclesAttrName);
+    auto predictedCpuCycles =
+        getRequiredF64(node.op, timing_attrs::kPredictedCpuCyclesAttrName);
+    auto costSource =
+        node.op->getAttrOfType<StringAttr>(timing_attrs::kCostSourceAttrName);
+    auto costConfidence = node.op->getAttrOfType<StringAttr>(
+        timing_attrs::kCostConfidenceAttrName);
     auto analogLoad =
         getRequiredF64(node.op, timing_attrs::kAnalogLoadLatencyNsAttrName);
     auto analogExecute =
         getRequiredF64(node.op, timing_attrs::kAnalogExecuteLatencyNsAttrName);
     auto analogStore =
         getRequiredF64(node.op, timing_attrs::kAnalogStoreLatencyNsAttrName);
+    auto analogPipeline =
+        getRequiredF64(node.op, timing_attrs::kAnalogPipelineLatencyNsAttrName);
     auto intrinsic =
         getRequiredF64(node.op, timing_attrs::kIntrinsicLatencyNsAttrName);
     auto earliestStart =
@@ -330,20 +569,42 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
         getRequiredF64(node.op, timing_attrs::kIncomingNetworkDelayNsAttrName);
     auto isCritical =
         getRequiredBool(node.op, timing_attrs::kIsCriticalAttrName);
-    if (failed(topologicalIndex) || failed(dependencyDepth) ||
-        failed(controlPredecessors) || failed(dataPredecessors) ||
-        failed(incomingBytes) || failed(outgoingBytes) || failed(digitalOps) ||
-        failed(digitalReplacementOps) || failed(analogLoad) ||
-        failed(analogExecute) || failed(analogStore) || failed(intrinsic) ||
-        failed(earliestStart) || failed(earliestFinish) ||
-        failed(criticalRemaining) || failed(slack) ||
+    if (failed(topologicalIndex) || failed(localRuntimeIndex) ||
+        failed(dependencyDepth) || failed(controlPredecessors) ||
+        failed(dataPredecessors) || failed(incomingBytes) ||
+        failed(outgoingBytes) || failed(digitalOps) ||
+        failed(digitalReplacementOps) || failed(analogLoadBytes) ||
+        failed(analogExecutionCount) || failed(analogStoreBytes) ||
+        failed(staticElements) || failed(localBytesRead) ||
+        failed(localBytesWritten) || failed(loopIterations) ||
+        failed(scalarInstructions) || failed(vectorInstructions) ||
+        failed(loadInstructions) || failed(storeInstructions) ||
+        failed(controlInstructions) || failed(runtimeDispatchCycles) ||
+        failed(taskEntryCycles) || failed(taskExitCycles) ||
+        failed(predictedCpuCycles) || !costSource || !costConfidence ||
+        failed(analogLoad) || failed(analogExecute) || failed(analogStore) ||
+        failed(intrinsic) || failed(analogPipeline) || failed(earliestStart) ||
+        failed(earliestFinish) || failed(criticalRemaining) || failed(slack) ||
         failed(incomingNetworkDelay) || failed(isCritical))
       return failure();
-    if (*topologicalIndex < 0 || *dependencyDepth < 0 ||
-        *controlPredecessors < 0 || *dataPredecessors < 0 ||
-        *incomingBytes < 0 || *outgoingBytes < 0 || *digitalOps < 0 ||
-        *digitalReplacementOps < 0) {
+    if (*topologicalIndex < 0 || *localRuntimeIndex < 0 ||
+        *dependencyDepth < 0 || *controlPredecessors < 0 ||
+        *dataPredecessors < 0 || *incomingBytes < 0 || *outgoingBytes < 0 ||
+        *digitalOps < 0 || *digitalReplacementOps < 0 || *analogLoadBytes < 0 ||
+        *analogExecutionCount < 0 || *analogStoreBytes < 0 ||
+        *staticElements < 0 || *localBytesRead < 0 || *localBytesWritten < 0 ||
+        *loopIterations < 0 || *scalarInstructions < 0 ||
+        *vectorInstructions < 0 || *loadInstructions < 0 ||
+        *storeInstructions < 0 || *controlInstructions < 0 ||
+        *runtimeDispatchCycles < 0 || *taskEntryCycles < 0 ||
+        *taskExitCycles < 0) {
       node.op->emitError("expected non-negative task timing counters");
+      return failure();
+    }
+    auto source = symbolizeTaskCostSource(costSource.getValue());
+    auto confidence = symbolizeTaskCostConfidence(costConfidence.getValue());
+    if (!source || !confidence) {
+      node.op->emitError("expected known task cost source and confidence");
       return failure();
     }
     if (node.index >= profile.tasks.size() ||
@@ -355,15 +616,34 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
     }
     seenTopologicalIndex[*topologicalIndex] = true;
     timing.topologicalIndex = *topologicalIndex;
+    timing.localRuntimeIndex = *localRuntimeIndex;
     timing.dependencyDepth = *dependencyDepth;
-    timing.controlPredecessorCount = *controlPredecessors;
-    timing.dataPredecessorCount = *dataPredecessors;
-    timing.incomingDataBytes = *incomingBytes;
-    timing.outgoingDataBytes = *outgoingBytes;
-    timing.digitalOps = *digitalOps;
-    timing.digitalReplacementOps = *digitalReplacementOps;
+    timing.workload.controlPredecessorCount = *controlPredecessors;
+    timing.workload.dataPredecessorCount = *dataPredecessors;
+    timing.workload.incomingDataBytes = *incomingBytes;
+    timing.workload.outgoingDataBytes = *outgoingBytes;
+    timing.workload.digitalOps = *digitalOps;
+    timing.workload.digitalReplacementOps = *digitalReplacementOps;
+    timing.workload.analogLoadBytes = *analogLoadBytes;
+    timing.workload.analogExecutionCount = *analogExecutionCount;
+    timing.workload.analogStoreBytes = *analogStoreBytes;
+    timing.workload.staticElements = *staticElements;
+    timing.workload.localBytesRead = *localBytesRead;
+    timing.workload.localBytesWritten = *localBytesWritten;
+    timing.workload.loopIterations = *loopIterations;
+    timing.cost.scalarInstructions = *scalarInstructions;
+    timing.cost.vectorInstructions = *vectorInstructions;
+    timing.cost.loadInstructions = *loadInstructions;
+    timing.cost.storeInstructions = *storeInstructions;
+    timing.cost.controlInstructions = *controlInstructions;
+    timing.cost.runtimeDispatchCycles = *runtimeDispatchCycles;
+    timing.cost.taskEntryCycles = *taskEntryCycles;
+    timing.cost.taskExitCycles = *taskExitCycles;
+    timing.cost.predictedCpuCycles = *predictedCpuCycles;
+    timing.cost.source = *source;
+    timing.cost.confidence = *confidence;
     std::optional<int64_t> replacementTotal = llvm::checkedAdd(
-        observedDigitalReplacementOps, timing.digitalReplacementOps);
+        observedDigitalReplacementOps, timing.workload.digitalReplacementOps);
     if (!replacementTotal) {
       node.op->emitError("digital replacement operation count overflow");
       return failure();
@@ -372,6 +652,7 @@ loadSchedulingTimingProfile(func::FuncOp taskGraphFunc, const TaskGraphDAG &dag,
     timing.analogLoadLatencyNs = *analogLoad;
     timing.analogExecuteLatencyNs = *analogExecute;
     timing.analogStoreLatencyNs = *analogStore;
+    timing.analogPipelineLatencyNs = *analogPipeline;
     timing.intrinsicLatencyNs = *intrinsic;
     timing.earliestStartNs = *earliestStart;
     timing.earliestFinishNs = *earliestFinish;

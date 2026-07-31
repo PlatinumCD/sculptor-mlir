@@ -2,8 +2,8 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_GREEDY_GREEDYHEURISTIC_H
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementConstraints.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -56,18 +56,19 @@ public:
   int64_t evaluate(const GreedyHeuristicContext &context) const final;
 };
 
-class LinkPressureGreedyHeuristic final : public GreedyHeuristic {
+class SpatialSharedLinkPressureGreedyHeuristic final : public GreedyHeuristic {
 public:
-  llvm::StringRef getName() const final { return "link-pressure"; }
+  llvm::StringRef getName() const final { return "spatial-link-pressure"; }
   int64_t evaluate(const GreedyHeuristicContext &context) const final;
 };
 
 class CompositeGreedyHeuristic final : public GreedyHeuristic {
 public:
   CompositeGreedyHeuristic(std::string name, bool boundaryRegret,
-                           bool compactRegion, bool linkPressure)
+                           bool compactRegion, bool spatialSharedLinkPressure)
       : name(std::move(name)), boundaryRegret(boundaryRegret),
-        compactRegion(compactRegion), linkPressure(linkPressure) {}
+        compactRegion(compactRegion),
+        spatialSharedLinkPressure(spatialSharedLinkPressure) {}
 
   llvm::StringRef getName() const final { return name; }
   int64_t evaluate(const GreedyHeuristicContext &context) const final;
@@ -76,7 +77,7 @@ private:
   std::string name;
   bool boundaryRegret = false;
   bool compactRegion = false;
-  bool linkPressure = false;
+  bool spatialSharedLinkPressure = false;
 };
 
 } // namespace task_schedulers

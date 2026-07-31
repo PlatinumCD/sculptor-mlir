@@ -39,22 +39,24 @@ module {
 }
 
 // CHECK-LABEL: func.func private @generate_task_graph()
-// CHECK-SAME: sculptor.timing.critical_path_ns = 9.000000e+00 : f64
+// The two producers share core 0, so the runtime serializes them. Their routes
+// consequently do not overlap and must not report false network contention.
+// CHECK-SAME: sculptor.timing.critical_path_ns = 9.400000e+01 : f64
 // CHECK-SAME: sculptor.timing.network_edges = [
 // CHECK-SAME: meshHops = 0 : i64
 // CHECK-SAME: meshHops = 0 : i64
 // CHECK-SAME: meshHops = 2 : i64
-// CHECK-SAME: networkLatencyNs = 5.000000e+00 : f64
+// CHECK-SAME: networkLatencyNs = 1.900000e+01 : f64
 // CHECK-SAME: meshHops = 2 : i64
-// CHECK-SAME: networkLatencyNs = 9.000000e+00 : f64, contentionDelayNs = 4.000000e+00 : f64>
+// CHECK-SAME: networkLatencyNs = 1.900000e+01 : f64, contentionDelayNs = 0.000000e+00 : f64
 // CHECK-SAME: sculptor.timing.placement_aware = true
-// CHECK-SAME: sculptor.timing.total_network_contention_delay_ns = 4.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.total_network_latency_ns = 1.400000e+01 : f64
+// CHECK-SAME: sculptor.timing.sum_edge_network_queue_delay_ns = 0.000000e+00 : f64
+// CHECK-SAME: sculptor.timing.sum_edge_network_service_ns = 3.800000e+01 : f64
 
 // CHECK: task_name = "consumer0"
-// CHECK-SAME: sculptor.timing.earliest_start_ns = 5.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.incoming_network_delay_ns = 5.000000e+00 : f64
+// CHECK-SAME: sculptor.timing.earliest_start_ns = 4.200000e+01 : f64
+// CHECK-SAME: sculptor.timing.incoming_network_delay_ns = 1.900000e+01 : f64
 
 // CHECK: task_name = "consumer1"
-// CHECK-SAME: sculptor.timing.earliest_start_ns = 9.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.incoming_network_delay_ns = 9.000000e+00 : f64
+// CHECK-SAME: sculptor.timing.earliest_start_ns = 6.800000e+01 : f64
+// CHECK-SAME: sculptor.timing.incoming_network_delay_ns = 0.000000e+00 : f64

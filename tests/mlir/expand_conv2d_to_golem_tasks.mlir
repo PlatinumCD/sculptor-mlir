@@ -56,8 +56,8 @@ module {
   // DIGITAL-COST-SAME: sculptor.timing.total_digital_replacement_ops = 2592 : i64
   // DIGITAL-COST: task_kind = "sculptor.conv_tile_mvm"
   // DIGITAL-COST-SAME: sculptor.timing.analog_execute_latency_ns = 0.000000e+00 : f64
-  // DIGITAL-COST-SAME: sculptor.timing.digital_replacement_ops = 2592 : i64
-  // DIGITAL-COST-SAME: sculptor.timing.intrinsic_latency_ns = 3.240000e+02 : f64
+  // DIGITAL-COST-SAME: sculptor.timing.intrinsic_latency_ns = 2.258000e+03 : f64
+  // DIGITAL-COST-SAME: sculptor.workload.digital_replacement_ops = 2592 : i64
   // DIGITAL-LABEL: func.func private @task_conv2d_bias_mvm_0_0_2(%arg0: tensor<9x9xf32>) -> tensor<9x1xf32>
   // DIGITAL-SAME: sculptor.runtime.digital_ops = 2592 : i64
   // DIGITAL-SAME: sculptor.task_domain = "digital"
@@ -74,7 +74,7 @@ module {
   // DIGITAL-SAME: sculptor.runtime.digital_ops = 2592 : i64
   // DIGITAL-SAME: sculptor.schedule.island_id = 0 : i64
   // DIGITAL-SAME: sculptor.timing.analog_execute_latency_ns = 0.000000e+00 : f64
-  // DIGITAL-SAME: sculptor.timing.digital_ops = 2592 : i64
+  // DIGITAL-SAME: sculptor.workload.digital_ops = 2592 : i64
   func.func @conv2d_bias(%arg0: tensor<1x1x5x5xf32>)
       -> tensor<1x1x3x3xf32>
       attributes {layer_type = "conv2d_w_bias"} {

@@ -12,6 +12,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDigitalOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -495,22 +496,6 @@ static mlir::LogicalResult rewriteCallsToSetup(mlir::ModuleOp module,
   return mlir::success();
 }
 
-static void clearTimingMetadata(mlir::func::FuncOp taskGraphFunc) {
-  auto clear = [](mlir::Operation *op) {
-    llvm::SmallVector<mlir::StringAttr, 16> names;
-    for (mlir::NamedAttribute attr : op->getAttrs()) {
-      if (attr.getName().getValue().starts_with("sculptor.timing."))
-        names.push_back(attr.getName());
-    }
-    for (mlir::StringAttr name : names)
-      op->removeAttr(name);
-  };
-  clear(taskGraphFunc);
-  for (mlir::sculptor::TaskCreateOp task :
-       taskGraphFunc.getOps<mlir::sculptor::TaskCreateOp>())
-    clear(task);
-}
-
 static mlir::LogicalResult
 refreshStructuralMetadata(mlir::func::FuncOp taskGraphFunc) {
   auto dag = task_graph::parseTaskGraphDAG(taskGraphFunc);
@@ -662,7 +647,7 @@ static mlir::LogicalResult lowerTaskGraphMVMs(mlir::ModuleOp module,
   }
   if (mlir::failed(refreshStructuralMetadata(taskGraphFunc)))
     return mlir::failure();
-  clearTimingMetadata(taskGraphFunc);
+  mlir::sculptor::task_timing::invalidateTaskGraphStructure(taskGraphFunc);
   changed = true;
   return mlir::success();
 }

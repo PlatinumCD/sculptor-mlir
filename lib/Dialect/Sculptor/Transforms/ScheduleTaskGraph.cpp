@@ -15,6 +15,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleMetadata.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduleReport.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphScheduler.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingAnalysis.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -25,6 +26,7 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include <cmath>
 #include <optional>
 #include <utility>
 
@@ -159,11 +161,39 @@ void ScheduleTaskGraphPass::runOnOperation() {
       signalPassFailure();
       return;
     }
+    if (!schedulingTimingProfile)
+      task_timing::invalidateTaskGraphTiming(func, /*advanceGeneration=*/false);
 
     auto scheduledDag = task_graph::parseTaskGraphDAG(func);
     if (failed(scheduledDag)) {
       signalPassFailure();
       return;
+    }
+
+    if (schedulingTimingProfile) {
+      auto timingModel = task_timing::loadTimingModel(func);
+      if (failed(timingModel)) {
+        signalPassFailure();
+        return;
+      }
+      auto exactTiming = task_timing::analyzeTaskGraphTiming(
+          module, func, *scheduledDag, *executionGraph, *islandGraph,
+          *timingModel, schedulingTimingProfile->mvmCostMode);
+      if (failed(exactTiming)) {
+        signalPassFailure();
+        return;
+      }
+      if (placementPlan->fullTimingObjective &&
+          std::abs(exactTiming->criticalPathNs -
+                   placementPlan->fullTimingObjective->makespanNs) > 1.0e-9) {
+        func.emitError("selected placement timing changed while committing "
+                       "the placement plan");
+        signalPassFailure();
+        return;
+      }
+      task_timing::attachTaskGraphTimingAnalysis(
+          func, *scheduledDag, *exactTiming, *timingModel,
+          schedulingTimingProfile->mvmCostMode);
     }
 
     if (failed(task_schedulers::finalizeTaskGraphScheduleMetadata(
@@ -183,20 +213,49 @@ void ScheduleTaskGraphPass::runOnOperation() {
         owner->removeAttr(schedule_attrs::kPlacementCostModeAttrName);
       }
 
-      if (placementPlan->timingObjective) {
-        const auto &objective = *placementPlan->timingObjective;
+      if (placementPlan->searchProxyObjective) {
+        const auto &objective = *placementPlan->searchProxyObjective;
+        owner->setAttr(schedule_attrs::kSearchCompletionTimeProxyAttrName,
+                       builder.getF64FloatAttr(objective.completionTime));
+        owner->setAttr(schedule_attrs::kSearchCommunicationProxyAttrName,
+                       builder.getF64FloatAttr(objective.communication));
+        owner->setAttr(schedule_attrs::kSearchResourceLoadProxyAttrName,
+                       builder.getF64FloatAttr(objective.resourceLoad));
+      } else {
+        owner->removeAttr(schedule_attrs::kSearchCompletionTimeProxyAttrName);
+        owner->removeAttr(schedule_attrs::kSearchCommunicationProxyAttrName);
+        owner->removeAttr(schedule_attrs::kSearchResourceLoadProxyAttrName);
+      }
+
+      if (placementPlan->fullTimingObjective) {
+        const auto &objective = *placementPlan->fullTimingObjective;
         owner->setAttr(schedule_attrs::kPredictedMakespanNsAttrName,
-                       builder.getF64FloatAttr(objective.predictedMakespanNs));
-        owner->setAttr(
-            schedule_attrs::kCriticalCommunicationNsAttrName,
-            builder.getF64FloatAttr(objective.criticalCommunicationNs));
-        owner->setAttr(
-            schedule_attrs::kMaximumResourceWorkNsAttrName,
-            builder.getF64FloatAttr(objective.maximumResourceWorkNs));
+                       builder.getF64FloatAttr(objective.makespanNs));
+        owner->setAttr(schedule_attrs::kPredictedExposedContentionNsAttrName,
+                       builder.getF64FloatAttr(objective.exposedContentionNs));
+        owner->setAttr(schedule_attrs::kPredictedExposedTransportNsAttrName,
+                       builder.getF64FloatAttr(objective.exposedTransportNs));
+        owner->setAttr(schedule_attrs::kPredictedTotalWordHopsAttrName,
+                       builder.getI64IntegerAttr(objective.totalWordHops));
       } else {
         owner->removeAttr(schedule_attrs::kPredictedMakespanNsAttrName);
-        owner->removeAttr(schedule_attrs::kCriticalCommunicationNsAttrName);
-        owner->removeAttr(schedule_attrs::kMaximumResourceWorkNsAttrName);
+        owner->removeAttr(
+            schedule_attrs::kPredictedExposedContentionNsAttrName);
+        owner->removeAttr(schedule_attrs::kPredictedExposedTransportNsAttrName);
+        owner->removeAttr(schedule_attrs::kPredictedTotalWordHopsAttrName);
+      }
+
+      if (placementPlan->timingRerankCandidateCount) {
+        owner->setAttr(schedule_attrs::kTimingRerankCandidateCountAttrName,
+                       builder.getI64IntegerAttr(
+                           *placementPlan->timingRerankCandidateCount));
+        owner->setAttr(schedule_attrs::kTimingRerankSelectedProxyRankAttrName,
+                       builder.getI64IntegerAttr(
+                           *placementPlan->timingRerankSelectedProxyRank));
+      } else {
+        owner->removeAttr(schedule_attrs::kTimingRerankCandidateCountAttrName);
+        owner->removeAttr(
+            schedule_attrs::kTimingRerankSelectedProxyRankAttrName);
       }
     }
 

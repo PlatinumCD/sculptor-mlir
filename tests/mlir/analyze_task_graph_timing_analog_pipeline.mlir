@@ -38,26 +38,28 @@ module {
 }
 
 // CHECK-LABEL: func.func private @generate_task_graph()
-// CHECK-SAME: sculptor.timing.critical_path_ns = 1.030000e+02 : f64
+// CHECK-SAME: sculptor.timing.critical_path_ns = 1.660000e+02 : f64
 // CHECK-SAME: sculptor.timing.islands = [#sculptor.island_timing<islandId = 0
 // CHECK-SAME: #sculptor.island_timing<islandId = 1
 // CHECK-SAME: sculptor.timing.total_data_bytes = 64 : i64
 
 // Both independent arrays start at zero and overlap in the DAG. Each array's
 // own load, execute, and store phases remain sequential and sum to 102 ns.
+// The remaining 31 ns per MVM is executable wrapper/adapter work.
 // CHECK: task_name = "mvm0"
 // CHECK-SAME: sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64
 // CHECK-SAME: sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64
+// CHECK-SAME: sculptor.timing.analog_pipeline_latency_ns = 1.020000e+02 : f64
 // CHECK-SAME: sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64
+// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.330000e+02 : f64
 // CHECK-SAME: sculptor.timing.earliest_start_ns = 0.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64
+// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 1.330000e+02 : f64
 
 // CHECK: task_name = "mvm1"
-// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64
+// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.330000e+02 : f64
 // CHECK-SAME: sculptor.timing.earliest_start_ns = 0.000000e+00 : f64
-// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64
+// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 1.330000e+02 : f64
 
 // CHECK: task_name = "join"
-// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.030000e+02 : f64
-// CHECK-SAME: sculptor.timing.earliest_start_ns = 1.020000e+02 : f64
+// CHECK-SAME: sculptor.timing.earliest_finish_ns = 1.660000e+02 : f64
+// CHECK-SAME: sculptor.timing.earliest_start_ns = 1.330000e+02 : f64

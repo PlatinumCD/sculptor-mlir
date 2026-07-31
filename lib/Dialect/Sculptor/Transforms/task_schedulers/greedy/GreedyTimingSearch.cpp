@@ -4,6 +4,8 @@
 #include "GreedySearchEngine.h"
 #include "GreedySearchInternals.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/MeshGeometry.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingAnalysis.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -40,9 +42,9 @@ struct TimingSearchModel {
 };
 
 struct TimingPlacementScore {
-  double predictedMakespanNs = 0.0;
-  double criticalCommunicationNs = 0.0;
-  double maximumResourceWorkNs = 0.0;
+  double completionTimeProxy = 0.0;
+  double communicationProxy = 0.0;
+  double resourceLoadProxy = 0.0;
   int64_t legacyScore = 0;
 };
 
@@ -213,7 +215,7 @@ static void addNewCriticalCommunication(unsigned island, int64_t candidateCore,
                  activeTiming ? activeTiming->slackNs : 0.0);
     double exposedLatencyNs = std::max(0.0, latencyNs - availableSlackNs);
     double pressure = std::max(edge.criticality, edge.consumerTimingPressure);
-    state.score.criticalCommunicationNs += exposedLatencyNs * pressure;
+    state.score.communicationProxy += exposedLatencyNs * pressure;
   }
 }
 
@@ -240,8 +242,8 @@ applyTimingEstimate(const TimingPlacementState &state,
     expanded.analogReadyByPhysicalArray[physicalArrayId] = analogFinishNs;
     double &analogWork = expanded.analogWorkByPhysicalArray[physicalArrayId];
     analogWork += timing.analogWorkNs;
-    expanded.score.maximumResourceWorkNs =
-        std::max(expanded.score.maximumResourceWorkNs, analogWork);
+    expanded.score.resourceLoadProxy =
+        std::max(expanded.score.resourceLoadProxy, analogWork);
   }
 
   double digitalFinishNs = dataReadyNs;
@@ -251,8 +253,8 @@ applyTimingEstimate(const TimingPlacementState &state,
         timing.digitalWorkNs;
     expanded.digitalReadyByCore[candidateCore] = digitalFinishNs;
     expanded.digitalWorkByCore[candidateCore] += timing.digitalWorkNs;
-    expanded.score.maximumResourceWorkNs =
-        std::max(expanded.score.maximumResourceWorkNs,
+    expanded.score.resourceLoadProxy =
+        std::max(expanded.score.resourceLoadProxy,
                  expanded.digitalWorkByCore[candidateCore]);
   }
 
@@ -261,8 +263,8 @@ applyTimingEstimate(const TimingPlacementState &state,
   double finishNs = std::max(
       {analogFinishNs, digitalFinishNs, dataReadyNs + intrinsicSpanNs});
   expanded.finishByIsland[island] = finishNs;
-  expanded.score.predictedMakespanNs =
-      std::max(expanded.score.predictedMakespanNs, finishNs);
+  expanded.score.completionTimeProxy =
+      std::max(expanded.score.completionTimeProxy, finishNs);
   expanded.score.legacyScore = expanded.placement.score;
   addNewCriticalCommunication(island, candidateCore, expanded, context);
   return expanded;
@@ -270,12 +272,12 @@ applyTimingEstimate(const TimingPlacementState &state,
 
 static bool isBetterTimingScore(const TimingPlacementScore &candidate,
                                 const TimingPlacementScore &current) {
-  if (candidate.predictedMakespanNs != current.predictedMakespanNs)
-    return candidate.predictedMakespanNs < current.predictedMakespanNs;
-  if (candidate.criticalCommunicationNs != current.criticalCommunicationNs)
-    return candidate.criticalCommunicationNs < current.criticalCommunicationNs;
-  if (candidate.maximumResourceWorkNs != current.maximumResourceWorkNs)
-    return candidate.maximumResourceWorkNs < current.maximumResourceWorkNs;
+  if (candidate.completionTimeProxy != current.completionTimeProxy)
+    return candidate.completionTimeProxy < current.completionTimeProxy;
+  if (candidate.communicationProxy != current.communicationProxy)
+    return candidate.communicationProxy < current.communicationProxy;
+  if (candidate.resourceLoadProxy != current.resourceLoadProxy)
+    return candidate.resourceLoadProxy < current.resourceLoadProxy;
   return candidate.legacyScore < current.legacyScore;
 }
 
@@ -338,10 +340,85 @@ buildFinalPlacementPlan(const TimingPlacementState &state,
       context.problem, context.placementResources, physicalArrayByIsland);
   if (mlir::failed(plan))
     return mlir::failure();
-  plan->timingObjective = task_schedulers::TimingPlacementObjective{
-      state.score.predictedMakespanNs, state.score.criticalCommunicationNs,
-      state.score.maximumResourceWorkNs};
+  plan->searchProxyObjective = task_schedulers::SearchProxyObjective{
+      state.score.completionTimeProxy, state.score.communicationProxy,
+      state.score.resourceLoadProxy};
   return plan;
+}
+
+static task_timing::TimingAnalysis buildBaseTimingAnalysis(
+    const task_schedulers::TaskGraphPlacementProblem &problem,
+    const task_timing::SchedulingTimingProfile &profile) {
+  task_timing::TimingAnalysis analysis;
+  analysis.tasks = profile.tasks;
+  analysis.incomingEdges = problem.executionGraph.incomingEdges;
+  analysis.outgoingEdges = problem.executionGraph.outgoingEdges;
+  analysis.topologicalOrder = problem.executionGraph.topologicalOrder;
+  analysis.controlEdgeCount = problem.executionGraph.controlEdgeCount;
+  analysis.dataEdgeCount = problem.executionGraph.dataEdgeCount;
+  analysis.executionDepth = 0;
+  analysis.totalDataBytes = problem.executionGraph.totalDataBytes;
+  analysis.mvmCostMode = profile.mvmCostMode;
+  analysis.executionEdges.reserve(problem.executionGraph.edges.size());
+  for (const task_graph::TaskExecutionEdge &edge :
+       problem.executionGraph.edges) {
+    analysis.executionEdges.push_back(task_timing::ExecutionEdge{
+        edge.producerTask, edge.consumerTask, edge.controlDependency,
+        edge.dataDependency, edge.transferredBytes});
+  }
+  return analysis;
+}
+
+static mlir::FailureOr<task_timing::TimingAnalysis>
+evaluateCompletePlan(const task_schedulers::TaskGraphPlacementProblem &problem,
+                     const task_schedulers::IslandPlacementPlan &plan,
+                     const task_timing::TimingModel &model,
+                     const task_timing::TimingAnalysis &baseAnalysis) {
+  llvm::SmallVector<int64_t, 16> coreByTask(problem.dag.nodes.size(), -1);
+  for (auto indexedIsland : llvm::enumerate(problem.islandGraph.islands)) {
+    int64_t core = plan.placements[indexedIsland.index()].coreId;
+    for (unsigned task : indexedIsland.value().taskIndices) {
+      if (task >= coreByTask.size()) {
+        problem.diagnosticOp->emitError(
+            "logical island references an invalid task during final timing "
+            "evaluation");
+        return mlir::failure();
+      }
+      if (coreByTask[task] >= 0 && coreByTask[task] != core) {
+        problem.diagnosticOp->emitError(
+            "task belongs to conflicting logical island placements during "
+            "final timing evaluation");
+        return mlir::failure();
+      }
+      coreByTask[task] = core;
+    }
+  }
+  for (auto indexedCore : llvm::enumerate(coreByTask)) {
+    if (indexedCore.value() >= 0)
+      continue;
+    problem.diagnosticOp->emitError(
+        "full-deployment timing score excludes task ")
+        << indexedCore.index()
+        << "; every analog, digital, and reduction task must belong to a "
+           "placed island";
+    return mlir::failure();
+  }
+
+  return task_timing::evaluateTaskGraphPlacementTiming(
+      problem.taskGraphFunc, problem.dag, model, baseAnalysis, coreByTask,
+      problem.budget.meshRows, problem.budget.meshCols);
+}
+
+static bool isBetterFullTiming(
+    const task_schedulers::FullDeploymentTimingObjective &candidate,
+    const task_schedulers::FullDeploymentTimingObjective &current) {
+  if (candidate.makespanNs != current.makespanNs)
+    return candidate.makespanNs < current.makespanNs;
+  if (candidate.exposedContentionNs != current.exposedContentionNs)
+    return candidate.exposedContentionNs < current.exposedContentionNs;
+  if (candidate.exposedTransportNs != current.exposedTransportNs)
+    return candidate.exposedTransportNs < current.exposedTransportNs;
+  return candidate.totalWordHops < current.totalWordHops;
 }
 
 } // namespace
@@ -386,7 +463,7 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
 
   CompositeGreedyHeuristic legacyHeuristic(
       config.specification, config.boundaryRegret, config.compactRegion,
-      config.linkPressure);
+      config.spatialSharedLinkPressure);
   unsigned analogIslandCount = static_cast<unsigned>(
       llvm::count_if(problem.islandGraph.islands,
                      [](const task_graph::LogicalPlacementIsland &island) {
@@ -419,41 +496,91 @@ FailureOr<IslandPlacementPlan> buildGreedyTimingPlacementPlan(
   auto expand = [&](const TimingPlacementState &state, bool) {
     return expandTimingState(state, context);
   };
-  FailureOr<TimingPlacementState> finalState =
-      config.beamWidth > 1
-          ? greedy::runBeamSearch(
-                std::move(initialState),
-                static_cast<unsigned>(config.beamWidth), isComplete, expand,
-                [](llvm::SmallVectorImpl<TimingPlacementState> &states,
-                   unsigned beamWidth) {
-                  llvm::sort(states, isBetterTimingState);
-                  if (states.size() > beamWidth)
-                    states.resize(beamWidth);
-                })
-          : greedy::runLookaheadSearch<TimingPlacementState,
-                                       TimingPlacementScore>(
-                std::move(initialState), config.lookahead, isComplete, expand,
-                [](const TimingPlacementState &state) { return state.score; },
-                [](const TimingPlacementScore &candidateScore,
-                   const TimingPlacementState &candidate, bool hasBest,
-                   const TimingPlacementScore &bestScore,
-                   const TimingPlacementState &best,
-                   const TimingPlacementState &) {
-                  if (!hasBest ||
-                      isBetterTimingScore(candidateScore, bestScore))
-                    return true;
-                  if (isBetterTimingScore(bestScore, candidateScore))
-                    return false;
-                  return candidate.placement.currentCore <
-                         best.placement.currentCore;
-                });
-  if (failed(finalState)) {
+  llvm::SmallVector<TimingPlacementState, 8> finalStates;
+  if (config.beamWidth > 1) {
+    auto beamStates = greedy::runBeamSearchCandidates(
+        std::move(initialState), static_cast<unsigned>(config.beamWidth),
+        isComplete, expand,
+        [](llvm::SmallVectorImpl<TimingPlacementState> &states,
+           unsigned beamWidth) {
+          llvm::sort(states, isBetterTimingState);
+          if (states.size() > beamWidth)
+            states.resize(beamWidth);
+        });
+    if (succeeded(beamStates))
+      finalStates = std::move(*beamStates);
+  } else {
+    auto finalState =
+        greedy::runLookaheadSearch<TimingPlacementState, TimingPlacementScore>(
+            std::move(initialState), config.lookahead, isComplete, expand,
+            [](const TimingPlacementState &state) { return state.score; },
+            [](const TimingPlacementScore &candidateScore,
+               const TimingPlacementState &candidate, bool hasBest,
+               const TimingPlacementScore &bestScore,
+               const TimingPlacementState &best, const TimingPlacementState &) {
+              if (!hasBest || isBetterTimingScore(candidateScore, bestScore))
+                return true;
+              if (isBetterTimingScore(bestScore, candidateScore))
+                return false;
+              return candidate.placement.currentCore <
+                     best.placement.currentCore;
+            });
+    if (succeeded(finalState))
+      finalStates.push_back(std::move(*finalState));
+  }
+  if (finalStates.empty()) {
     problem.diagnosticOp->emitError(
         "failed to find a timing-aware greedy island placement");
     return failure();
   }
-  return buildFinalPlacementPlan(*finalState, context,
-                                 placementResources->analogPhysicalArrayOrder);
+  llvm::sort(finalStates, isBetterTimingState);
+
+  auto timingModel = task_timing::loadTimingModel(problem.taskGraphFunc);
+  if (failed(timingModel))
+    return failure();
+  task_timing::TimingAnalysis baseAnalysis =
+      buildBaseTimingAnalysis(problem, timingProfile);
+
+  bool hasBest = false;
+  unsigned selectedProxyRank = 0;
+  IslandPlacementPlan bestPlan;
+  TimingPlacementScore bestProxyScore;
+  for (auto indexedState : llvm::enumerate(finalStates)) {
+    const TimingPlacementState &state = indexedState.value();
+    auto plan = buildFinalPlacementPlan(
+        state, context, placementResources->analogPhysicalArrayOrder);
+    if (failed(plan))
+      return failure();
+    auto exact =
+        evaluateCompletePlan(problem, *plan, *timingModel, baseAnalysis);
+    if (failed(exact))
+      return failure();
+    FullDeploymentTimingObjective objective{
+        exact->criticalPathNs, exact->exposedContentionNs,
+        exact->exposedTransportNs, exact->totalWordHops};
+    plan->fullTimingObjective = objective;
+
+    bool select = !hasBest;
+    if (hasBest) {
+      const FullDeploymentTimingObjective &bestObjective =
+          *bestPlan.fullTimingObjective;
+      if (isBetterFullTiming(objective, bestObjective))
+        select = true;
+      else if (!isBetterFullTiming(bestObjective, objective) &&
+               isBetterTimingScore(state.score, bestProxyScore))
+        select = true;
+    }
+    if (!select)
+      continue;
+    hasBest = true;
+    bestPlan = std::move(*plan);
+    bestProxyScore = state.score;
+    selectedProxyRank = indexedState.index();
+  }
+  bestPlan.timingRerankCandidateCount =
+      static_cast<unsigned>(finalStates.size());
+  bestPlan.timingRerankSelectedProxyRank = selectedProxyRank;
+  return bestPlan;
 }
 
 } // namespace task_schedulers

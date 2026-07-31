@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphReductionBalancer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/Pass/PassRegistry.h"
 
@@ -46,12 +47,15 @@ void BalanceTaskGraphReductionsPass::runOnOperation() {
     if (!returnsTaskGraph(func))
       continue;
     foundTaskGraph = true;
-    foundEligibleReduction |= hasEligibleReduction(func, reductionWidth);
+    bool eligible = hasEligibleReduction(func, reductionWidth);
+    foundEligibleReduction |= eligible;
     if (failed(task_graph::balanceTaskGraphReductions(getOperation(), func,
                                                       reductionWidth))) {
       signalPassFailure();
       return;
     }
+    if (eligible)
+      task_timing::invalidateTaskGraphStructure(func);
   }
 
   if (!foundTaskGraph) {

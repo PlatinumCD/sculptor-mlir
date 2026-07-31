@@ -27,7 +27,8 @@ module {
 // CHECK-SAME: sculptor.schedule.core_transfer_cost = [0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 // CHECK-SAME: sculptor.schedule.graph_score = 16 : i64
 // CHECK-SAME: sculptor.schedule.total_transfer_cost = 16 : i64
+// CHECK-NOT: sculptor.timing.
 // CHECK: task_name = "consumer"
-// CHECK-SAME: sculptor.timing.topological_index = 1 : i64
+// CHECK-SAME: sculptor.runtime.core_id = 3 : i64
 // CHECK: task_name = "producer"
-// CHECK-SAME: sculptor.timing.topological_index = 0 : i64
+// CHECK-SAME: sculptor.runtime.core_id = 0 : i64

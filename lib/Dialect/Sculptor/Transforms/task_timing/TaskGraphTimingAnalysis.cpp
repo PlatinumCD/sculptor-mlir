@@ -62,9 +62,9 @@ analyzeTask(ModuleOp module, const TaskGraphDAG &dag,
 
   for (unsigned edgeIndex : analysis.incomingEdges[taskIndex]) {
     const ExecutionEdge &edge = analysis.executionEdges[edgeIndex];
-    timing.controlPredecessorCount += edge.controlDependency;
-    timing.dataPredecessorCount += edge.dataDependency;
-    timing.incomingDataBytes += edge.transferredBytes;
+    timing.workload.controlPredecessorCount += edge.controlDependency;
+    timing.workload.dataPredecessorCount += edge.dataDependency;
+    timing.workload.incomingDataBytes += edge.transferredBytes;
     const TaskTiming &predecessor = analysis.tasks[edge.producerTask];
     timing.dependencyDepth =
         std::max(timing.dependencyDepth, predecessor.dependencyDepth + 1);
@@ -72,25 +72,25 @@ analyzeTask(ModuleOp module, const TaskGraphDAG &dag,
         std::max(timing.earliestStartNs, predecessor.earliestFinishNs);
   }
   for (unsigned edgeIndex : analysis.outgoingEdges[taskIndex])
-    timing.outgoingDataBytes +=
+    timing.workload.outgoingDataBytes +=
         analysis.executionEdges[edgeIndex].transferredBytes;
 
   FailureOr<int64_t> digitalOps =
       task_graph::estimateTaskDigitalOps(module, dag.nodes[taskIndex].op);
   if (failed(digitalOps))
     return failure();
-  timing.digitalOps = *digitalOps;
+  timing.workload.digitalOps = *digitalOps;
 
   FailureOr<int64_t> digitalReplacementOps = estimateReplacementOps(
       module, dag.nodes[taskIndex].op, producerByResource, mvmCostMode);
   if (failed(digitalReplacementOps))
     return failure();
-  timing.digitalReplacementOps = *digitalReplacementOps;
+  timing.workload.digitalReplacementOps = *digitalReplacementOps;
 
-  int64_t effectiveDigitalOps = timing.digitalOps;
+  int64_t effectiveDigitalOps = timing.workload.digitalOps;
   if (mvmCostMode == MVMCostMode::Digital) {
-    std::optional<int64_t> sum =
-        llvm::checkedAdd(effectiveDigitalOps, timing.digitalReplacementOps);
+    std::optional<int64_t> sum = llvm::checkedAdd(
+        effectiveDigitalOps, timing.workload.digitalReplacementOps);
     if (!sum) {
       dag.nodes[taskIndex].op->emitError(
           "effective digital operation count overflow");
@@ -100,12 +100,18 @@ analyzeTask(ModuleOp module, const TaskGraphDAG &dag,
   }
 
   FailureOr<TaskLatencyEstimate> latency = estimateTaskLatency(
-      dag.nodes[taskIndex].op, effectiveDigitalOps, model, mvmCostMode);
+      module, dag.nodes[taskIndex].op, timing.workload, effectiveDigitalOps,
+      mvmCostMode == MVMCostMode::Digital
+          ? timing.workload.digitalReplacementOps
+          : 0,
+      model, mvmCostMode);
   if (failed(latency))
     return failure();
+  timing.cost = latency->cost;
   timing.analogLoadLatencyNs = latency->analogLoadLatencyNs;
   timing.analogExecuteLatencyNs = latency->analogExecuteLatencyNs;
   timing.analogStoreLatencyNs = latency->analogStoreLatencyNs;
+  timing.analogPipelineLatencyNs = latency->analogPipelineLatencyNs;
   timing.intrinsicLatencyNs = latency->intrinsicLatencyNs;
   timing.earliestFinishNs = timing.earliestStartNs + timing.intrinsicLatencyNs;
   return timing;
@@ -147,8 +153,10 @@ analyzeTaskGraphTiming(ModuleOp module, func::FuncOp taskGraphFunc,
     if (failed(timing))
       return failure();
     analysis.tasks[taskIndex] = *timing;
-    std::optional<int64_t> totalReplacement = llvm::checkedAdd(
-        analysis.totalDigitalReplacementOps, timing->digitalReplacementOps);
+    analysis.sumTaskWorkNs += timing->intrinsicLatencyNs;
+    std::optional<int64_t> totalReplacement =
+        llvm::checkedAdd(analysis.totalDigitalReplacementOps,
+                         timing->workload.digitalReplacementOps);
     if (!totalReplacement) {
       dag.nodes[taskIndex].op->emitError(
           "total digital replacement operation count overflow");
@@ -164,6 +172,10 @@ analyzeTaskGraphTiming(ModuleOp module, func::FuncOp taskGraphFunc,
     return failure();
 
   buildSchedulingTimingProfile(islandGraph, model, analysis);
+  if (!analysis.placementAware) {
+    analysis.noContentionMakespanNs = analysis.criticalPathNs;
+    analysis.zeroNetworkMakespanNs = analysis.criticalPathNs;
+  }
   return analysis;
 }
 

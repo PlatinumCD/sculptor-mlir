@@ -172,23 +172,22 @@ void attachTaskGraphSchedulerOptionAttrs(
               builder.getStringAttr(annealing->annealing.moveSetSpecification));
   op->setAttr(schedule_attrs::kAnnealingMoveRadiusAttrName,
               builder.getI64IntegerAttr(annealing->annealing.moveRadius));
+  op->setAttr(schedule_attrs::kAnnealingPlateauPatienceAttrName,
+              builder.getI64IntegerAttr(annealing->annealing.plateauPatience));
   op->setAttr(
-      schedule_attrs::kAnnealingPlateauPatienceAttrName,
-      builder.getI64IntegerAttr(annealing->annealing.plateauPatience));
-  op->setAttr(schedule_attrs::kAnnealingImprovementThresholdAttrName,
-              builder.getF64FloatAttr(
-                  annealing->annealing.improvementThreshold));
+      schedule_attrs::kAnnealingImprovementThresholdAttrName,
+      builder.getF64FloatAttr(annealing->annealing.improvementThreshold));
   op->setAttr(schedule_attrs::kAnnealingMinimumEpochsAttrName,
               builder.getI64IntegerAttr(annealing->annealing.minimumEpochs));
-  op->setAttr(schedule_attrs::kAnnealingPlateauAcceptanceRateAttrName,
-              builder.getF64FloatAttr(
-                  annealing->annealing.plateauAcceptanceRate));
-  op->setAttr(schedule_attrs::kAnnealingMaximumEvaluationsAttrName,
-              builder.getI64IntegerAttr(
-                  annealing->annealing.maximumEvaluations));
-  op->setAttr(schedule_attrs::kAnnealingMaximumRuntimeSecondsAttrName,
-              builder.getF64FloatAttr(
-                  annealing->annealing.maximumRuntimeSeconds));
+  op->setAttr(
+      schedule_attrs::kAnnealingPlateauAcceptanceRateAttrName,
+      builder.getF64FloatAttr(annealing->annealing.plateauAcceptanceRate));
+  op->setAttr(
+      schedule_attrs::kAnnealingMaximumEvaluationsAttrName,
+      builder.getI64IntegerAttr(annealing->annealing.maximumEvaluations));
+  op->setAttr(
+      schedule_attrs::kAnnealingMaximumRuntimeSecondsAttrName,
+      builder.getF64FloatAttr(annealing->annealing.maximumRuntimeSeconds));
   if (annealing->annealing.initialSchedule == AnnealingInitialSchedule::Greedy)
     attachGreedyAttrs(op, builder, annealing->greedyInitialPlacement);
 }
@@ -232,8 +231,8 @@ parseGreedyScheduleConfig(Operation *diagnosticOp,
       config.compactRegion = true;
       continue;
     }
-    if (term == "link-pressure") {
-      config.linkPressure = true;
+    if (term == "spatial-link-pressure" || term == "link-pressure") {
+      config.spatialSharedLinkPressure = true;
       continue;
     }
 
@@ -271,7 +270,7 @@ parseGreedyScheduleConfig(Operation *diagnosticOp,
     diagnosticOp->emitError("unknown Sculptor greedy heuristic term '")
         << term
         << "'; expected comma-separated terms: 'transfer-cost', "
-           "'boundary-regret', 'compact-region', 'link-pressure', "
+           "'boundary-regret', 'compact-region', 'spatial-link-pressure', "
            "'lookahead=N', 'beam=N', or 'scope=NAME'";
     return failure();
   }
@@ -282,9 +281,9 @@ FailureOr<AnnealingScheduleConfig> parseAnnealingScheduleConfig(
     Operation *diagnosticOp, llvm::StringRef initialSchedule,
     llvm::StringRef moveSet, int64_t moveRadius, double initialTemperature,
     double finalTemperature, double coolingRate, int64_t stepsPerTemperature,
-    int64_t plateauPatience, double improvementThreshold,
-    int64_t minimumEpochs, double plateauAcceptanceRate,
-    int64_t maximumEvaluations, double maximumRuntimeSeconds) {
+    int64_t plateauPatience, double improvementThreshold, int64_t minimumEpochs,
+    double plateauAcceptanceRate, int64_t maximumEvaluations,
+    double maximumRuntimeSeconds) {
   AnnealingScheduleConfig config;
   if (initialSchedule == "identity") {
     config.initialSchedule = AnnealingInitialSchedule::Identity;

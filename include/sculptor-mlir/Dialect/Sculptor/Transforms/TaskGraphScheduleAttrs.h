@@ -49,12 +49,12 @@ inline constexpr llvm::StringLiteral
     kAnnealingEpochsAttrName("sculptor.schedule.annealing_epochs");
 inline constexpr llvm::StringLiteral
     kAnnealingEvaluationsAttrName("sculptor.schedule.annealing_evaluations");
-inline constexpr llvm::StringLiteral kAnnealingInitialScoreAttrName(
-    "sculptor.schedule.annealing_initial_score");
+inline constexpr llvm::StringLiteral
+    kAnnealingInitialScoreAttrName("sculptor.schedule.annealing_initial_score");
 inline constexpr llvm::StringLiteral
     kAnnealingBestScoreAttrName("sculptor.schedule.annealing_best_score");
-inline constexpr llvm::StringLiteral kAnnealingStopReasonAttrName(
-    "sculptor.schedule.annealing_stop_reason");
+inline constexpr llvm::StringLiteral
+    kAnnealingStopReasonAttrName("sculptor.schedule.annealing_stop_reason");
 inline constexpr llvm::StringLiteral kAnnealingSearchSecondsAttrName(
     "sculptor.schedule.annealing_search_seconds");
 inline constexpr llvm::StringLiteral kAnnealingUphillAcceptanceRateAttrName(
@@ -89,12 +89,24 @@ inline constexpr llvm::StringLiteral
     kIslandIdAttrName("sculptor.schedule.island_id");
 inline constexpr llvm::StringLiteral
     kPlacementCostModeAttrName("sculptor.schedule.placement_cost_mode");
+inline constexpr llvm::StringLiteral kSearchCompletionTimeProxyAttrName(
+    "sculptor.schedule.search_completion_time_proxy");
+inline constexpr llvm::StringLiteral kSearchCommunicationProxyAttrName(
+    "sculptor.schedule.search_communication_proxy");
+inline constexpr llvm::StringLiteral kSearchResourceLoadProxyAttrName(
+    "sculptor.schedule.search_resource_load_proxy");
 inline constexpr llvm::StringLiteral
     kPredictedMakespanNsAttrName("sculptor.schedule.predicted_makespan_ns");
-inline constexpr llvm::StringLiteral kCriticalCommunicationNsAttrName(
-    "sculptor.schedule.critical_communication_ns");
-inline constexpr llvm::StringLiteral kMaximumResourceWorkNsAttrName(
-    "sculptor.schedule.maximum_resource_work_ns");
+inline constexpr llvm::StringLiteral kPredictedExposedContentionNsAttrName(
+    "sculptor.schedule.predicted_exposed_contention_ns");
+inline constexpr llvm::StringLiteral kPredictedExposedTransportNsAttrName(
+    "sculptor.schedule.predicted_exposed_transport_ns");
+inline constexpr llvm::StringLiteral kPredictedTotalWordHopsAttrName(
+    "sculptor.schedule.predicted_total_word_hops");
+inline constexpr llvm::StringLiteral kTimingRerankCandidateCountAttrName(
+    "sculptor.schedule.timing_rerank_candidate_count");
+inline constexpr llvm::StringLiteral kTimingRerankSelectedProxyRankAttrName(
+    "sculptor.schedule.timing_rerank_selected_proxy_rank");
 
 } // namespace schedule_attrs
 } // namespace sculptor

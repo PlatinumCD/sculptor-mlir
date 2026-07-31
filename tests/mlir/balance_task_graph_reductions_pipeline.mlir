@@ -3,6 +3,7 @@
 // RUN: sculptor-mlir-opt %s --sculptor-balance-task-graph-reductions --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=6 arrays-per-core=1 topology=mesh mesh-rows=2 mesh-cols=3 schedule=random random-seed=0" -o /dev/null
 // RUN: sculptor-mlir-opt %s --sculptor-balance-task-graph-reductions --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=6 arrays-per-core=1 topology=mesh mesh-rows=2 mesh-cols=3 schedule=greedy greedy-heuristic=transfer-cost,lookahead=2,beam=1,scope=cardinal" -o /dev/null
 // RUN: sculptor-mlir-opt %s --sculptor-balance-task-graph-reductions --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=6 arrays-per-core=1 topology=mesh mesh-rows=2 mesh-cols=3 schedule=greedy-timing greedy-heuristic=transfer-cost,lookahead=2,beam=1,scope=cardinal" -o /dev/null
+// RUN: sculptor-mlir-opt %s --sculptor-balance-task-graph-reductions --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=6 arrays-per-core=1 topology=mesh mesh-rows=2 mesh-cols=3 schedule=greedy-timing greedy-heuristic=transfer-cost,spatial-link-pressure,lookahead=1,beam=16,scope=diagonal" | FileCheck %s --check-prefix=TIMING-RERANK
 // RUN: sculptor-mlir-opt %s --sculptor-balance-task-graph-reductions --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=6 arrays-per-core=1 topology=mesh mesh-rows=2 mesh-cols=3 schedule=annealing annealing-initial-schedule=snake annealing-move-set=basic annealing-steps-per-temperature=2 annealing-initial-temperature=2 annealing-final-temperature=1 annealing-cooling-rate=0.5" -o /dev/null
 
 module {
@@ -63,13 +64,22 @@ module {
 // SCHEDULED-NOT: func.func private @star_add
 // SCHEDULED-LABEL: func.func private @generate_task_graph()
 // SCHEDULED-SAME: sculptor.schedule.task_count = 13 : i64
-// SCHEDULED-SAME: sculptor.timing.critical_path_ns
+// SCHEDULED-SAME: sculptor.task_graph.generation = 1 : i64
+// SCHEDULED-NOT: sculptor.timing.
 // SCHEDULED-DAG: task_name = "star.level0.lane0"{{.*}}sculptor.runtime.core_id = 1 : i64{{.*}}sculptor.schedule.island_id = 8 : i64
 // SCHEDULED-DAG: task_name = "star.level0.lane1"{{.*}}sculptor.runtime.core_id = 2 : i64{{.*}}sculptor.schedule.island_id = 9 : i64
 // SCHEDULED-DAG: task_name = "star.level1.root"{{.*}}sculptor.runtime.core_id = 2 : i64{{.*}}sculptor.schedule.island_id = 10 : i64
 // SCHEDULED-NOT: task_name = "star"
-// SCHEDULED: task_name = "bridge"{{.*}}sculptor.runtime.core_id = 2 : i64
+// SCHEDULED: task_name = "bridge"{{.*}}sculptor.runtime.core_id = 5 : i64{{.*}}sculptor.schedule.island_id = 3 : i64
 // SCHEDULED: task_name = "sink"{{.*}}sculptor.schedule.island_id = 3 : i64
+
+// The spatial proxy's first complete candidate loses once reduction placement,
+// core serialization, and routed communication are replayed exactly.
+// TIMING-RERANK-LABEL: func.func private @generate_task_graph()
+// TIMING-RERANK-SAME: sculptor.schedule.predicted_makespan_ns = 2.730000e+02 : f64
+// TIMING-RERANK-SAME: sculptor.schedule.timing_rerank_candidate_count = 16 : i64
+// TIMING-RERANK-SAME: sculptor.schedule.timing_rerank_selected_proxy_rank = 1 : i64
+// TIMING-RERANK-SAME: sculptor.timing.critical_path_ns = 2.730000e+02 : f64
 
 // FINAL-NOT: func.func private @star_add
 // FINAL-LABEL: func.func private @generate_task_graph()

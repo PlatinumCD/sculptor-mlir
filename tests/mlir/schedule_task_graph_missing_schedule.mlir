@@ -9,5 +9,5 @@ module {
 }
 
 // CHECK: expected task graph schedule name
-// MISSING-TIMING: expected pre-placement timing attribute 'sculptor.timing.placement_aware'
+// MISSING-TIMING: expected pre-placement timing attribute 'sculptor.timing.generation'
 // MISSING-TIMING: failed to load pre-placement scheduling timing profile

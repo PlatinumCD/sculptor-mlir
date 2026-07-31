@@ -61,20 +61,20 @@ module {
 // CHECK-NOT: task_name = "wide.level"
 
 // STAR-LABEL: func.func private @generate_task_graph()
-// STAR-SAME: sculptor.timing.critical_path_ns = 9.920000e+02 : f64
+// STAR-SAME: sculptor.timing.critical_path_ns = 3.984000e+03 : f64
 // STAR-SAME: sculptor.timing.execution_depth = 1 : i64
 // STAR-SAME: sculptor.timing.task_count = 1 : i64
-// STAR: sculptor.timing.digital_ops = 7936 : i64
-// STAR-SAME: sculptor.timing.intrinsic_latency_ns = 9.920000e+02 : f64
+// STAR: sculptor.timing.intrinsic_latency_ns = 3.984000e+03 : f64
+// STAR-SAME: sculptor.workload.digital_ops = 7936 : i64
 
 // TREE-LABEL: func.func private @generate_task_graph()
-// TREE-SAME: sculptor.timing.critical_path_ns = 3.200000e+02 : f64
+// TREE-SAME: sculptor.timing.critical_path_ns = 3.912000e+03 : f64
 // TREE-SAME: sculptor.timing.execution_depth = 2 : i64
 // TREE-SAME: sculptor.timing.task_count = 5 : i64
 // TREE: task_name = "wide.level1.root"
-// TREE-SAME: sculptor.timing.critical_path_remaining_ns = 9.600000e+01 : f64
-// TREE-SAME: sculptor.timing.digital_ops = 768 : i64
-// TREE-SAME: sculptor.timing.intrinsic_latency_ns = 9.600000e+01 : f64
+// TREE-SAME: sculptor.timing.critical_path_remaining_ns = 1.439000e+03 : f64
+// TREE-SAME: sculptor.timing.intrinsic_latency_ns = 1.439000e+03 : f64
+// TREE-SAME: sculptor.workload.digital_ops = 768 : i64
 
 // PLACED: task_name = "wide.level0.lane0"
 // PLACED-SAME: sculptor.runtime.core_id = 0 : i64

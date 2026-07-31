@@ -6,6 +6,7 @@
 // RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-schedule-task-graph="cores=3 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=3 schedule=greedy greedy-heuristic=transfer-cost,lookahead=1,beam=3,scope=cardinal" | FileCheck %s --check-prefix=GREEDY-BEAM
 // RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=3 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=3 schedule=greedy-timing greedy-heuristic=transfer-cost,lookahead=3,beam=1,scope=cardinal" | FileCheck %s --check-prefix=TIMING-LOOKAHEAD
 // RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=3 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=3 schedule=greedy-timing greedy-heuristic=transfer-cost,lookahead=1,beam=3,scope=cardinal" | FileCheck %s --check-prefix=TIMING-BEAM
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=2 arrays-per-core=2 topology=mesh mesh-rows=1 mesh-cols=2 schedule=greedy-timing greedy-heuristic=transfer-cost,lookahead=1,beam=8,scope=cardinal" | FileCheck %s --check-prefix=TIMING-RERANK
 // RUN: not sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-schedule-task-graph="cores=3 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=3 schedule=greedy-timing greedy-heuristic=transfer-cost" 2>&1 | FileCheck %s --check-prefix=MISSING-TIMING
 
 module {
@@ -63,13 +64,13 @@ module {
 
 // GREEDY-EXACT-LABEL: func.func private @generate_task_graph
 // GREEDY-EXACT-SAME: sculptor.schedule.graph_score = 16 : i64
-// GREEDY-EXACT-SAME: sculptor.timing.critical_path_ns = 2.070000e+02 : f64
-// GREEDY-EXACT-SAME: sculptor.timing.total_network_latency_ns = 3.000000e+00 : f64
+// GREEDY-EXACT-SAME: sculptor.timing.critical_path_ns = 2.690000e+02 : f64
+// GREEDY-EXACT-SAME: sculptor.timing.sum_edge_network_service_ns = 1.500000e+01 : f64
 
 // TIMING-EXACT-LABEL: func.func private @generate_task_graph
 // TIMING-EXACT-SAME: sculptor.schedule.graph_score = 8 : i64
-// TIMING-EXACT-SAME: sculptor.timing.critical_path_ns = 2.060000e+02 : f64
-// TIMING-EXACT-SAME: sculptor.timing.total_network_latency_ns = 2.000000e+00 : f64
+// TIMING-EXACT-SAME: sculptor.timing.critical_path_ns = 2.680000e+02 : f64
+// TIMING-EXACT-SAME: sculptor.timing.sum_edge_network_service_ns = 1.400000e+01 : f64
 
 // GREEDY-LOOKAHEAD-LABEL: func.func private @generate_task_graph
 // GREEDY-LOOKAHEAD-SAME: sculptor.schedule.graph_score = 16 : i64
@@ -89,7 +90,16 @@ module {
 // TIMING-BEAM-LABEL: func.func private @generate_task_graph
 // TIMING-BEAM-SAME: sculptor.schedule.graph_score = 8 : i64
 
-// MISSING-TIMING: expected pre-placement timing attribute 'sculptor.timing.placement_aware'
+// MISSING-TIMING: expected pre-placement timing attribute 'sculptor.timing.generation'
 // MISSING-TIMING: failed to load pre-placement scheduling timing profile
 // TIMING-BEAM-SAME: sculptor.schedule.greedy_beam_width = 3 : i64
 // TIMING-BEAM-SAME: sculptor.schedule.greedy_lookahead = 1 : i64
+
+// Three proxy-ranked complete placements survive the beam. All three are
+// replayed through the full task/core/NIC/link/RX timing model before the
+// selected exact objective is committed.
+// TIMING-RERANK-LABEL: func.func private @generate_task_graph
+// TIMING-RERANK-SAME: sculptor.schedule.predicted_makespan_ns = 2.540000e+02 : f64
+// TIMING-RERANK-SAME: sculptor.schedule.timing_rerank_candidate_count = 3 : i64
+// TIMING-RERANK-SAME: sculptor.schedule.timing_rerank_selected_proxy_rank = 0 : i64
+// TIMING-RERANK-SAME: sculptor.timing.critical_path_ns = 2.540000e+02 : f64

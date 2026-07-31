@@ -21,6 +21,17 @@ static uint64_t getDirectedEdgeKey(unsigned producer, unsigned consumer) {
 }
 
 static void computeReverseCriticalPaths(TimingAnalysis &analysis) {
+  if (analysis.placementAware) {
+    for (TaskTiming &timing : analysis.tasks) {
+      if (!timing.isCritical) {
+        timing.slackNs =
+            std::max(0.0, analysis.criticalPathNs - timing.earliestFinishNs);
+        timing.criticalPathRemainingNs = timing.intrinsicLatencyNs;
+      }
+    }
+    return;
+  }
+
   for (unsigned taskIndex : llvm::reverse(analysis.topologicalOrder)) {
     double successorPathNs = 0.0;
     for (unsigned edgeIndex : analysis.outgoingEdges[taskIndex]) {
@@ -70,9 +81,7 @@ buildIslandTiming(const task_graph::LogicalPlacementIslandGraph &islandGraph,
                    taskTiming.criticalPathRemainingNs);
       islandTiming.slackNs = std::min(islandTiming.slackNs, taskTiming.slackNs);
       islandTiming.isCritical |= taskTiming.isCritical;
-      double analogWorkNs = taskTiming.analogLoadLatencyNs +
-                            taskTiming.analogExecuteLatencyNs +
-                            taskTiming.analogStoreLatencyNs;
+      double analogWorkNs = taskTiming.analogPipelineLatencyNs;
       islandTiming.analogWorkNs += analogWorkNs;
       islandTiming.digitalWorkNs +=
           std::max(0.0, taskTiming.intrinsicLatencyNs - analogWorkNs);

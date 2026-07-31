@@ -64,10 +64,11 @@ getReportingGreedyConfig(const TaskGraphSchedulerOptions &options) {
 
 } // namespace
 
-LogicalResult appendScheduleSummary(
-    func::FuncOp taskGraphFunc, const HardwareBudget &budget,
-    const TaskGraphSchedulerOptions &options, StringRef scheduleName,
-    StringRef outputPath) {
+LogicalResult appendScheduleSummary(func::FuncOp taskGraphFunc,
+                                    const HardwareBudget &budget,
+                                    const TaskGraphSchedulerOptions &options,
+                                    StringRef scheduleName,
+                                    StringRef outputPath) {
   if (outputPath.empty())
     return success();
 
@@ -114,8 +115,7 @@ LogicalResult appendScheduleSummary(
     auto bestScore = getIntegerSummaryAttr(
         taskGraphFunc, schedule_attrs::kAnnealingBestScoreAttrName);
     auto uphillAcceptanceRate = getFloatSummaryAttr(
-        taskGraphFunc,
-        schedule_attrs::kAnnealingUphillAcceptanceRateAttrName);
+        taskGraphFunc, schedule_attrs::kAnnealingUphillAcceptanceRateAttrName);
     auto searchSeconds = getFloatSummaryAttr(
         taskGraphFunc, schedule_attrs::kAnnealingSearchSecondsAttrName);
     annealingStopReason = taskGraphFunc->getAttrOfType<StringAttr>(
@@ -136,24 +136,51 @@ LogicalResult appendScheduleSummary(
   }
 
   StringRef placementCostMode = "n/a";
+  double searchCompletionTimeProxy = 0.0;
+  double searchCommunicationProxy = 0.0;
+  double searchResourceLoadProxy = 0.0;
   double predictedMakespanNs = 0.0;
-  double criticalCommunicationNs = 0.0;
-  double maximumResourceWorkNs = 0.0;
+  double predictedExposedContentionNs = 0.0;
+  double predictedExposedTransportNs = 0.0;
+  int64_t predictedTotalWordHops = 0;
+  int64_t timingRerankCandidateCount = 0;
+  int64_t timingRerankSelectedProxyRank = 0;
   if (auto mode = taskGraphFunc->getAttrOfType<StringAttr>(
           schedule_attrs::kPlacementCostModeAttrName)) {
-    auto predictedMakespan = getFloatSummaryAttr(
+    auto completionTimeProxy = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kSearchCompletionTimeProxyAttrName);
+    auto communicationProxy = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kSearchCommunicationProxyAttrName);
+    auto resourceLoadProxy = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kSearchResourceLoadProxyAttrName);
+    auto makespan = getFloatSummaryAttr(
         taskGraphFunc, schedule_attrs::kPredictedMakespanNsAttrName);
-    auto criticalCommunication = getFloatSummaryAttr(
-        taskGraphFunc, schedule_attrs::kCriticalCommunicationNsAttrName);
-    auto maximumResourceWork = getFloatSummaryAttr(
-        taskGraphFunc, schedule_attrs::kMaximumResourceWorkNsAttrName);
-    if (failed(predictedMakespan) || failed(criticalCommunication) ||
-        failed(maximumResourceWork))
+    auto exposedContention = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kPredictedExposedContentionNsAttrName);
+    auto exposedTransport = getFloatSummaryAttr(
+        taskGraphFunc, schedule_attrs::kPredictedExposedTransportNsAttrName);
+    auto wordHops = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kPredictedTotalWordHopsAttrName);
+    auto rerankCandidateCount = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kTimingRerankCandidateCountAttrName);
+    auto rerankSelectedProxyRank = getIntegerSummaryAttr(
+        taskGraphFunc, schedule_attrs::kTimingRerankSelectedProxyRankAttrName);
+    if (failed(completionTimeProxy) || failed(communicationProxy) ||
+        failed(resourceLoadProxy) || failed(makespan) ||
+        failed(exposedContention) || failed(exposedTransport) ||
+        failed(wordHops) || failed(rerankCandidateCount) ||
+        failed(rerankSelectedProxyRank))
       return failure();
     placementCostMode = mode.getValue();
-    predictedMakespanNs = *predictedMakespan;
-    criticalCommunicationNs = *criticalCommunication;
-    maximumResourceWorkNs = *maximumResourceWork;
+    searchCompletionTimeProxy = *completionTimeProxy;
+    searchCommunicationProxy = *communicationProxy;
+    searchResourceLoadProxy = *resourceLoadProxy;
+    predictedMakespanNs = *makespan;
+    predictedExposedContentionNs = *exposedContention;
+    predictedExposedTransportNs = *exposedTransport;
+    predictedTotalWordHops = *wordHops;
+    timingRerankCandidateCount = *rerankCandidateCount;
+    timingRerankSelectedProxyRank = *rerankSelectedProxyRank;
   }
 
   std::error_code ec;
@@ -190,8 +217,11 @@ LogicalResult appendScheduleSummary(
   }
   os << ',';
   writeCsvString(os, placementCostMode);
-  os << ',' << predictedMakespanNs << ',' << criticalCommunicationNs << ','
-     << maximumResourceWorkNs;
+  os << ',' << searchCompletionTimeProxy << ',' << searchCommunicationProxy
+     << ',' << searchResourceLoadProxy << ',' << predictedMakespanNs << ','
+     << predictedExposedContentionNs << ',' << predictedExposedTransportNs
+     << ',' << predictedTotalWordHops << ',' << timingRerankCandidateCount
+     << ',' << timingRerankSelectedProxyRank;
   os << '\n';
   return success();
 }

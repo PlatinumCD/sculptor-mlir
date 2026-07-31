@@ -1,5 +1,5 @@
 // RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph="patterns=streaming-convolution require-change=true" --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing | FileCheck %s --check-prefix=STREAM --implicit-check-not="tensor<9x9xf32>" --implicit-check-not="task_kind = \"digital.conv_patch\"" --implicit-check-not="task_kind = \"sculptor.conv_tile_mvm\"" --implicit-check-not="task_kind = \"digital.tile_recombine\"" --implicit-check-not="task_kind = \"digital.bias_add\""
-// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --check-prefix=SHIM --implicit-check-not="!sculptor.logical.array" --implicit-check-not="sculptor.array." --implicit-check-not=memref<1x1x1xf32>
+// RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing --sculptor-lower-golem-to-llvm-shims --sculptor-finalize-task-graph-resources | FileCheck %s --check-prefix=SHIM --implicit-check-not="!sculptor.logical.array" --implicit-check-not="sculptor.array." --implicit-check-not="memref<1x1x1xf32>"
 // RUN: sculptor-mlir-opt %s --sculptor-convert-layers --sculptor-expand-mvm-to-golem="array-rows=4 array-cols=4" --sculptor-materialize-tasks --sculptor-assemble-task-graph --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=3 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-optimize-task-graph --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing --sculptor-lower-golem-to-llvm-shims --sculptor-partition-task-graph-by-core --sculptor-extract-core-module="core-id=0" --sculptor-finalize-task-graph-resources -o %t.core.mlir
 // RUN: sculptor-mlir-opt %t.core.mlir --canonicalize --cse --empty-tensor-to-alloc-tensor --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" --buffer-deallocation-pipeline --convert-bufferization-to-memref --optimize-allocation-liveness -o %t.deallocated.mlir
 // RUN: sculptor-mlir-opt %t.deallocated.mlir | FileCheck %s --check-prefix=DEALLOC
@@ -35,11 +35,18 @@ module {
 // STREAM-SAME: deps[{{[^]]+}}]
 // STREAM-SAME: sculptor.runtime.analog_execution_counts = [9, 9, 9]
 // STREAM-SAME: sculptor.runtime.analog_load_bytes = 432 : i64
+// STREAM-SAME: sculptor.runtime.analog_load_bytes_per_array = [144, 144, 144]
 // STREAM-SAME: sculptor.runtime.analog_store_bytes = 432 : i64
+// STREAM-SAME: sculptor.runtime.analog_store_bytes_per_array = [144, 144, 144]
 // STREAM-SAME: sculptor.runtime.array_bindings = [{input_index = 1 : i64, local_array_id = 0 : i64, physical_array_id = 0 : i64}, {input_index = 2 : i64, local_array_id = 1 : i64, physical_array_id = 1 : i64}, {input_index = 3 : i64, local_array_id = 2 : i64, physical_array_id = 2 : i64}]
-// STREAM-SAME: sculptor.timing.analog_execute_latency_ns = 9.000000e+02 : f64
+// The aggregate phase counters expose all 27 executions, while the 936 ns
+// pipeline span models the three independent arrays overlapping. A serial sum
+// of the phase totals would be 2728 ns.
+// STREAM-SAME: sculptor.timing.analog_execute_latency_ns = 2.700000e+03 : f64
 // STREAM-SAME: sculptor.timing.analog_load_latency_ns = 1.400000e+01 : f64
+// STREAM-SAME: sculptor.timing.analog_pipeline_latency_ns = 9.360000e+02 : f64
 // STREAM-SAME: sculptor.timing.analog_store_latency_ns = 1.400000e+01 : f64
+// STREAM-SAME: sculptor.timing.intrinsic_latency_ns = 1.647000e+03 : f64
 // STREAM-LABEL: func.func private @task_conv2d_bias_streaming_conv_mvm(
 // STREAM: sculptor.array.load
 // STREAM-SAME: sculptor.runtime.local_array_id = 0 : i64

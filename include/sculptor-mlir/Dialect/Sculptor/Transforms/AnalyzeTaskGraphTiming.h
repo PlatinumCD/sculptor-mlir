@@ -54,6 +54,21 @@ struct AnalyzeTaskGraphTimingPass
       llvm::cl::desc("Maximum digital vector throughput in bits per cycle"),
       llvm::cl::init(256)};
 
+  Option<int64_t> fixedRuntimeDispatchCycles{
+      *this, "fixed-runtime-dispatch-cycles",
+      llvm::cl::desc("Fixed runtime task dispatch and bookkeeping cycles"),
+      llvm::cl::init(8)};
+
+  Option<int64_t> fixedTaskEntryCycles{
+      *this, "fixed-task-entry-cycles",
+      llvm::cl::desc("Fixed task adapter entry overhead in cycles"),
+      llvm::cl::init(4)};
+
+  Option<int64_t> fixedTaskExitCycles{
+      *this, "fixed-task-exit-cycles",
+      llvm::cl::desc("Fixed task adapter exit overhead in cycles"),
+      llvm::cl::init(4)};
+
   Option<int64_t> networkLinkBitsPerCycle{
       *this, "network-link-bits-per-cycle",
       llvm::cl::desc("Network link bandwidth in bits per cycle"),
@@ -68,6 +83,48 @@ struct AnalyzeTaskGraphTimingPass
       *this, "network-pipelined",
       llvm::cl::desc("Whether communication across network hops is pipelined"),
       llvm::cl::init(true)};
+
+  Option<int64_t> networkLinkWordBits{
+      *this, "network-link-word-bits",
+      llvm::cl::desc("Width of one routed network word in bits"),
+      llvm::cl::init(32)};
+
+  Option<int64_t> protocolWordsPerRoute{
+      *this, "protocol-words-per-route",
+      llvm::cl::desc("Protocol overhead words carried by every logical route"),
+      llvm::cl::init(5)};
+
+  Option<int64_t> nicInjectionWordsPerCycle{
+      *this, "nic-injection-words-per-cycle",
+      llvm::cl::desc("Source NIC injection throughput in words per cycle"),
+      llvm::cl::init(1)};
+
+  Option<int64_t> rxDmaWordsPerCycle{
+      *this, "rx-dma-words-per-cycle",
+      llvm::cl::desc("Receive DMA throughput in words per cycle"),
+      llvm::cl::init(1)};
+
+  Option<std::string> timingBoundary{
+      *this, "timing-boundary", llvm::cl::desc("Timing boundary: warm or cold"),
+      llvm::cl::init("warm")};
+
+  Option<std::string> runtimeTaskPolicy{
+      *this, "runtime-task-policy",
+      llvm::cl::desc("Ready-task selection policy"),
+      llvm::cl::init("lowest-local-task-index")};
+
+  Option<std::string> runtimeTransmitPolicy{
+      *this, "runtime-transmit-policy",
+      llvm::cl::desc("Runtime task/transmit policy (overlap-ready-tasks only)"),
+      llvm::cl::init("overlap-ready-tasks")};
+
+  Option<std::string> memoryBackend{
+      *this, "memory-backend", llvm::cl::desc("Local-memory timing backend"),
+      llvm::cl::init("native-untimed")};
+
+  Option<std::string> routingPolicy{*this, "routing-policy",
+                                    llvm::cl::desc("Network routing policy"),
+                                    llvm::cl::init("xy")};
 
   AnalyzeTaskGraphTimingPass() = default;
 
@@ -105,6 +162,19 @@ struct AnalyzeTaskGraphTimingPass
             llvm::cl::desc(
                 "Maximum digital vector throughput in bits per cycle"),
             llvm::cl::init(256)),
+        fixedRuntimeDispatchCycles(
+            *this, "fixed-runtime-dispatch-cycles",
+            llvm::cl::desc(
+                "Fixed runtime task dispatch and bookkeeping cycles"),
+            llvm::cl::init(8)),
+        fixedTaskEntryCycles(
+            *this, "fixed-task-entry-cycles",
+            llvm::cl::desc("Fixed task adapter entry overhead in cycles"),
+            llvm::cl::init(4)),
+        fixedTaskExitCycles(
+            *this, "fixed-task-exit-cycles",
+            llvm::cl::desc("Fixed task adapter exit overhead in cycles"),
+            llvm::cl::init(4)),
         networkLinkBitsPerCycle(
             *this, "network-link-bits-per-cycle",
             llvm::cl::desc("Network link bandwidth in bits per cycle"),
@@ -117,7 +187,41 @@ struct AnalyzeTaskGraphTimingPass
             *this, "network-pipelined",
             llvm::cl::desc(
                 "Whether communication across network hops is pipelined"),
-            llvm::cl::init(true)) {
+            llvm::cl::init(true)),
+        networkLinkWordBits(
+            *this, "network-link-word-bits",
+            llvm::cl::desc("Width of one routed network word in bits"),
+            llvm::cl::init(32)),
+        protocolWordsPerRoute(
+            *this, "protocol-words-per-route",
+            llvm::cl::desc(
+                "Protocol overhead words carried by every logical route"),
+            llvm::cl::init(5)),
+        nicInjectionWordsPerCycle(
+            *this, "nic-injection-words-per-cycle",
+            llvm::cl::desc(
+                "Source NIC injection throughput in words per cycle"),
+            llvm::cl::init(1)),
+        rxDmaWordsPerCycle(
+            *this, "rx-dma-words-per-cycle",
+            llvm::cl::desc("Receive DMA throughput in words per cycle"),
+            llvm::cl::init(1)),
+        timingBoundary(*this, "timing-boundary",
+                       llvm::cl::desc("Timing boundary: warm or cold"),
+                       llvm::cl::init("warm")),
+        runtimeTaskPolicy(*this, "runtime-task-policy",
+                          llvm::cl::desc("Ready-task selection policy"),
+                          llvm::cl::init("lowest-local-task-index")),
+        runtimeTransmitPolicy(
+            *this, "runtime-transmit-policy",
+            llvm::cl::desc("Runtime task/transmit overlap policy"),
+            llvm::cl::init("overlap-ready-tasks")),
+        memoryBackend(*this, "memory-backend",
+                      llvm::cl::desc("Local-memory timing backend"),
+                      llvm::cl::init("native-untimed")),
+        routingPolicy(*this, "routing-policy",
+                      llvm::cl::desc("Network routing policy"),
+                      llvm::cl::init("xy")) {
     mvmCostMode = pass.mvmCostMode;
     analogMVMLatencyNs = pass.analogMVMLatencyNs;
     analogIOBitsPerCycle = pass.analogIOBitsPerCycle;
@@ -125,9 +229,21 @@ struct AnalyzeTaskGraphTimingPass
     digitalClockGHz = pass.digitalClockGHz;
     digitalIssueWidth = pass.digitalIssueWidth;
     digitalVectorBitsPerCycle = pass.digitalVectorBitsPerCycle;
+    fixedRuntimeDispatchCycles = pass.fixedRuntimeDispatchCycles;
+    fixedTaskEntryCycles = pass.fixedTaskEntryCycles;
+    fixedTaskExitCycles = pass.fixedTaskExitCycles;
     networkLinkBitsPerCycle = pass.networkLinkBitsPerCycle;
     networkHopLatencyCycles = pass.networkHopLatencyCycles;
     networkPipelined = pass.networkPipelined;
+    networkLinkWordBits = pass.networkLinkWordBits;
+    protocolWordsPerRoute = pass.protocolWordsPerRoute;
+    nicInjectionWordsPerCycle = pass.nicInjectionWordsPerCycle;
+    rxDmaWordsPerCycle = pass.rxDmaWordsPerCycle;
+    timingBoundary = pass.timingBoundary;
+    runtimeTaskPolicy = pass.runtimeTaskPolicy;
+    runtimeTransmitPolicy = pass.runtimeTransmitPolicy;
+    memoryBackend = pass.memoryBackend;
+    routingPolicy = pass.routingPolicy;
   }
 
   StringRef getArgument() const final {

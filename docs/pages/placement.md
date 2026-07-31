@@ -15,7 +15,7 @@ The selected strategy is controlled by the `schedule` option on
 | `random` | Baseline randomized physical-array order with shared island materialization and digital placement. |
 | `snake` | Deterministic mesh traversal that fills local arrays before moving to the next core, with shared island materialization and digital placement. |
 | `greedy` | Island-level lookahead search over configurable candidate core scopes. |
-| `greedy-timing` | Timing-prioritized Greedy search that minimizes predicted completion time before communication pressure, resource load, and legacy placement cost. |
+| `greedy-timing` | Timing-prioritized Greedy search that ranks partial placements with completion, communication, and resource-load proxies. |
 | `annealing` | Simulated annealing over physical-array orders with configurable initial schedules and perturbation move sets. |
 
 
@@ -89,8 +89,8 @@ costed. It changes timing estimates only; task identity, dependencies, logical
 arrays, islands, and the feasible placement space remain unchanged. The
 default is `analog`.
 
-An analog compute task is modeled as three sequential phases on its logical
-array:
+An ordinary single-array analog compute task is modeled as three sequential
+phases on that array:
 
 ```text
 load -> execute -> store
@@ -101,20 +101,23 @@ store_ns   = ceil(output_bits / analog_io_bits_per_cycle) / digital_clock_ghz
 latency_ns = load_ns + execute_ns + store_ns
 ```
 
-In digital cost mode, the same static MVM is estimated as a digital
-replacement:
+In digital cost mode, the same static MVM receives a checked replacement
+workload:
 
 ```text
 digital_replacement_ops = 2 * M * N * K
 effective_digital_ops   = digital_ops + digital_replacement_ops
-ops_per_cycle           = max(digital_issue_width,
-                              digital_vector_bits_per_cycle / 32)
-latency_cycles          = ceil(effective_digital_ops / ops_per_cycle)
 ```
 
-Its analog load, execute, and store phase latencies are zero in this mode.
-Existing non-MVM digital tasks retain the same cost in both modes. The
-replacement count uses the same checked static-geometry utility as
+The versioned `golem-qemu-v1` task-cost analysis combines that workload with
+the final task function's dynamic scalar, vector, load, store, control,
+descriptor, loop, and tensor-copy estimates. Runtime dispatch, task entry, and
+task exit are separate cycle terms. The model does not divide every operation
+by vector width. Its analog load, execute, and store phase latencies are zero
+in digital mode. Existing non-MVM digital tasks retain the same semantic
+workload in both modes.
+
+The replacement count uses the same checked static-geometry utility as
 `sculptor-lower-scheduled-mvm-to-digital`, including physical padded tile
 dimensions. Missing geometry, dynamic shapes, or arithmetic overflow are
 diagnosed rather than silently estimated. A mixed streaming-convolution task
@@ -125,11 +128,12 @@ This comparison is warm execution: matrix setup work does not contribute
 placement-critical programming latency, and setup tasks and logical-array
 resources remain in the shared graph.
 
-The pass attaches all three phase durations to the task. It does not introduce
-dependencies between different logical arrays, so independent arrays can have
-overlapping load, execute, or store phases. Serialization of repeated work on
-one physical array and shared I/O contention depend on the eventual placement
-and are therefore deferred to placement-aware timing evaluation.
+The pass attaches aggregate phase service and the effective pipeline span.
+For a multi-array streaming convolution, per-array execution counts and
+load/store bytes drive a deterministic phase schedule. Each array preserves
+`load -> execute -> store`; independent arrays can execute concurrently, and
+the configured shared analog-I/O channel serializes their load/store service.
+Cross-patch pipelining is intentionally absent in the current model.
 
 The first invocation produces a placement-independent critical-path lower
 bound. Exact mesh hops and network contention are absent because the physical
@@ -141,28 +145,53 @@ For a timing-aware schedule, the selected mode survives as
 separate from ephemeral `sculptor.timing.*` attributes, so later execution
 lowering, fusion, partitioning, and core extraction do not erase which model
 selected the placement. The scheduler summary CSV appends the placement mode
-and the predicted makespan, critical-communication, and maximum-resource-work
-objectives. GraphML and simulation-model JSON exports include the placement
-mode and digital replacement counts.
+and the completion-time, communication, and resource-load search proxies.
+These values rank partial placements and are not predicted elapsed time.
+GraphML and simulation-model JSON exports include the placement mode and
+digital replacement counts.
 
-After placement, the pipeline invokes the timing pass again. Data transfers use
-deterministic XY routing over directed mesh links. A transfer is divided into
-`network_link_bits_per_cycle` flits, incurs
-`network_hop_latency_cycles` forwarding latency per hop, and reserves every
-directed link on its route. A transfer that reaches a busy link waits until the
-link becomes available, so competing routes delay downstream consumers. With
-pipelining enabled, an uncontended transfer takes:
+After placement, the pipeline invokes the timing pass again. It runs a
+deterministic event replay with one CPU execution resource per active core.
+Ready tasks are selected in local runtime-index order and task bodies on one
+core cannot overlap. A completed producer may inject a route while later CPU
+work executes.
+
+Data transfers use one source-NIC injection resource per core, deterministic
+XY routing over independent directed mesh links, and one receive-DMA resource
+per destination core. Every logical route includes payload words plus the
+configured protocol words. Busy resources create queue intervals with explicit
+NIC, link, and receive causes. Consumer input readiness occurs only after
+receive completion.
+
+For a route:
 
 ```text
-flits = ceil(resource_bits / network_link_bits_per_cycle)
-latency_cycles = flits + hops * network_hop_latency_cycles - 1
+payload_words = ceil(resource_bits / network_link_word_bits)
+route_words   = payload_words + protocol_words_per_route
 ```
 
-The placement-aware result records each execution edge's source and destination
-core, mesh hops, transfer window, latency, and contention delay. Control-only
-dependencies remain zero-byte, zero-latency ordering edges. This model does not
-yet serialize processor execution, physical-array reuse, shared analog I/O, or
-network backpressure beyond directed-link availability.
+Source injection, directed-link occupancy, per-hop latency, and receive-DMA
+service use their respective configured rates. Pipelined and store-and-forward
+multi-hop traversal are both supported.
+
+The placement-aware result records source and destination cores, mesh hops,
+payload and protocol words, every transfer phase, and each queue component.
+It also replays the fixed placement with contention disabled and with transport
+disabled:
+
+```text
+exposed_contention = full - no_contention
+exposed_transport  = no_contention - zero_network
+```
+
+Aggregate route service and aggregate queue delay remain pressure totals and
+must not be interpreted as elapsed-runtime shares.
+
+The first corrected network model uses interval reservations with effectively
+sufficient buffering. It does not model finite router credits, head-of-line
+blocking, cache/DRAM timing, or output-buffer ownership hazards. Cross-core
+control-only dependencies remain zero-byte timing edges; deployment
+partitioning rejects them unless a routed tensor edge supplies readiness.
 
 Placement cost and execution backend can therefore be swept independently:
 
@@ -240,7 +269,7 @@ The placement pass receives a hardware budget through pass parameters.
 | `network-pipelined` | Selects pipelined or store-and-forward traversal across a multi-hop route. The default is `true`. |
 | `schedule` | Name of a registered placement strategy. |
 | `random-seed` | Seed used by randomized schedulers. The default is `0` for reproducible output. |
-| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` and `greedy-timing` schedulers. Terms are comma-separated, such as `transfer-cost,link-pressure,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, `compact-region`, and `link-pressure`; supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. For `greedy-timing`, scoring terms are the final tie-breaker after timing objectives. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
+| `greedy-heuristic` | Candidate scoring and search terms used by the `greedy` and `greedy-timing` schedulers. Terms are comma-separated, such as `transfer-cost,spatial-link-pressure,lookahead=3,beam=8,scope=diagonal`. Supported scoring terms are `transfer-cost`, `boundary-regret`, `compact-region`, and `spatial-link-pressure`; `link-pressure` remains a compatibility alias. Supported search terms are `lookahead=N`, `beam=N`, and `scope=NAME`. For `greedy-timing`, scoring terms are the final tie-breaker after timing proxies. The default is `transfer-cost`, with `lookahead=1`, `beam=1`, and `scope=diagonal`. |
 | `annealing-initial-schedule` | Initial placement schedule used by the `annealing` scheduler: `identity`, `random`, `snake`, or `greedy`. The default is `snake`. The `greedy` initializer uses the configured `greedy-heuristic` terms. |
 | `annealing-move-set` | Comma-separated perturbation moves used by the `annealing` scheduler. Supported presets are `basic`, `basic-wide`, and `all`; individual moves are `move-one-position`, `move-one-relocation`, `swap-two-positions`, `adjacent-swap`, `segment-reverse`, `segment-relocation`, and `block-swap`. The default is `basic`. |
 | `annealing-move-radius` | Maximum physical-array-order index distance for single-position annealing moves. `0` means unbounded/global. The default is `0`. |
@@ -254,7 +283,7 @@ The placement pass receives a hardware budget through pass parameters.
 | `annealing-plateau-acceptance-rate` | Maximum fraction of worse proposals accepted in the last epoch for a stagnant search to be considered plateaued. The default is `0.01` (1%). |
 | `annealing-maximum-evaluations` | Hard candidate-evaluation limit, or `0` to disable it. The default is `100000`. |
 | `annealing-maximum-runtime-seconds` | Internal wall-clock limit, or `0` to disable it. The default is `420` seconds. |
-| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. Rows also record placement cost mode and timing-aware objective values when available. Annealing rows include their stop reason, epoch and evaluation counts, initial and best scores, final uphill acceptance rate, and search time. |
+| `summary-output` | Optional CSV path where the scheduler appends compact score and transfer metadata for each scheduled task graph. Rows also record placement cost mode, timing-aware objective values, exact-rerank candidate count, and the selected candidate's proxy rank when available. Annealing rows include their stop reason, epoch and evaluation counts, initial and best scores, final uphill acceptance rate, and search time. |
 
 `reduction-width` belongs to `sculptor-balance-task-graph-reductions`, not to
 the scheduling pass. It controls reduction parallelism and therefore the size
@@ -477,15 +506,15 @@ dimensional regions when transfer-cost candidates are equal or near-equal. It is
 intended to be composed with the transfer baseline, for example
 `greedy-heuristic=transfer-cost,compact-region,lookahead=3,beam=8`.
 
-The `link-pressure` greedy heuristic is a placement-time proxy for network
-contention. It routes every data edge whose endpoint islands are already
+The `spatial-link-pressure` greedy heuristic is an order-independent placement
+proxy for shared directed-link use. It routes every data edge whose endpoint islands are already
 placed using the same directed XY routes as the timing model. For each directed
 link, it adds a normalized pairwise penalty when multiple byte-heavy routes
 share that link. Opposite link directions are independent. The term is
 order-independent and does not claim that the transfers overlap in time; exact
 time-window contention remains part of placement-aware timing analysis. It can
 be composed as
-`greedy-heuristic=transfer-cost,link-pressure,boundary-regret,lookahead=3`.
+`greedy-heuristic=transfer-cost,spatial-link-pressure,boundary-regret,lookahead=3`.
 
 Boundary-aware greedy heuristics also run a terminal repair step after the
 initial island placement is selected. If the first and last task islands do not
@@ -536,18 +565,17 @@ cost of every additional hop, preserving pipelined and non-pipelined network
 behavior without passing the hardware timing model into the scheduler.
 Candidates are compared lexicographically by:
 
-1. predicted placement makespan;
-2. communication latency exposed beyond endpoint slack, weighted by edge
+1. completion-time proxy for the partially materialized placement;
+2. communication proxy derived from latency beyond endpoint slack, weighted by edge
    criticality and consumer timing pressure;
-3. maximum accumulated analog-array or digital-core work; and
+3. resource-load proxy from accumulated analog-array or digital-core work; and
 4. the configured legacy Greedy heuristic score.
 
 This keeps quantities with different units out of one arbitrary weighted sum.
 The existing byte-hop graph score is still emitted after placement so timing
 and locality results remain directly comparable. Exact routed-link contention
-is evaluated by the placement-aware timing pass after scheduling; the Greedy
-search currently uses a contention-free incremental estimate while exploring
-candidates.
+is evaluated by the placement-aware timing pass after scheduling. None of the
+partial-placement proxy values is labeled as predicted runtime.
 
 </details>
 

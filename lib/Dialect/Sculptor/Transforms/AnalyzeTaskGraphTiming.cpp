@@ -8,6 +8,10 @@
 
 #include "mlir/Pass/PassRegistry.h"
 
+#ifndef SCULPTOR_COMPILER_REVISION
+#define SCULPTOR_COMPILER_REVISION "unknown"
+#endif
+
 namespace {
 
 bool returnsTaskGraph(mlir::func::FuncOp func) {
@@ -32,15 +36,28 @@ void AnalyzeTaskGraphTimingPass::runOnOperation() {
   }
 
   task_timing::TimingModel model;
+  model.compilerRevision = SCULPTOR_COMPILER_REVISION;
+  model.timingBoundary = timingBoundary;
+  model.runtimeTaskPolicy = runtimeTaskPolicy;
+  model.runtimeTransmitPolicy = runtimeTransmitPolicy;
+  model.memoryBackend = memoryBackend;
   model.analogMVMLatencyNs = analogMVMLatencyNs;
   model.analogIOBitsPerCycle = analogIOBitsPerCycle;
   model.analogIOShared = analogIOShared;
   model.digitalClockGHz = digitalClockGHz;
   model.digitalIssueWidth = digitalIssueWidth;
   model.digitalVectorBitsPerCycle = digitalVectorBitsPerCycle;
+  model.fixedRuntimeDispatchCycles = fixedRuntimeDispatchCycles;
+  model.fixedTaskEntryCycles = fixedTaskEntryCycles;
+  model.fixedTaskExitCycles = fixedTaskExitCycles;
   model.networkLinkBitsPerCycle = networkLinkBitsPerCycle;
   model.networkHopLatencyCycles = networkHopLatencyCycles;
   model.networkPipelined = networkPipelined;
+  model.networkLinkWordBits = networkLinkWordBits;
+  model.protocolWordsPerRoute = protocolWordsPerRoute;
+  model.nicInjectionWordsPerCycle = nicInjectionWordsPerCycle;
+  model.rxDmaWordsPerCycle = rxDmaWordsPerCycle;
+  model.routingPolicy = routingPolicy;
 
   if (failed(task_timing::validateTimingModel(getOperation(), model))) {
     signalPassFailure();

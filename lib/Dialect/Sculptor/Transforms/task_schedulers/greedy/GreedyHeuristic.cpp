@@ -226,7 +226,7 @@ static int64_t getAverageDataEdgeBytes(
   return edgeCount == 0 ? 1 : std::max<int64_t>(1, totalBytes / edgeCount);
 }
 
-static int64_t getLinkPressurePenalty(
+static int64_t getSpatialSharedLinkPressurePenalty(
     const mlir::sculptor::task_schedulers::GreedyHeuristicContext &context) {
   llvm::DenseMap<uint64_t, int64_t> bytesByDirectedLink;
   long double pressure = 0.0L;
@@ -235,10 +235,8 @@ static int64_t getLinkPressurePenalty(
   for (const auto &edge : context.islandExecutionEdges) {
     if (!edge.dataDependency || edge.transferredBytes <= 0)
       continue;
-    auto producerCore =
-        context.coreByPlacedIsland.find(edge.producerIsland);
-    auto consumerCore =
-        context.coreByPlacedIsland.find(edge.consumerIsland);
+    auto producerCore = context.coreByPlacedIsland.find(edge.producerIsland);
+    auto consumerCore = context.coreByPlacedIsland.find(edge.consumerIsland);
     if (producerCore == context.coreByPlacedIsland.end() ||
         consumerCore == context.coreByPlacedIsland.end() ||
         producerCore->second == consumerCore->second)
@@ -288,11 +286,12 @@ int64_t CompactRegionGreedyHeuristic::evaluate(
                        getCompactRegionPenalty(context, transferScore));
 }
 
-int64_t LinkPressureGreedyHeuristic::evaluate(
+int64_t SpatialSharedLinkPressureGreedyHeuristic::evaluate(
     const GreedyHeuristicContext &context) const {
   TransferCostGreedyHeuristic transferCost;
   int64_t transferScore = transferCost.evaluate(context);
-  return saturatingAdd(transferScore, getLinkPressurePenalty(context));
+  return saturatingAdd(transferScore,
+                       getSpatialSharedLinkPressurePenalty(context));
 }
 
 int64_t CompositeGreedyHeuristic::evaluate(
@@ -310,8 +309,8 @@ int64_t CompositeGreedyHeuristic::evaluate(
     score =
         saturatingAdd(score, getCompactRegionPenalty(context, transferScore));
 
-  if (linkPressure)
-    score = saturatingAdd(score, getLinkPressurePenalty(context));
+  if (spatialSharedLinkPressure)
+    score = saturatingAdd(score, getSpatialSharedLinkPressurePenalty(context));
 
   return score;
 }

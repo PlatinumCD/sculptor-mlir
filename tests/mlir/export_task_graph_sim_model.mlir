@@ -40,17 +40,17 @@ module {
     sculptor.timing.critical_path_ns = 1.020000e+02 : f64,
     sculptor.timing.execution_depth = 3 : i64,
     sculptor.timing.execution_edge_count = 3 : i64,
-    sculptor.timing.model = #sculptor.timing_model<analogMVMLatencyNs = 100 : i64, analogIOBitsPerCycle = 256 : i64, analogIOShared = true, digitalClockGHz = 1.000000e+00 : f64, digitalIssueWidth = 2 : i64, digitalVectorBitsPerCycle = 256 : i64, networkLinkBitsPerCycle = 32 : i64, networkHopLatencyCycles = 1 : i64, networkPipelined = true>,
+    sculptor.timing.model = #sculptor.timing_model<costModel = "golem-qemu-v1", costModelRevision = 1 : i64, compilerRevision = "test", timingBoundary = "warm", runtimeTaskPolicy = "lowest-local-task-index", runtimeTransmitPolicy = "overlap-ready-tasks", memoryBackend = "native-untimed", analogMVMLatencyNs = 100 : i64, analogIOBitsPerCycle = 256 : i64, analogIOShared = true, digitalClockGHz = 1.000000e+00 : f64, digitalIssueWidth = 2 : i64, digitalVectorBitsPerCycle = 256 : i64, fixedRuntimeDispatchCycles = 8 : i64, fixedTaskEntryCycles = 4 : i64, fixedTaskExitCycles = 4 : i64, networkLinkBitsPerCycle = 32 : i64, networkHopLatencyCycles = 1 : i64, networkPipelined = true, networkLinkWordBits = 32 : i64, protocolWordsPerRoute = 5 : i64, nicInjectionWordsPerCycle = 1 : i64, rxDmaWordsPerCycle = 1 : i64, routingPolicy = "xy">,
     sculptor.timing.network_edges = [
-      #sculptor.network_edge_timing<producerTask = 0 : i64, consumerTask = 2 : i64, sourceCore = 0 : i64, destinationCore = 0 : i64, meshHops = 0 : i64, transferStartNs = 0.000000e+00 : f64, transferFinishNs = 0.000000e+00 : f64, networkLatencyNs = 0.000000e+00 : f64, contentionDelayNs = 0.000000e+00 : f64>,
-      #sculptor.network_edge_timing<producerTask = 1 : i64, consumerTask = 2 : i64, sourceCore = 1 : i64, destinationCore = 0 : i64, meshHops = 1 : i64, transferStartNs = 0.000000e+00 : f64, transferFinishNs = 2.000000e+00 : f64, networkLatencyNs = 2.000000e+00 : f64, contentionDelayNs = 0.000000e+00 : f64>,
-      #sculptor.network_edge_timing<producerTask = 2 : i64, consumerTask = 3 : i64, sourceCore = 0 : i64, destinationCore = 1 : i64, meshHops = 1 : i64, transferStartNs = 1.020000e+02 : f64, transferFinishNs = 1.050000e+02 : f64, networkLatencyNs = 3.000000e+00 : f64, contentionDelayNs = 1.000000e+00 : f64>
+      #sculptor.network_edge_timing<producerTask = 0 : i64, consumerTask = 2 : i64, sourceCore = 0 : i64, destinationCore = 0 : i64, meshHops = 0 : i64, payloadWords = 0 : i64, protocolWords = 0 : i64, transferStartNs = 0.000000e+00 : f64, injectionStartNs = 0.000000e+00 : f64, injectionFinishNs = 0.000000e+00 : f64, routeArrivalNs = 0.000000e+00 : f64, receiveStartNs = 0.000000e+00 : f64, receiveCompleteNs = 0.000000e+00 : f64, transferFinishNs = 0.000000e+00 : f64, networkLatencyNs = 0.000000e+00 : f64, contentionDelayNs = 0.000000e+00 : f64, nicQueueDelayNs = 0.000000e+00 : f64, linkQueueDelayNs = 0.000000e+00 : f64, receiveQueueDelayNs = 0.000000e+00 : f64, causalParentTask = 0 : i64, causalParentEdge = -1 : i64, causalResource = "same-core">,
+      #sculptor.network_edge_timing<producerTask = 1 : i64, consumerTask = 2 : i64, sourceCore = 1 : i64, destinationCore = 0 : i64, meshHops = 1 : i64, payloadWords = 2 : i64, protocolWords = 5 : i64, transferStartNs = 0.000000e+00 : f64, injectionStartNs = 0.000000e+00 : f64, injectionFinishNs = 1.000000e+00 : f64, routeArrivalNs = 1.000000e+00 : f64, receiveStartNs = 1.000000e+00 : f64, receiveCompleteNs = 2.000000e+00 : f64, transferFinishNs = 2.000000e+00 : f64, networkLatencyNs = 2.000000e+00 : f64, contentionDelayNs = 0.000000e+00 : f64, nicQueueDelayNs = 0.000000e+00 : f64, linkQueueDelayNs = 0.000000e+00 : f64, receiveQueueDelayNs = 0.000000e+00 : f64, causalParentTask = 1 : i64, causalParentEdge = -1 : i64, causalResource = "producer">,
+      #sculptor.network_edge_timing<producerTask = 2 : i64, consumerTask = 3 : i64, sourceCore = 0 : i64, destinationCore = 1 : i64, meshHops = 1 : i64, payloadWords = 2 : i64, protocolWords = 5 : i64, transferStartNs = 1.020000e+02 : f64, injectionStartNs = 1.030000e+02 : f64, injectionFinishNs = 1.040000e+02 : f64, routeArrivalNs = 1.040000e+02 : f64, receiveStartNs = 1.040000e+02 : f64, receiveCompleteNs = 1.050000e+02 : f64, transferFinishNs = 1.050000e+02 : f64, networkLatencyNs = 3.000000e+00 : f64, contentionDelayNs = 1.000000e+00 : f64, nicQueueDelayNs = 1.000000e+00 : f64, linkQueueDelayNs = 0.000000e+00 : f64, receiveQueueDelayNs = 0.000000e+00 : f64, causalParentTask = 2 : i64, causalParentEdge = -1 : i64, causalResource = "source-nic">
     ],
     sculptor.timing.placement_aware = true,
     sculptor.timing.task_count = 4 : i64,
     sculptor.timing.total_data_bytes = 16 : i64,
-    sculptor.timing.total_network_contention_delay_ns = 1.000000e+00 : f64,
-    sculptor.timing.total_network_latency_ns = 5.000000e+00 : f64
+    sculptor.timing.sum_edge_network_queue_delay_ns = 1.000000e+00 : f64,
+    sculptor.timing.sum_edge_network_service_ns = 4.000000e+00 : f64
   } {
     %graph = sculptor.task_graph.create : !sculptor.task_graph
     %input = sculptor.task_graph.input %graph {sculptor.runtime.byte_size = 8 : i64, sculptor.runtime.slot = 0 : i64} : !sculptor.task_graph -> !sculptor.task_resource<tensor<1x2xf32>>
@@ -61,7 +61,7 @@ module {
 
     %setup = sculptor.task.create %graph, @task_matrix, domain = "analog", task_kind = "sculptor.matrix_setup", task_name = "linear_matrix_tile_0_0", source_layer = "linear_0", source_task_ordinal = 0, inputs[], outputs[%array], deps[] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 0 : i64} : (!sculptor.task_graph, !sculptor.task_resource<!sculptor.logical.array>) -> !sculptor.task
     %vector = sculptor.task.create %graph, @task_vector, domain = "digital", task_kind = "digital.vector_tile", task_name = "linear_vector_tile_0", source_layer = "linear_0", source_task_ordinal = 1, inputs[%input], outputs[%tile], deps[] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.digital_ops = 3 : i64, sculptor.runtime.task_index = 1 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>) -> !sculptor.task
-    %mvm = sculptor.task.create %graph, @task_mvm, domain = "analog", task_kind = "sculptor.mvm", task_name = "linear_mvm_0_0", source_layer = "linear_0", source_task_ordinal = 2, inputs[%tile, %array], outputs[%mvm_out], deps[%setup, %vector] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 2 : i64, sculptor.schedule.island_id = 0 : i64, sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64, sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64, sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64, sculptor.timing.critical_path_remaining_ns = 1.020000e+02 : f64, sculptor.timing.dependency_depth = 1 : i64, sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64, sculptor.timing.earliest_start_ns = 0.000000e+00 : f64, sculptor.timing.incoming_data_bytes = 8 : i64, sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64, sculptor.timing.is_critical = true, sculptor.timing.outgoing_data_bytes = 8 : i64, sculptor.timing.topological_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
+    %mvm = sculptor.task.create %graph, @task_mvm, domain = "analog", task_kind = "sculptor.mvm", task_name = "linear_mvm_0_0", source_layer = "linear_0", source_task_ordinal = 2, inputs[%tile, %array], outputs[%mvm_out], deps[%setup, %vector] {sculptor.runtime.core_id = 0 : i64, sculptor.runtime.digital_ops = 0 : i64, sculptor.runtime.physical_array_id = 0 : i64, sculptor.runtime.task_index = 2 : i64, sculptor.schedule.island_id = 0 : i64, sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64, sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64, sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64, sculptor.timing.critical_path_remaining_ns = 1.020000e+02 : f64, sculptor.timing.dependency_depth = 1 : i64, sculptor.timing.earliest_finish_ns = 1.020000e+02 : f64, sculptor.timing.earliest_start_ns = 0.000000e+00 : f64, sculptor.workload.analog_execution_count = 1 : i64, sculptor.workload.analog_load_bytes = 8 : i64, sculptor.workload.analog_store_bytes = 8 : i64, sculptor.workload.incoming_data_bytes = 8 : i64, sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64, sculptor.timing.is_critical = true, sculptor.workload.outgoing_data_bytes = 8 : i64, sculptor.timing.topological_index = 2 : i64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<!sculptor.logical.array>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task, !sculptor.task) -> !sculptor.task
     %bias = sculptor.task.create %graph, @task_bias, domain = "digital", task_kind = "digital.bias_add", task_name = "linear_bias_add", source_layer = "linear_0", source_task_ordinal = 3, inputs[%mvm_out], outputs[%output], deps[%mvm] {sculptor.runtime.core_id = 1 : i64, sculptor.runtime.digital_ops = 2 : i64, sculptor.runtime.task_index = 3 : i64, sculptor.timing.incoming_network_delay_ns = 3.000000e+00 : f64} : (!sculptor.task_graph, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task_resource<tensor<1x2xf32>>, !sculptor.task) -> !sculptor.task
 
     return %graph : !sculptor.task_graph
@@ -107,6 +107,9 @@ module {
 // CHECK: "island_id": 0
 // CHECK: "timing": {
 // CHECK: "topological_index": 2
+// CHECK: "analog_load_bytes": 8
+// CHECK: "analog_execution_count": 1
+// CHECK: "analog_store_bytes": 8
 // CHECK: "analog_load_latency_ns": 1
 // CHECK: "analog_execute_latency_ns": 100
 // CHECK: "analog_store_latency_ns": 1
@@ -159,8 +162,20 @@ module {
 // CHECK: "total_data_bytes": 16
 // CHECK: "critical_path_ns": 102
 // CHECK: "placement_aware": true
-// CHECK: "total_network_latency_ns": 5
-// CHECK: "total_network_contention_delay_ns": 1
+// CHECK: "sum_edge_network_service_ns": 4
+// CHECK: "sum_edge_network_queue_delay_ns": 1
 // CHECK: "model": {
+// CHECK: "cost_model": "golem-qemu-v1"
+// CHECK: "cost_model_revision": 1
+// CHECK: "compiler_revision": "test"
+// CHECK: "timing_boundary": "warm"
+// CHECK: "runtime_task_policy": "lowest-local-task-index"
+// CHECK: "runtime_transmit_policy": "overlap-ready-tasks"
+// CHECK: "memory_backend": "native-untimed"
 // CHECK: "analog_mvm_latency_ns": 100
 // CHECK: "analog_io_bits_per_cycle": 256
+// CHECK: "network_link_word_bits": 32
+// CHECK: "protocol_words_per_route": 5
+// CHECK: "nic_injection_words_per_cycle": 1
+// CHECK: "rx_dma_words_per_cycle": 1
+// CHECK: "routing_policy": "xy"

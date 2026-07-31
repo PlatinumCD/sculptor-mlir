@@ -1,3 +1,7 @@
+add_compile_definitions(
+  SCULPTOR_COMPILER_REVISION="${SCULPTOR_COMPILER_REVISION}"
+)
+
 add_mlir_library(MLIRSculptorTransforms
   Passes.cpp
   AnalyzeTaskGraphTiming.cpp
@@ -43,6 +47,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphDigitalOps.cpp
   task_graph/TaskGraphCleanup.cpp
   task_graph/TaskGraphResourceUtils.cpp
+  task_graph/TaskGraphRuntimeOrder.cpp
   task_schedulers/TaskGraphScorer.cpp
   task_schedulers/TaskGraphScheduleMetadata.cpp
   task_schedulers/MeshGeometry.cpp
@@ -54,6 +59,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_timing/TaskGraphTimingIRCodec.cpp
   task_timing/TaskGraphNetworkTiming.cpp
   task_timing/TaskGraphTimingProfileBuilder.cpp
+  task_timing/TaskCostAnalysis.cpp
   task_timing/TaskLatencyModel.cpp
   task_timing/TimingCostModel.cpp
   task_schedulers/greedy/GreedyHeuristic.cpp

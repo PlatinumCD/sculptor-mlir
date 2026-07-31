@@ -61,7 +61,7 @@ module {
 // RANDOM-LABEL: func.func private @generate_task_graph
 // RANDOM-SAME: sculptor.schedule.graph_score = 8 : i64
 // RANDOM-SAME: sculptor.schedule.total_transfer_cost = 8 : i64
-// RANDOM-SAME: sculptor.timing.island_edges = [#sculptor.timed_island_edge<producerIsland = 0 : i64, consumerIsland = 1 : i64, bytes = 8 : i64, estimatedTransferNsPerHop = 2.000000e+00 : f64, estimatedAdditionalHopNs = 1.000000e+00 : f64, criticality = 1.000000e+00 : f64, producerReadyTimeNs = 1.020000e+02 : f64, consumerTimingPressure = 1.000000e+00 : f64>]
+// RANDOM-NOT: sculptor.timing.
 
 // SNAKE-LABEL: func.func private @generate_task_graph
 // SNAKE-SAME: sculptor.schedule.graph_score = 8 : i64

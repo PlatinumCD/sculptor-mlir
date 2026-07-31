@@ -1,8 +1,8 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULECONFIG_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_SCHEDULERS_TASKGRAPHSCHEDULECONFIG_H
 
-#include "mlir/IR/Operation.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -26,7 +26,7 @@ struct GreedyScheduleConfig {
   std::string specification = "transfer-cost";
   bool boundaryRegret = false;
   bool compactRegion = false;
-  bool linkPressure = false;
+  bool spatialSharedLinkPressure = false;
   int64_t lookahead = 1;
   int64_t beamWidth = 1;
   GreedyCandidateScope candidateScope = GreedyCandidateScope::Diagonal;
@@ -90,19 +90,16 @@ using TaskGraphSchedulerOptions =
 
 FailureOr<TaskGraphSchedulerOptions> buildTaskGraphSchedulerOptions(
     Operation *diagnosticOp, llvm::StringRef schedule, int64_t randomSeed,
-    llvm::StringRef greedyHeuristic,
-    llvm::StringRef annealingInitialSchedule, llvm::StringRef annealingMoveSet,
-    int64_t annealingMoveRadius, double annealingInitialTemperature,
-    double annealingFinalTemperature, double annealingCoolingRate,
-    int64_t annealingStepsPerTemperature, int64_t annealingPlateauPatience,
-    double annealingImprovementThreshold, int64_t annealingMinimumEpochs,
-    double annealingPlateauAcceptanceRate,
-    int64_t annealingMaximumEvaluations,
-    double annealingMaximumRuntimeSeconds);
+    llvm::StringRef greedyHeuristic, llvm::StringRef annealingInitialSchedule,
+    llvm::StringRef annealingMoveSet, int64_t annealingMoveRadius,
+    double annealingInitialTemperature, double annealingFinalTemperature,
+    double annealingCoolingRate, int64_t annealingStepsPerTemperature,
+    int64_t annealingPlateauPatience, double annealingImprovementThreshold,
+    int64_t annealingMinimumEpochs, double annealingPlateauAcceptanceRate,
+    int64_t annealingMaximumEvaluations, double annealingMaximumRuntimeSeconds);
 
 void attachTaskGraphSchedulerOptionAttrs(
-    Operation *op, Builder &builder,
-    const TaskGraphSchedulerOptions &options);
+    Operation *op, Builder &builder, const TaskGraphSchedulerOptions &options);
 
 llvm::StringRef stringifyGreedyCandidateScope(GreedyCandidateScope scope);
 
@@ -114,9 +111,9 @@ FailureOr<AnnealingScheduleConfig> parseAnnealingScheduleConfig(
     Operation *diagnosticOp, llvm::StringRef initialSchedule,
     llvm::StringRef moveSet, int64_t moveRadius, double initialTemperature,
     double finalTemperature, double coolingRate, int64_t stepsPerTemperature,
-    int64_t plateauPatience, double improvementThreshold,
-    int64_t minimumEpochs, double plateauAcceptanceRate,
-    int64_t maximumEvaluations, double maximumRuntimeSeconds);
+    int64_t plateauPatience, double improvementThreshold, int64_t minimumEpochs,
+    double plateauAcceptanceRate, int64_t maximumEvaluations,
+    double maximumRuntimeSeconds);
 
 } // namespace task_schedulers
 } // namespace sculptor

@@ -14,6 +14,13 @@ namespace task_timing {
 
 struct TimingAnalysis;
 
+void invalidateTaskGraphTiming(func::FuncOp taskGraphFunc,
+                               bool advanceGeneration = false);
+
+void invalidateTaskGraphWorkload(func::FuncOp taskGraphFunc);
+
+void invalidateTaskGraphStructure(func::FuncOp taskGraphFunc);
+
 void attachTaskGraphTimingAnalysis(func::FuncOp taskGraphFunc,
                                    const task_graph::TaskGraphDAG &dag,
                                    const TimingAnalysis &analysis,

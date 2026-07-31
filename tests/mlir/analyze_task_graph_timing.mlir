@@ -1,4 +1,7 @@
 // RUN: sculptor-mlir-opt %s --sculptor-analyze-task-graph-timing="analog-mvm-latency-ns=75 analog-io-bits-per-cycle=128 analog-io-shared=false digital-clock-ghz=1.5 digital-issue-width=4 digital-vector-bits-per-cycle=512 network-link-bits-per-cycle=64 network-hop-latency-cycles=2 network-pipelined=false" | FileCheck %s
+// RUN: sculptor-mlir-opt %s --sculptor-analyze-task-graph-timing --sculptor-build-task-graph-islands | FileCheck %s --check-prefix=PLACEMENT-INVALIDATED
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-fuse-task-graph | FileCheck %s --check-prefix=INVALIDATED
+// RUN: sculptor-mlir-opt %s --sculptor-build-task-graph-islands --sculptor-analyze-task-graph-timing --sculptor-schedule-task-graph="cores=1 arrays-per-core=1 topology=mesh mesh-rows=1 mesh-cols=1 schedule=snake" --sculptor-fuse-task-graph --sculptor-analyze-task-graph-timing | FileCheck %s --check-prefix=RECOSTED
 
 module {
   func.func private @task_setup() -> !sculptor.logical.array {
@@ -42,17 +45,18 @@ module {
 
 // CHECK-LABEL: func.func private @generate_task_graph()
 // CHECK-SAME: sculptor.timing.control_edge_count = 4 : i64
-// CHECK-SAME: sculptor.timing.critical_path_ns = 78.333333333333343 : f64
+// CHECK-SAME: sculptor.timing.critical_path_ns = 121.00000000000001 : f64
 // CHECK-SAME: sculptor.timing.data_edge_count = 5 : i64
 // CHECK-SAME: sculptor.timing.execution_depth = 4 : i64
 // CHECK-SAME: sculptor.timing.execution_edge_count = 5 : i64
 // CHECK-SAME: sculptor.timing.islands = [#sculptor.island_timing<islandId = 0 : i64, taskCount = 5 : i64
-// CHECK-SAME: digitalWorkNs = 2.6666666666666665 : f64
+// CHECK-SAME: digitalWorkNs = 5.800000e+01 : f64
 // CHECK-SAME: earliestStartNs = 0.000000e+00 : f64
 // CHECK-SAME: slackNs = 0.000000e+00 : f64, isCritical = true>]
 // CHECK-SAME: sculptor.timing.model = #sculptor.timing_model<
 // CHECK-SAME: analogIOShared = false
-// CHECK-SAME: networkPipelined = false>
+// CHECK-SAME: networkPipelined = false
+// CHECK-SAME: routingPolicy = "xy">
 // CHECK-SAME: sculptor.timing.task_count = 5 : i64
 // CHECK-SAME: sculptor.timing.total_data_bytes = 32 : i64
 
@@ -65,17 +69,40 @@ module {
 // CHECK-SAME: sculptor.timing.analog_execute_latency_ns = 7.500000e+01 : f64
 // CHECK-SAME: sculptor.timing.analog_load_latency_ns = 0.66666666666666663 : f64
 // CHECK-SAME: sculptor.timing.analog_store_latency_ns = 0.66666666666666663 : f64
-// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 76.333333333333343 : f64
+// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 90.333333333333343 : f64
 // CHECK-SAME: sculptor.timing.is_critical = true
-// CHECK-SAME: sculptor.timing.slack_ns = 0.000000e+00 : f64
 
 // CHECK: task_name = "right"
-// CHECK-SAME: sculptor.timing.earliest_finish_ns = 77.666666666666671 : f64
+// CHECK-SAME: sculptor.timing.earliest_finish_ns = 106.33333333333334 : f64
 // CHECK-SAME: sculptor.timing.is_critical = true
 
 // CHECK: task_name = "join"
 // CHECK-SAME: sculptor.timing.control_predecessor_count = 1 : i64
 // CHECK-SAME: sculptor.timing.data_predecessor_count = 2 : i64
 // CHECK-SAME: sculptor.timing.dependency_depth = 3 : i64
-// CHECK-SAME: sculptor.timing.earliest_start_ns = 77.666666666666671 : f64
+// CHECK-SAME: sculptor.timing.earliest_start_ns = 106.33333333333334 : f64
 // CHECK-SAME: sculptor.timing.topological_index = 4 : i64
+
+// PLACEMENT-INVALIDATED-LABEL: func.func private @generate_task_graph
+// PLACEMENT-INVALIDATED-SAME: sculptor.task_graph.generation = 0 : i64
+// PLACEMENT-INVALIDATED-NOT: sculptor.timing.
+// PLACEMENT-INVALIDATED: sculptor.task.create
+// PLACEMENT-INVALIDATED-SAME: sculptor.workload.digital_ops
+// PLACEMENT-INVALIDATED-SAME: sculptor.workload.incoming_data_bytes
+// PLACEMENT-INVALIDATED-NOT: sculptor.timing.
+
+// INVALIDATED-LABEL: func.func private @generate_task_graph
+// INVALIDATED-SAME: sculptor.task_graph.generation = 1 : i64
+// INVALIDATED-NOT: sculptor.timing.
+// INVALIDATED: task_kind = "mixed.fused"
+// INVALIDATED-NOT: sculptor.workload.
+// INVALIDATED-NOT: sculptor.timing.
+
+// RECOSTED-LABEL: func.func private @generate_task_graph
+// RECOSTED-SAME: sculptor.task_graph.generation = 1 : i64
+// RECOSTED-SAME: sculptor.timing.generation = 1 : i64
+// RECOSTED: task_kind = "mixed.fused"
+// RECOSTED-SAME: sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64
+// RECOSTED-SAME: sculptor.timing.predicted_cpu_cycles
+// RECOSTED-SAME: sculptor.workload.analog_execution_count = 1 : i64
+// RECOSTED-SAME: sculptor.workload.digital_ops

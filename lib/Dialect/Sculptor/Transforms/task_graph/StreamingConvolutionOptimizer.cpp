@@ -693,9 +693,21 @@ buildStreamingConvolutionCallee(ModuleOp module,
 
   int64_t totalPhysicalColumns = 0;
   int64_t totalPhysicalRows = 0;
+  SmallVector<int64_t, 4> loadBytesPerArray;
+  SmallVector<int64_t, 4> storeBytesPerArray;
   for (const ArrayStage &stage : match.arrays) {
     totalPhysicalColumns += stage.arrayCols;
     totalPhysicalRows += stage.arrayRows;
+    auto arrayLoadBytes =
+        checkedMultiply(patchTask, {outputPositions, stage.arrayCols, 4},
+                        "per-array streaming convolution load bytes");
+    auto arrayStoreBytes =
+        checkedMultiply(patchTask, {outputPositions, stage.arrayRows, 4},
+                        "per-array streaming convolution store bytes");
+    if (failed(arrayLoadBytes) || failed(arrayStoreBytes))
+      return failure();
+    loadBytesPerArray.push_back(*arrayLoadBytes);
+    storeBytesPerArray.push_back(*arrayStoreBytes);
   }
   auto loadBytes =
       checkedMultiply(patchTask, {outputPositions, totalPhysicalColumns, 4},
@@ -729,6 +741,10 @@ buildStreamingConvolutionCallee(ModuleOp module,
                          builder.getI64IntegerAttr(*loadBytes));
   streamingFunc->setAttr(runtime_attrs::kTaskAnalogStoreBytesAttrName,
                          builder.getI64IntegerAttr(*storeBytes));
+  streamingFunc->setAttr(runtime_attrs::kTaskAnalogLoadBytesPerArrayAttrName,
+                         builder.getI64ArrayAttr(loadBytesPerArray));
+  streamingFunc->setAttr(runtime_attrs::kTaskAnalogStoreBytesPerArrayAttrName,
+                         builder.getI64ArrayAttr(storeBytesPerArray));
   streamingFunc->setAttr(runtime_attrs::kTaskDigitalOpsAttrName,
                          builder.getI64IntegerAttr(digitalOps));
 
@@ -947,10 +963,13 @@ rewriteStreamingConvolution(ModuleOp module, func::FuncOp taskGraphFunc,
                        builder.getI64ArrayAttr(match.sourceIslandIds));
   replacement->setAttr(runtime_attrs::kTaskArrayBindingsAttrName,
                        buildArrayBindings(builder, match.arrays));
-  for (StringRef attrName : {runtime_attrs::kTaskAnalogExecutionCountsAttrName,
-                             runtime_attrs::kTaskAnalogLoadBytesAttrName,
-                             runtime_attrs::kTaskAnalogStoreBytesAttrName,
-                             runtime_attrs::kTaskDigitalOpsAttrName}) {
+  for (StringRef attrName :
+       {runtime_attrs::kTaskAnalogExecutionCountsAttrName,
+        runtime_attrs::kTaskAnalogLoadBytesAttrName,
+        runtime_attrs::kTaskAnalogStoreBytesAttrName,
+        runtime_attrs::kTaskAnalogLoadBytesPerArrayAttrName,
+        runtime_attrs::kTaskAnalogStoreBytesPerArrayAttrName,
+        runtime_attrs::kTaskDigitalOpsAttrName}) {
     replacement->setAttr(attrName, (*streamingFunc)->getAttr(attrName));
   }
   replacement->setAttr(runtime_attrs::kTaskResultIndicesAttrName,

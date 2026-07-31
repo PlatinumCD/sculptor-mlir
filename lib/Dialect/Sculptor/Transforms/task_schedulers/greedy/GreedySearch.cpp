@@ -178,9 +178,9 @@ buildGreedyPlacementPlan(const TaskGraphPlacementProblem &problem,
     return failure();
   }
 
-  CompositeGreedyHeuristic heuristic(config.specification,
-                                     config.boundaryRegret,
-                                     config.compactRegion, config.linkPressure);
+  CompositeGreedyHeuristic heuristic(
+      config.specification, config.boundaryRegret, config.compactRegion,
+      config.spatialSharedLinkPressure);
 
   auto resources = buildIslandPlacementResources(problem, physicalArrayOrder);
   if (failed(resources))

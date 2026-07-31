@@ -6,6 +6,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphCleanup.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphOptimizer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -86,23 +87,6 @@ parseSelectedPatterns(mlir::Operation *anchor, llvm::StringRef option,
     selected.push_back(storage.back());
   }
   return selected;
-}
-
-static void clearTimingMetadata(mlir::func::FuncOp taskGraphFunc) {
-  auto removeTimingAttrs = [](mlir::Operation *op) {
-    llvm::SmallVector<mlir::StringAttr, 16> names;
-    for (mlir::NamedAttribute attr : op->getAttrs()) {
-      if (attr.getName().getValue().starts_with("sculptor.timing."))
-        names.push_back(attr.getName());
-    }
-    for (mlir::StringAttr name : names)
-      op->removeAttr(name);
-  };
-
-  removeTimingAttrs(taskGraphFunc);
-  for (mlir::sculptor::TaskCreateOp task :
-       taskGraphFunc.getOps<mlir::sculptor::TaskCreateOp>())
-    removeTimingAttrs(task);
 }
 
 static mlir::LogicalResult
@@ -193,7 +177,7 @@ void OptimizeTaskGraphPass::runOnOperation() {
       signalPassFailure();
       return;
     }
-    clearTimingMetadata(taskGraphFunc);
+    task_timing::invalidateTaskGraphStructure(taskGraphFunc);
   }
 
   if (!foundTaskGraph) {

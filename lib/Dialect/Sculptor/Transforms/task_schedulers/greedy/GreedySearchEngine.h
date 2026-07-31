@@ -14,18 +14,17 @@ namespace sculptor {
 namespace task_schedulers {
 namespace greedy_detail {
 
-template <typename State, typename Score>
-struct LookaheadChoice {
+template <typename State, typename Score> struct LookaheadChoice {
   State immediateState;
   Score leafScore;
 };
 
 template <typename State, typename Score, typename IsCompleteFn,
           typename ExpandFn, typename GetScoreFn, typename BetterChoiceFn>
-FailureOr<LookaheadChoice<State, Score>> chooseLookaheadState(
-    const State &state, int64_t remainingLookahead,
-    IsCompleteFn &&isComplete, ExpandFn &&expand, GetScoreFn &&getScore,
-    BetterChoiceFn &&isBetterChoice) {
+FailureOr<LookaheadChoice<State, Score>>
+chooseLookaheadState(const State &state, int64_t remainingLookahead,
+                     IsCompleteFn &&isComplete, ExpandFn &&expand,
+                     GetScoreFn &&getScore, BetterChoiceFn &&isBetterChoice) {
   auto expandedStates = expand(state, remainingLookahead > 1);
   if (expandedStates.empty())
     return failure();
@@ -75,9 +74,10 @@ FailureOr<State> runLookaheadSearch(State initialState, int64_t lookahead,
 
 template <typename State, typename IsCompleteFn, typename ExpandFn,
           typename PruneFn>
-FailureOr<State> runBeamSearch(State initialState, unsigned beamWidth,
-                               IsCompleteFn &&isComplete, ExpandFn &&expand,
-                               PruneFn &&prune) {
+FailureOr<llvm::SmallVector<State, 8>>
+runBeamSearchCandidates(State initialState, unsigned beamWidth,
+                        IsCompleteFn &&isComplete, ExpandFn &&expand,
+                        PruneFn &&prune) {
   llvm::SmallVector<State, 8> states;
   states.push_back(std::move(initialState));
 
@@ -95,7 +95,19 @@ FailureOr<State> runBeamSearch(State initialState, unsigned beamWidth,
     states = std::move(nextStates);
   }
 
-  return std::move(states.front());
+  return states;
+}
+
+template <typename State, typename IsCompleteFn, typename ExpandFn,
+          typename PruneFn>
+FailureOr<State> runBeamSearch(State initialState, unsigned beamWidth,
+                               IsCompleteFn &&isComplete, ExpandFn &&expand,
+                               PruneFn &&prune) {
+  auto states = runBeamSearchCandidates(std::move(initialState), beamWidth,
+                                        isComplete, expand, prune);
+  if (failed(states))
+    return failure();
+  return std::move(states->front());
 }
 
 } // namespace greedy_detail

@@ -6,7 +6,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -33,7 +32,6 @@ namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_attrs = mlir::sculptor::task_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
-namespace timing_attrs = mlir::sculptor::timing_attrs;
 
 static constexpr llvm::StringLiteral kFusedMixedTaskDomain("digital");
 static constexpr llvm::StringLiteral kFusedMixedTaskKind("mixed.fused");
@@ -713,26 +711,6 @@ fuseIslandComponent(ModuleOp module, func::FuncOp taskGraphFunc,
   }
   fusedTask->setAttr(runtime_attrs::kTaskDigitalOpsAttrName,
                      builder.getI64IntegerAttr(digitalOps));
-
-  auto sumTimingAttr = [&](llvm::StringRef attrName) -> std::optional<double> {
-    double total = 0.0;
-    for (const TaskGraphNode *node : component.nodes) {
-      auto value = node->op->getAttrOfType<FloatAttr>(attrName);
-      if (!value)
-        return std::nullopt;
-      total += value.getValueAsDouble();
-    }
-    return total;
-  };
-  for (llvm::StringRef attrName : {
-           timing_attrs::kAnalogLoadLatencyNsAttrName,
-           timing_attrs::kAnalogExecuteLatencyNsAttrName,
-           timing_attrs::kAnalogStoreLatencyNsAttrName,
-           timing_attrs::kIntrinsicLatencyNsAttrName,
-       }) {
-    if (std::optional<double> total = sumTimingAttr(attrName))
-      fusedTask->setAttr(attrName, builder.getF64FloatAttr(*total));
-  }
 
   llvm::SmallPtrSet<Operation *, 16> componentOps;
   for (const TaskGraphNode *node : component.nodes) {

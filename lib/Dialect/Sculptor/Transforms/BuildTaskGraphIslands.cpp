@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphExecutionGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/Pass/PassRegistry.h"
 
@@ -31,8 +32,7 @@ void BuildTaskGraphIslandsPass::runOnOperation() {
       return;
     }
 
-    auto executionGraph =
-        task_graph::buildTaskExecutionGraph(func, *parsedDag);
+    auto executionGraph = task_graph::buildTaskExecutionGraph(func, *parsedDag);
     if (failed(executionGraph)) {
       signalPassFailure();
       return;
@@ -46,11 +46,12 @@ void BuildTaskGraphIslandsPass::runOnOperation() {
       return;
     }
 
-    if (failed(task_graph::attachLogicalPlacementIslandIds(
-            func, *parsedDag, *islandGraph))) {
+    if (failed(task_graph::attachLogicalPlacementIslandIds(func, *parsedDag,
+                                                           *islandGraph))) {
       signalPassFailure();
       return;
     }
+    task_timing::invalidateTaskGraphTiming(func, /*advanceGeneration=*/false);
 
     foundTaskGraph = true;
   }

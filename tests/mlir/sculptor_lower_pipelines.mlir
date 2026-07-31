@@ -29,9 +29,11 @@ module {
 // PIPELINE-SAME: sculptor.schedule.logical_array_to_analog_array = [0]
 // PIPELINE-SAME: sculptor.schedule.num_logical_arrays = 1 : i64
 // PIPELINE-SAME: sculptor.timing.critical_path_ns
-// PIPELINE-SAME: sculptor.timing.model = #sculptor.timing_model<analogMVMLatencyNs = 75 : i64
+// PIPELINE-SAME: sculptor.timing.model = #sculptor.timing_model<costModel = "golem-qemu-v1"
+// PIPELINE-SAME: analogMVMLatencyNs = 75 : i64
 // PIPELINE-SAME: digitalClockGHz = 1.500000e+00 : f64
-// PIPELINE-SAME: networkPipelined = false>
+// PIPELINE-SAME: networkPipelined = false
+// PIPELINE-SAME: routingPolicy = "xy">
 // PIPELINE-SAME: sculptor.timing.placement_aware = true
 // PIPELINE: module @core_0
 // PIPELINE-LABEL: func.func private @generate_task_graph
@@ -43,7 +45,10 @@ module {
 // PIPELINE: task_kind = "mixed.fused"
 // PIPELINE-SAME: sculptor.deployment.global_task_id = 1 : i64
 // PIPELINE-SAME: sculptor.schedule.island_id = 0 : i64
-// PIPELINE-SAME: sculptor.timing.intrinsic_latency_ns = 76.333333333333343 : f64
+// PIPELINE-SAME: sculptor.timing.intrinsic_latency_ns = 91.666666666666671 : f64
+// PIPELINE-SAME: sculptor.workload.analog_execution_count = 1 : i64
+// PIPELINE-SAME: sculptor.workload.analog_load_bytes = 16 : i64
+// PIPELINE-SAME: sculptor.workload.analog_store_bytes = 16 : i64
 
 // LOWERED-EXPORT: "resources": [
 // LOWERED-EXPORT: "kind": "input"

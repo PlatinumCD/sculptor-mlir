@@ -42,7 +42,7 @@ module {
 // DIGITAL-SAME: sculptor.schedule.graph_score = 0 : i64
 // DIGITAL-SAME: sculptor.schedule.task_count = 4 : i64
 // DIGITAL-SAME: sculptor.schedule.total_digital_ops = 32 : i64
-// DIGITAL-SAME: sculptor.timing.critical_path_ns = 4.000000e+00 : f64
+// DIGITAL-SAME: sculptor.timing.critical_path_ns = 1.410000e+02 : f64
 // DIGITAL: sculptor.task.create {{.*}} domain = "analog", task_kind = "sculptor.matrix_setup"
 // DIGITAL-SAME: inputs[], outputs[], deps[]
 // DIGITAL-SAME: sculptor.runtime.core_id = 0 : i64
@@ -53,8 +53,8 @@ module {
 // DIGITAL-SAME: sculptor.runtime.digital_ops = 32 : i64
 // DIGITAL-SAME: sculptor.schedule.island_id = 0 : i64
 // DIGITAL-SAME: sculptor.timing.analog_execute_latency_ns = 0.000000e+00 : f64
-// DIGITAL-SAME: sculptor.timing.digital_ops = 32 : i64
-// DIGITAL-SAME: sculptor.timing.intrinsic_latency_ns = 4.000000e+00 : f64
+// DIGITAL-SAME: sculptor.timing.intrinsic_latency_ns = 8.600000e+01 : f64
+// DIGITAL-SAME: sculptor.workload.digital_ops = 32 : i64
 
 // CORE-LABEL: module attributes
 // CORE-SAME: sculptor.runtime.core_id = 0 : i64

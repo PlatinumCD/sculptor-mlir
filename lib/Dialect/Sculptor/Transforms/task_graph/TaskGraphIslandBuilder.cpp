@@ -204,6 +204,72 @@ static void assignExecutionEndpointIslands(
       /*traverseForward=*/false, islandByTaskIndex);
 }
 
+static mlir::LogicalResult assignUncoveredDigitalTasksToNearestAnalogIsland(
+    const task_graph::TaskGraphDAG &dag,
+    const task_graph::TaskExecutionGraph &executionGraph,
+    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  llvm::DenseSet<unsigned> analogIslands;
+  for (const TaskGraphNode *setup : matrixSetupTasks) {
+    auto island = islandByTaskIndex.find(setup->index);
+    if (island != islandByTaskIndex.end())
+      analogIslands.insert(island->second);
+  }
+  if (analogIslands.empty())
+    return mlir::success();
+
+  for (const TaskGraphNode &node : dag.nodes) {
+    if (islandByTaskIndex.contains(node.index))
+      continue;
+    if (!task_graph::isDigitalTask(node.op)) {
+      node.op->emitError(
+          "expected every non-digital task to have an anchored logical island");
+      return mlir::failure();
+    }
+
+    llvm::SmallVector<bool, 16> visited(dag.nodes.size(), false);
+    std::queue<unsigned> worklist;
+    visited[node.index] = true;
+    worklist.push(node.index);
+    std::optional<unsigned> selectedIsland;
+    while (!worklist.empty() && !selectedIsland) {
+      size_t levelSize = worklist.size();
+      llvm::SmallVector<unsigned, 4> candidates;
+      for (size_t item = 0; item < levelSize; ++item) {
+        unsigned current = worklist.front();
+        worklist.pop();
+        auto visitAdjacent = [&](unsigned adjacent) {
+          auto island = islandByTaskIndex.find(adjacent);
+          if (island != islandByTaskIndex.end() &&
+              analogIslands.contains(island->second)) {
+            candidates.push_back(island->second);
+            return;
+          }
+          if (!visited[adjacent]) {
+            visited[adjacent] = true;
+            worklist.push(adjacent);
+          }
+        };
+        for (unsigned edgeIndex : executionGraph.incomingEdges[current])
+          visitAdjacent(executionGraph.edges[edgeIndex].producerTask);
+        for (unsigned edgeIndex : executionGraph.outgoingEdges[current])
+          visitAdjacent(executionGraph.edges[edgeIndex].consumerTask);
+      }
+      if (!candidates.empty())
+        selectedIsland =
+            *std::min_element(candidates.begin(), candidates.end());
+    }
+
+    if (!selectedIsland) {
+      node.op->emitError(
+          "could not assign digital task to a reachable analog island");
+      return mlir::failure();
+    }
+    islandByTaskIndex[node.index] = *selectedIsland;
+  }
+  return mlir::success();
+}
+
 static mlir::FailureOr<task_graph::LogicalPlacementIslandGraph>
 assembleLogicalPlacementIslandGraph(
     const task_graph::TaskGraphDAG &dag,
@@ -353,6 +419,9 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
 
   assignExecutionEndpointIslands(executionGraph, matrixSetupTasks,
                                  islandByTaskIndex);
+  if (failed(assignUncoveredDigitalTasksToNearestAnalogIsland(
+          dag, executionGraph, matrixSetupTasks, islandByTaskIndex)))
+    return failure();
 
   llvm::SmallVector<IslandAffinityEdge, 16> affinityEdges =
       buildIslandAffinityEdges(dag, *resourceEdges, islandByTaskIndex);

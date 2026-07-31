@@ -24,16 +24,21 @@ module {
   }
 }
 
-// Four 32-bit flits crossing three hops cost 4 + 3 - 1 = 6 cycles when
-// pipelined, and 3 * (4 + 1 - 1) = 12 cycles when not pipelined.
+// Four payload words plus five protocol words are injected and received. The
+// three-hop link service adds 2 pipelined cycles or 18 non-pipelined cycles,
+// yielding complete route service times of 20 and 36 ns respectively.
 // PIPELINED-LABEL: func.func private @generate_task_graph
-// PIPELINED-SAME: sculptor.timing.critical_path_ns = 6.000000e+00 : f64
+// PIPELINED-SAME: sculptor.timing.critical_path_ns = 6.900000e+01 : f64
 // PIPELINED-SAME: meshHops = 3 : i64
-// PIPELINED-SAME: networkLatencyNs = 6.000000e+00 : f64
-// PIPELINED-SAME: sculptor.timing.total_network_latency_ns = 6.000000e+00 : f64
+// PIPELINED-SAME: payloadWords = 4 : i64
+// PIPELINED-SAME: protocolWords = 5 : i64
+// PIPELINED-SAME: networkLatencyNs = 2.000000e+01 : f64
+// PIPELINED-SAME: sculptor.timing.sum_edge_network_service_ns = 2.000000e+01 : f64
 
 // NONPIPELINED-LABEL: func.func private @generate_task_graph
-// NONPIPELINED-SAME: sculptor.timing.critical_path_ns = 1.200000e+01 : f64
+// NONPIPELINED-SAME: sculptor.timing.critical_path_ns = 8.500000e+01 : f64
 // NONPIPELINED-SAME: meshHops = 3 : i64
-// NONPIPELINED-SAME: networkLatencyNs = 1.200000e+01 : f64
-// NONPIPELINED-SAME: sculptor.timing.total_network_latency_ns = 1.200000e+01 : f64
+// NONPIPELINED-SAME: payloadWords = 4 : i64
+// NONPIPELINED-SAME: protocolWords = 5 : i64
+// NONPIPELINED-SAME: networkLatencyNs = 3.600000e+01 : f64
+// NONPIPELINED-SAME: sculptor.timing.sum_edge_network_service_ns = 3.600000e+01 : f64

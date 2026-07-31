@@ -28,9 +28,9 @@ module {
 
 // TIMING: task_name = "mvm"
 // TIMING-SAME: sculptor.timing.analog_execute_latency_ns = 0.000000e+00 : f64
-// TIMING-SAME: sculptor.timing.digital_ops = 8 : i64
-// TIMING-SAME: sculptor.timing.digital_replacement_ops = 128 : i64
-// TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 1.700000e+01 : f64
+// TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 9.500000e+01 : f64
+// TIMING-SAME: sculptor.workload.digital_ops = 8 : i64
+// TIMING-SAME: sculptor.workload.digital_replacement_ops = 128 : i64
 
 // LOWERING-LABEL: func.func private @task_mvm(%arg0: tensor<1x8xf32>)
 // LOWERING-SAME: sculptor.runtime.digital_ops = 136 : i64

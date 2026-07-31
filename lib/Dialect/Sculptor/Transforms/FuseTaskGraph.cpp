@@ -5,6 +5,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphCleanup.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphRoutineFuser.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_timing/TaskGraphTimingIRCodec.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -20,9 +21,8 @@ static bool returnsTaskGraph(mlir::func::FuncOp func) {
          mlir::isa<mlir::sculptor::TaskGraphType>(functionType.getResult(0));
 }
 
-static void
-refreshStructuralMetadata(mlir::func::FuncOp func,
-                          const task_graph::TaskGraphDAG &dag) {
+static void refreshStructuralMetadata(mlir::func::FuncOp func,
+                                      const task_graph::TaskGraphDAG &dag) {
   mlir::Builder builder(func.getContext());
   func->setAttr(
       schedule_attrs::kTaskCountAttrName,
@@ -49,8 +49,7 @@ void FuseTaskGraphPass::runOnOperation() {
     auto dag = task_graph::parseTaskGraphDAG(func);
     if (failed(dag) ||
         failed(task_graph::fuseTaskGraphRoutines(module, func, *dag)) ||
-        failed(
-            task_graph::eraseUnusedTaskGraphIntermediateResources(func))) {
+        failed(task_graph::eraseUnusedTaskGraphIntermediateResources(func))) {
       func.emitError("failed to fuse scheduled task graph");
       signalPassFailure();
       return;
@@ -62,6 +61,7 @@ void FuseTaskGraphPass::runOnOperation() {
       return;
     }
     refreshStructuralMetadata(func, *fusedDag);
+    task_timing::invalidateTaskGraphStructure(func);
   }
 
   if (!foundTaskGraph) {

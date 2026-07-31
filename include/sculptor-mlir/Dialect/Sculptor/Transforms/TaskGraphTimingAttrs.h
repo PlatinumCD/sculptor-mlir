@@ -8,27 +8,49 @@ namespace sculptor {
 namespace timing_attrs {
 
 inline constexpr llvm::StringLiteral
+    kGraphGenerationAttrName("sculptor.task_graph.generation");
+inline constexpr llvm::StringLiteral
+    kAnalysisGenerationAttrName("sculptor.timing.generation");
+inline constexpr llvm::StringLiteral
     kTopologicalIndexAttrName("sculptor.timing.topological_index");
 inline constexpr llvm::StringLiteral
     kDependencyDepthAttrName("sculptor.timing.dependency_depth");
+inline constexpr llvm::StringLiteral
+    kLocalRuntimeIndexAttrName("sculptor.timing.local_runtime_index");
 inline constexpr llvm::StringLiteral kControlPredecessorCountAttrName(
     "sculptor.timing.control_predecessor_count");
 inline constexpr llvm::StringLiteral
     kDataPredecessorCountAttrName("sculptor.timing.data_predecessor_count");
+inline constexpr llvm::StringLiteral kScalarInstructionEstimateAttrName(
+    "sculptor.timing.scalar_instruction_estimate");
+inline constexpr llvm::StringLiteral kVectorInstructionEstimateAttrName(
+    "sculptor.timing.vector_instruction_estimate");
+inline constexpr llvm::StringLiteral kLoadInstructionEstimateAttrName(
+    "sculptor.timing.load_instruction_estimate");
+inline constexpr llvm::StringLiteral kStoreInstructionEstimateAttrName(
+    "sculptor.timing.store_instruction_estimate");
+inline constexpr llvm::StringLiteral kControlInstructionEstimateAttrName(
+    "sculptor.timing.control_instruction_estimate");
 inline constexpr llvm::StringLiteral
-    kIncomingDataBytesAttrName("sculptor.timing.incoming_data_bytes");
+    kRuntimeDispatchCyclesAttrName("sculptor.timing.runtime_dispatch_cycles");
 inline constexpr llvm::StringLiteral
-    kOutgoingDataBytesAttrName("sculptor.timing.outgoing_data_bytes");
+    kTaskEntryCyclesAttrName("sculptor.timing.task_entry_cycles");
 inline constexpr llvm::StringLiteral
-    kDigitalOpsAttrName("sculptor.timing.digital_ops");
+    kTaskExitCyclesAttrName("sculptor.timing.task_exit_cycles");
 inline constexpr llvm::StringLiteral
-    kDigitalReplacementOpsAttrName("sculptor.timing.digital_replacement_ops");
+    kPredictedCpuCyclesAttrName("sculptor.timing.predicted_cpu_cycles");
+inline constexpr llvm::StringLiteral
+    kCostSourceAttrName("sculptor.timing.cost_source");
+inline constexpr llvm::StringLiteral
+    kCostConfidenceAttrName("sculptor.timing.cost_confidence");
 inline constexpr llvm::StringLiteral
     kAnalogLoadLatencyNsAttrName("sculptor.timing.analog_load_latency_ns");
 inline constexpr llvm::StringLiteral kAnalogExecuteLatencyNsAttrName(
     "sculptor.timing.analog_execute_latency_ns");
 inline constexpr llvm::StringLiteral
     kAnalogStoreLatencyNsAttrName("sculptor.timing.analog_store_latency_ns");
+inline constexpr llvm::StringLiteral kAnalogPipelineLatencyNsAttrName(
+    "sculptor.timing.analog_pipeline_latency_ns");
 inline constexpr llvm::StringLiteral
     kIntrinsicLatencyNsAttrName("sculptor.timing.intrinsic_latency_ns");
 inline constexpr llvm::StringLiteral
@@ -43,6 +65,12 @@ inline constexpr llvm::StringLiteral
     kIsCriticalAttrName("sculptor.timing.is_critical");
 inline constexpr llvm::StringLiteral kIncomingNetworkDelayNsAttrName(
     "sculptor.timing.incoming_network_delay_ns");
+inline constexpr llvm::StringLiteral
+    kCoreQueueDelayNsAttrName("sculptor.timing.core_queue_delay_ns");
+inline constexpr llvm::StringLiteral
+    kCausalInputEdgeAttrName("sculptor.timing.causal_input_edge");
+inline constexpr llvm::StringLiteral
+    kCausalPreviousTaskAttrName("sculptor.timing.causal_previous_task");
 
 inline constexpr llvm::StringLiteral
     kTaskCountAttrName("sculptor.timing.task_count");
@@ -64,10 +92,34 @@ inline constexpr llvm::StringLiteral
     kMVMCostModeAttrName("sculptor.timing.mvm_cost_mode");
 inline constexpr llvm::StringLiteral
     kPlacementAwareAttrName("sculptor.timing.placement_aware");
+inline constexpr llvm::StringLiteral kSumEdgeNetworkServiceNsAttrName(
+    "sculptor.timing.sum_edge_network_service_ns");
+inline constexpr llvm::StringLiteral kSumEdgeNetworkQueueDelayNsAttrName(
+    "sculptor.timing.sum_edge_network_queue_delay_ns");
 inline constexpr llvm::StringLiteral
-    kTotalNetworkLatencyNsAttrName("sculptor.timing.total_network_latency_ns");
-inline constexpr llvm::StringLiteral kTotalNetworkContentionDelayNsAttrName(
-    "sculptor.timing.total_network_contention_delay_ns");
+    kSumTaskWorkNsAttrName("sculptor.timing.sum_task_work_ns");
+inline constexpr llvm::StringLiteral
+    kSumCoreQueueDelayNsAttrName("sculptor.timing.sum_core_queue_delay_ns");
+inline constexpr llvm::StringLiteral
+    kSumNicQueueDelayNsAttrName("sculptor.timing.sum_nic_queue_delay_ns");
+inline constexpr llvm::StringLiteral
+    kSumLinkQueueDelayNsAttrName("sculptor.timing.sum_link_queue_delay_ns");
+inline constexpr llvm::StringLiteral kSumReceiveQueueDelayNsAttrName(
+    "sculptor.timing.sum_receive_queue_delay_ns");
+inline constexpr llvm::StringLiteral kNoContentionMakespanNsAttrName(
+    "sculptor.timing.no_contention_makespan_ns");
+inline constexpr llvm::StringLiteral
+    kZeroNetworkMakespanNsAttrName("sculptor.timing.zero_network_makespan_ns");
+inline constexpr llvm::StringLiteral
+    kExposedTransportNsAttrName("sculptor.timing.exposed_transport_ns");
+inline constexpr llvm::StringLiteral
+    kExposedContentionNsAttrName("sculptor.timing.exposed_contention_ns");
+inline constexpr llvm::StringLiteral
+    kTotalPayloadWordsAttrName("sculptor.timing.total_payload_words");
+inline constexpr llvm::StringLiteral
+    kTotalProtocolWordsAttrName("sculptor.timing.total_protocol_words");
+inline constexpr llvm::StringLiteral
+    kTotalWordHopsAttrName("sculptor.timing.total_word_hops");
 
 inline constexpr llvm::StringLiteral
     kTimingModelAttrName("sculptor.timing.model");
@@ -77,6 +129,8 @@ inline constexpr llvm::StringLiteral
     kIslandProfilesAttrName("sculptor.timing.islands");
 inline constexpr llvm::StringLiteral
     kTimedIslandEdgesAttrName("sculptor.timing.island_edges");
+inline constexpr llvm::StringLiteral
+    kCausalCriticalChainAttrName("sculptor.timing.causal_critical_chain");
 
 } // namespace timing_attrs
 } // namespace sculptor

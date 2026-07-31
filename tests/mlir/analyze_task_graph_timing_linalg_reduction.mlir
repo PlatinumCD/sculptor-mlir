@@ -37,5 +37,15 @@ module {
 // The generic executes 2 * 4 * 3 iterations with one multiply and one add.
 // CHECK-LABEL: func.func private @generate_task_graph
 // CHECK: task_name = "matmul"
-// CHECK-SAME: sculptor.timing.digital_ops = 48 : i64
-// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 6.000000e+00 : f64
+// CHECK-SAME: sculptor.timing.control_instruction_estimate = 56 : i64
+// CHECK-SAME: sculptor.timing.cost_confidence = "high"
+// CHECK-SAME: sculptor.timing.cost_source = "static-analysis"
+// CHECK-SAME: sculptor.timing.intrinsic_latency_ns = 1.200000e+02 : f64
+// CHECK-SAME: sculptor.timing.load_instruction_estimate = 64 : i64
+// CHECK-SAME: sculptor.timing.predicted_cpu_cycles = 1.200000e+02 : f64
+// CHECK-SAME: sculptor.timing.scalar_instruction_estimate = 48 : i64
+// CHECK-SAME: sculptor.timing.store_instruction_estimate = 40 : i64
+// CHECK-SAME: sculptor.workload.digital_ops = 48 : i64
+// CHECK-SAME: sculptor.workload.local_bytes_read = 256 : i64
+// CHECK-SAME: sculptor.workload.local_bytes_written = 160 : i64
+// CHECK-SAME: sculptor.workload.loop_iterations = 32 : i64

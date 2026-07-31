@@ -6,6 +6,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTimingAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphWorkloadAttrs.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -31,6 +32,7 @@ namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_graph_attrs = mlir::sculptor::task_graph_attrs;
 namespace timing_attrs = mlir::sculptor::timing_attrs;
+namespace workload_attrs = mlir::sculptor::workload_attrs;
 
 struct ResourceModel {
   mlir::Value value;
@@ -60,6 +62,9 @@ struct TaskModel {
   std::optional<int64_t> localArrayId;
   std::optional<int64_t> digitalOps;
   std::optional<int64_t> digitalReplacementOps;
+  std::optional<int64_t> analogLoadBytes;
+  std::optional<int64_t> analogExecutionCount;
+  std::optional<int64_t> analogStoreBytes;
   std::optional<int64_t> reductionTreeId;
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
@@ -385,7 +390,13 @@ mlir::LogicalResult collectTasks(mlir::ModuleOp module, GraphModel &graph) {
     task.digitalOps =
         getOptionalI64Attr(taskOp, runtime_attrs::kTaskDigitalOpsAttrName);
     task.digitalReplacementOps = getOptionalI64Attr(
-        taskOp, timing_attrs::kDigitalReplacementOpsAttrName);
+        taskOp, workload_attrs::kDigitalReplacementOpsAttrName);
+    task.analogLoadBytes =
+        getOptionalI64Attr(taskOp, workload_attrs::kAnalogLoadBytesAttrName);
+    task.analogExecutionCount = getOptionalI64Attr(
+        taskOp, workload_attrs::kAnalogExecutionCountAttrName);
+    task.analogStoreBytes =
+        getOptionalI64Attr(taskOp, workload_attrs::kAnalogStoreBytesAttrName);
     task.reductionTreeId = getOptionalI64Attr(
         taskOp, task_graph_attrs::kTaskReductionTreeIdAttrName);
     task.reductionLevel = getOptionalI64Attr(
@@ -588,6 +599,9 @@ void emitGraphMLNode(llvm::raw_ostream &os, const TaskModel &task) {
   emitGraphMLI64Data(os, "local_array_id", task.localArrayId);
   emitGraphMLI64Data(os, "digital_ops", task.digitalOps);
   emitGraphMLI64Data(os, "digital_replacement_ops", task.digitalReplacementOps);
+  emitGraphMLI64Data(os, "analog_load_bytes", task.analogLoadBytes);
+  emitGraphMLI64Data(os, "analog_execution_count", task.analogExecutionCount);
+  emitGraphMLI64Data(os, "analog_store_bytes", task.analogStoreBytes);
   emitGraphMLI64Data(os, "analog_ops", task.analogOps);
   emitGraphMLI64Data(os, "reduction_tree_id", task.reductionTreeId);
   emitGraphMLI64Data(os, "reduction_level", task.reductionLevel);

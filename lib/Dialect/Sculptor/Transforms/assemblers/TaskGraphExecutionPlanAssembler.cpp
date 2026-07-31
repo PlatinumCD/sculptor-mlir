@@ -5,6 +5,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphExecutionPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphRuntimeOrder.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -557,22 +558,35 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
                         builder.getI64IntegerAttr(resourceIt.second.byteSize));
   }
 
-  unsigned taskIndex = 0;
+  llvm::SmallVector<int64_t> coreByTask;
+  coreByTask.reserve(plan.tasks.size());
+  for (mlir::Operation &op : taskGraphFunc.getBody().front()) {
+    auto taskOp = llvm::dyn_cast<mlir::sculptor::TaskCreateOp>(&op);
+    if (!taskOp)
+      continue;
+    auto coreId = taskOp->getAttrOfType<mlir::IntegerAttr>(
+        runtime_attrs::kTaskCoreIdAttrName);
+    coreByTask.push_back(coreId ? coreId.getInt() : 0);
+  }
+  llvm::SmallVector<unsigned> localRuntimeOrder =
+      mlir::sculptor::task_graph::buildLocalRuntimeOrder(coreByTask);
+
+  unsigned taskOrdinal = 0;
   for (mlir::Operation &op : taskGraphFunc.getBody().front()) {
     auto taskOp = llvm::dyn_cast<mlir::sculptor::TaskCreateOp>(&op);
     if (!taskOp)
       continue;
 
-    const TaskPlan &taskPlan = plan.tasks[taskIndex];
+    const TaskPlan &taskPlan = plan.tasks[taskOrdinal];
     taskOp->setAttr(runtime_attrs::kTaskIndexAttrName,
-                    builder.getI64IntegerAttr(taskIndex));
+                    builder.getI64IntegerAttr(localRuntimeOrder[taskOrdinal]));
     taskOp->setAttr(runtime_attrs::kTaskInputSlotsAttrName,
                     buildIntegerArrayAttr(builder, llvm::ArrayRef<uint32_t>(
                                                        taskPlan.inputSlots)));
     taskOp->setAttr(runtime_attrs::kTaskOutputSlotsAttrName,
                     buildIntegerArrayAttr(builder, llvm::ArrayRef<uint32_t>(
                                                        taskPlan.outputSlots)));
-    ++taskIndex;
+    ++taskOrdinal;
   }
 
   return mlir::success();

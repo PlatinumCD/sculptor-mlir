@@ -45,15 +45,30 @@ def Sculptor_TimingModelAttr
     : Sculptor_Attr<"TimingModel", "timing_model"> {
   let summary = "hardware timing model used for task graph analysis";
   let parameters = (ins
+    "StringAttr":$costModel,
+    "IntegerAttr":$costModelRevision,
+    "StringAttr":$compilerRevision,
+    "StringAttr":$timingBoundary,
+    "StringAttr":$runtimeTaskPolicy,
+    "StringAttr":$runtimeTransmitPolicy,
+    "StringAttr":$memoryBackend,
     "IntegerAttr":$analogMVMLatencyNs,
     "IntegerAttr":$analogIOBitsPerCycle,
     "BoolAttr":$analogIOShared,
     "FloatAttr":$digitalClockGHz,
     "IntegerAttr":$digitalIssueWidth,
     "IntegerAttr":$digitalVectorBitsPerCycle,
+    "IntegerAttr":$fixedRuntimeDispatchCycles,
+    "IntegerAttr":$fixedTaskEntryCycles,
+    "IntegerAttr":$fixedTaskExitCycles,
     "IntegerAttr":$networkLinkBitsPerCycle,
     "IntegerAttr":$networkHopLatencyCycles,
-    "BoolAttr":$networkPipelined
+    "BoolAttr":$networkPipelined,
+    "IntegerAttr":$networkLinkWordBits,
+    "IntegerAttr":$protocolWordsPerRoute,
+    "IntegerAttr":$nicInjectionWordsPerCycle,
+    "IntegerAttr":$rxDmaWordsPerCycle,
+    "StringAttr":$routingPolicy
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
@@ -101,10 +116,40 @@ def Sculptor_NetworkEdgeTimingAttr
     "IntegerAttr":$sourceCore,
     "IntegerAttr":$destinationCore,
     "IntegerAttr":$meshHops,
+    "IntegerAttr":$payloadWords,
+    "IntegerAttr":$protocolWords,
     "FloatAttr":$transferStartNs,
+    "FloatAttr":$injectionStartNs,
+    "FloatAttr":$injectionFinishNs,
+    "FloatAttr":$routeArrivalNs,
+    "FloatAttr":$receiveStartNs,
+    "FloatAttr":$receiveCompleteNs,
     "FloatAttr":$transferFinishNs,
     "FloatAttr":$networkLatencyNs,
-    "FloatAttr":$contentionDelayNs
+    "FloatAttr":$contentionDelayNs,
+    "FloatAttr":$nicQueueDelayNs,
+    "FloatAttr":$linkQueueDelayNs,
+    "FloatAttr":$receiveQueueDelayNs,
+    "IntegerAttr":$causalParentTask,
+    "IntegerAttr":$causalParentEdge,
+    "StringAttr":$causalResource
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_CausalTimingEventAttr
+    : Sculptor_Attr<"CausalTimingEvent", "causal_timing_event"> {
+  let summary = "one event on the causal deployment critical chain";
+  let parameters = (ins
+    "IntegerAttr":$id,
+    "StringAttr":$kind,
+    "IntegerAttr":$taskIndex,
+    "IntegerAttr":$edgeIndex,
+    "IntegerAttr":$coreId,
+    "FloatAttr":$startNs,
+    "FloatAttr":$finishNs,
+    "IntegerAttr":$parentEvent,
+    "StringAttr":$resource
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }

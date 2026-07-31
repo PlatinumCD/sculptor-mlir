@@ -48,49 +48,51 @@ module {
 }
 
 // ANALOG-TIMING-LABEL: func.func private @generate_task_graph
-// ANALOG-TIMING-SAME: sculptor.timing.critical_path_ns = 1.040000e+02 : f64
+// ANALOG-TIMING-SAME: sculptor.timing.critical_path_ns = 1.630000e+02 : f64
 // ANALOG-TIMING-SAME: sculptor.timing.mvm_cost_mode = "analog"
 // ANALOG-TIMING-SAME: sculptor.timing.total_digital_replacement_ops = 128 : i64
 // ANALOG-TIMING: task_name = "mvm"
 // ANALOG-TIMING-SAME: sculptor.timing.analog_execute_latency_ns = 1.000000e+02 : f64
 // ANALOG-TIMING-SAME: sculptor.timing.analog_load_latency_ns = 1.000000e+00 : f64
 // ANALOG-TIMING-SAME: sculptor.timing.analog_store_latency_ns = 1.000000e+00 : f64
-// ANALOG-TIMING-SAME: sculptor.timing.digital_ops = 0 : i64
-// ANALOG-TIMING-SAME: sculptor.timing.digital_replacement_ops = 128 : i64
-// ANALOG-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 1.020000e+02 : f64
+// ANALOG-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 1.330000e+02 : f64
+// ANALOG-TIMING-SAME: sculptor.workload.digital_ops = 0 : i64
+// ANALOG-TIMING-SAME: sculptor.workload.digital_replacement_ops = 128 : i64
 // ANALOG-TIMING: task_name = "digital"
-// ANALOG-TIMING-SAME: sculptor.timing.digital_ops = 16 : i64
-// ANALOG-TIMING-SAME: sculptor.timing.digital_replacement_ops = 0 : i64
-// ANALOG-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 2.000000e+00 : f64
+// ANALOG-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 3.000000e+01 : f64
+// ANALOG-TIMING-SAME: sculptor.workload.digital_ops = 16 : i64
+// ANALOG-TIMING-SAME: sculptor.workload.digital_replacement_ops = 0 : i64
 
 // DIGITAL-TIMING-LABEL: func.func private @generate_task_graph
-// DIGITAL-TIMING-SAME: sculptor.timing.critical_path_ns = 1.800000e+01 : f64
+// DIGITAL-TIMING-SAME: sculptor.timing.critical_path_ns = 1.250000e+02 : f64
 // DIGITAL-TIMING-SAME: sculptor.timing.mvm_cost_mode = "digital"
 // DIGITAL-TIMING-SAME: sculptor.timing.total_digital_replacement_ops = 128 : i64
 // DIGITAL-TIMING: task_name = "mvm"
 // DIGITAL-TIMING-SAME: sculptor.timing.analog_execute_latency_ns = 0.000000e+00 : f64
 // DIGITAL-TIMING-SAME: sculptor.timing.analog_load_latency_ns = 0.000000e+00 : f64
 // DIGITAL-TIMING-SAME: sculptor.timing.analog_store_latency_ns = 0.000000e+00 : f64
-// DIGITAL-TIMING-SAME: sculptor.timing.digital_ops = 0 : i64
-// DIGITAL-TIMING-SAME: sculptor.timing.digital_replacement_ops = 128 : i64
-// DIGITAL-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 1.600000e+01 : f64
+// DIGITAL-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 9.500000e+01 : f64
+// DIGITAL-TIMING-SAME: sculptor.workload.digital_ops = 0 : i64
+// DIGITAL-TIMING-SAME: sculptor.workload.digital_replacement_ops = 128 : i64
 // DIGITAL-TIMING: task_name = "digital"
-// DIGITAL-TIMING-SAME: sculptor.timing.digital_ops = 16 : i64
-// DIGITAL-TIMING-SAME: sculptor.timing.digital_replacement_ops = 0 : i64
-// DIGITAL-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 2.000000e+00 : f64
+// DIGITAL-TIMING-SAME: sculptor.timing.intrinsic_latency_ns = 3.000000e+01 : f64
+// DIGITAL-TIMING-SAME: sculptor.workload.digital_ops = 16 : i64
+// DIGITAL-TIMING-SAME: sculptor.workload.digital_replacement_ops = 0 : i64
 
 // INVALID-MODE: unknown MVM cost mode 'invalid'; expected 'analog' or 'digital'
 
 // COST-SCHEDULE: module attributes
 // COST-SCHEDULE-SAME: sculptor.schedule.placement_cost_mode = "digital"
-// COST-SCHEDULE-SAME: sculptor.schedule.predicted_makespan_ns
+// COST-SCHEDULE-SAME: sculptor.schedule.search_completion_time_proxy
 
-// SUMMARY: generate_task_graph,greedy-timing,{{.*}},digital,{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9.e+-]+}}
+// SUMMARY: generate_task_graph,greedy-timing,{{.*}},digital,{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9.e+-]+}},{{[0-9]+}},1,0
 // COST-SCHEDULE-LABEL: func.func private @generate_task_graph
-// COST-SCHEDULE-SAME: sculptor.schedule.critical_communication_ns
-// COST-SCHEDULE-SAME: sculptor.schedule.maximum_resource_work_ns
 // COST-SCHEDULE-SAME: sculptor.schedule.placement_cost_mode = "digital"
-// COST-SCHEDULE-SAME: sculptor.schedule.predicted_makespan_ns
+// COST-SCHEDULE-SAME: sculptor.schedule.search_communication_proxy
+// COST-SCHEDULE-SAME: sculptor.schedule.search_completion_time_proxy
+// COST-SCHEDULE-SAME: sculptor.schedule.search_resource_load_proxy
+// COST-SCHEDULE-SAME: sculptor.schedule.timing_rerank_candidate_count = 1 : i64
+// COST-SCHEDULE-SAME: sculptor.schedule.timing_rerank_selected_proxy_rank = 0 : i64
 
 // ANALOG-COST-ANALOG-EXEC: module attributes
 // ANALOG-COST-ANALOG-EXEC-SAME: sculptor.schedule.placement_cost_mode = "analog"
@@ -148,5 +150,7 @@ module {
 
 // JSON: "digital_replacement_ops": 128
 // JSON: "placement_cost_mode": "digital"
+// JSON: "timing_rerank_candidate_count": 1
+// JSON: "timing_rerank_selected_proxy_rank": 0
 // JSON: "total_digital_replacement_ops": 128
 // JSON: "mvm_cost_mode": "digital"
