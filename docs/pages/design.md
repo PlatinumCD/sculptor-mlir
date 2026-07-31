@@ -77,17 +77,25 @@ isolated scheduled core graphs.
    Builds `generate_task_graph` with `sculptor.task_graph.*` resources and
    `sculptor.task.create` nodes. The materialized `forward` function may still
    be present at this point as a direct call form of the same tasks.
-2. `sculptor-build-task-graph-islands`
+2. Optional `sculptor-distribute-digital-matmul`
+   Rewrites eligible static rank-2 digital matmuls and transformer
+   attention-score/apply contractions into operand-partition, independent
+   shard, and output-assembly tasks. Typed
+   `#sculptor.task_distribution` metadata identifies each group, role, shard
+   coordinate, strategy, and placement policy. This stage must run before
+   timing, island construction, or scheduling.
+3. `sculptor-build-task-graph-islands`
    Builds logical placement islands and attaches stable island IDs without
-   assigning physical cores or arrays.
-3. `sculptor-analyze-task-graph-timing`
+   assigning physical cores or arrays. Every distributed matmul shard anchors
+   one digital-only island.
+4. `sculptor-analyze-task-graph-timing`
    Combines explicit task dependencies with resource producer-consumer edges,
    validates the resulting execution DAG, and attaches timing metadata used by
    `greedy-timing`. Its `mvm-cost-mode=analog|digital` option selects the
    placement cost model without changing tasks, dependencies, islands, or
    logical arrays. Standalone ordinary schedulers do not require this pass
    before scheduling.
-4. `sculptor-schedule-task-graph`
+5. `sculptor-schedule-task-graph`
    Consumes the prebuilt islands, assigns cores and arrays, and records transfer
    metadata and the placement score without changing graph topology. A
    timing-aware schedule retains its cost model in
@@ -104,25 +112,25 @@ isolated scheduled core graphs.
    Analyze timing for the selected execution backend before fusion, then
    analyze it again after any graph optimization or fusion. This prevents a
    pre-placement cost estimate from being mistaken for actual backend timing.
-5. `sculptor-fuse-task-graph`
+6. `sculptor-fuse-task-graph`
    Fuses connected tasks only when they share both a logical island and a core,
    then removes task callees and intermediate resources made dead by fusion.
-6. `sculptor-lower-golem-to-llvm-shims`
+7. `sculptor-lower-golem-to-llvm-shims`
    Rewrites scheduled Golem array operations into LLVM-callable runtime shim
    calls. At the same boundary it removes logical-array resources from task
    interfaces, preserves setup ordering as explicit task dependencies, and
    retains physical/local array bindings plus graph-level placement provenance.
-7. `sculptor-partition-task-graph-by-core`
+8. `sculptor-partition-task-graph-by-core`
    Assigns deterministic deployment task/resource IDs, converts cross-core
    tensor edges into typed route boundaries, clones each core's complete symbol
    closure, and emits modules only for active cores. Global runtime slots are
    intentionally absent.
-8. `sculptor-extract-core-module`
+9. `sculptor-extract-core-module`
    Selects one active core, flattens its isolated symbol closure into a
    standalone module, and retains only that core's routes and model ownership
    records. `sculptor-finalize-task-graph-resources` then assigns private local
    slots and workspace storage.
-9. Standard MLIR lowering followed by `sculptor-emit-golem-tile-abi`
+10. Standard MLIR lowering followed by `sculptor-emit-golem-tile-abi`
    Converts task implementations to `llvm.func`, then packages the declarative
    core graph as immutable Golem boot, dispatch, route, and model-I/O tables.
    The pass emits Golem `TaskExecute` adapters, removes the consumed graph and
@@ -146,6 +154,7 @@ task or a cross-core tensor route.
 | `sculptor-expand-mvm-to-golem` | `sculptor.mvm` inside layer/helper functions. | Golem array setup, vector tiling, array execution, store, and recombine task regions. |
 | `sculptor-materialize-tasks` | `sculptor.task_region` boundaries. | Private task functions with task metadata, called from `forward`. |
 | `sculptor-assemble-task-graph` | A `forward` function that calls materialized task functions. | Materialized task functions plus `generate_task_graph` with `sculptor.task_graph.*` resources and `sculptor.task.create` nodes. |
+| `sculptor-distribute-digital-matmul` | An assembled, unscheduled task graph containing eligible static rank-2 `f32` matmuls or typed transformer attention contractions. | Explicit operand-partition, independently placeable shard, and deterministic output-assembly tasks with typed distribution metadata. |
 | `sculptor-build-task-graph-islands` | An assembled task graph. | Placement-island members annotated with stable logical island IDs. |
 | `sculptor-analyze-task-graph-timing` | An island-annotated task graph plus `mvm-cost-mode=analog|digital`. | Task-level execution order and backend-costed latency metadata plus graph critical-path and island-work summaries. |
 | `sculptor-schedule-task-graph` | An island-annotated task graph. | Scheduled task graph metadata, graph score, live private task functions, and no stale materialized `forward` entry point. |

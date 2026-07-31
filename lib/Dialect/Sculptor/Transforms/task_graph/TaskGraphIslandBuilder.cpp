@@ -2,6 +2,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 
@@ -121,6 +122,60 @@ static mlir::LogicalResult recordInitialReductionIslands(
   return mlir::success();
 }
 
+static mlir::FailureOr<mlir::sculptor::TaskDistributionAttr>
+getShardDistributionMetadata(const TaskGraphNode &node) {
+  auto distribution =
+      node.op->getAttrOfType<mlir::sculptor::TaskDistributionAttr>(
+          mlir::sculptor::task_graph_attrs::kTaskDistributionAttrName);
+  if (!distribution ||
+      distribution.getRole() != mlir::sculptor::TaskDistributionRole::Shard)
+    return mlir::failure();
+
+  int64_t groupId = distribution.getGroupId().getInt();
+  int64_t shardId = distribution.getShardId().getInt();
+  int64_t shardCount = distribution.getShardCount().getInt();
+  int64_t rowShard = distribution.getRowShard().getInt();
+  int64_t rowShards = distribution.getRowShards().getInt();
+  int64_t columnShard = distribution.getColumnShard().getInt();
+  int64_t columnShards = distribution.getColumnShards().getInt();
+  if (groupId < 0 || shardCount < 2 || shardId < 0 || shardId >= shardCount ||
+      rowShards <= 0 || columnShards <= 0 || rowShard < 0 ||
+      rowShard >= rowShards || columnShard < 0 || columnShard >= columnShards ||
+      rowShards > std::numeric_limits<int64_t>::max() / columnShards ||
+      rowShards * columnShards != shardCount) {
+    node.op->emitError("expected valid digital matmul shard metadata");
+    return mlir::failure();
+  }
+  return distribution;
+}
+
+static mlir::LogicalResult recordInitialDigitalShardIslands(
+    const task_graph::TaskGraphDAG &dag,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
+  llvm::DenseSet<std::pair<int64_t, int64_t>> seenShards;
+  for (const TaskGraphNode &node : dag.nodes) {
+    auto distribution =
+        node.op->getAttrOfType<mlir::sculptor::TaskDistributionAttr>(
+            mlir::sculptor::task_graph_attrs::kTaskDistributionAttrName);
+    if (!distribution ||
+        distribution.getRole() != mlir::sculptor::TaskDistributionRole::Shard)
+      continue;
+
+    auto metadata = getShardDistributionMetadata(node);
+    if (mlir::failed(metadata))
+      return mlir::failure();
+    auto key = std::make_pair(metadata->getGroupId().getInt(),
+                              metadata->getShardId().getInt());
+    if (!seenShards.insert(key).second) {
+      node.op->emitError(
+          "expected one digital matmul task for each distribution shard");
+      return mlir::failure();
+    }
+    islandByTaskIndex.try_emplace(node.index, node.index);
+  }
+  return mlir::success();
+}
+
 static void appendUniqueTaskIndex(llvm::SmallVectorImpl<unsigned> &tasks,
                                   unsigned taskIndex) {
   for (unsigned existingTask : tasks) {
@@ -133,7 +188,7 @@ static void appendUniqueTaskIndex(llvm::SmallVectorImpl<unsigned> &tasks,
 
 static void assignUncoveredExecutionEndpointIsland(
     const task_graph::TaskExecutionGraph &executionGraph,
-    const llvm::DenseSet<unsigned> &analogIslands, unsigned endpoint,
+    const llvm::DenseSet<unsigned> &anchoredIslands, unsigned endpoint,
     bool traverseForward,
     llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
   if (islandByTaskIndex.contains(endpoint) ||
@@ -162,7 +217,7 @@ static void assignUncoveredExecutionEndpointIsland(
             traverseForward ? edge.consumerTask : edge.producerTask;
         auto island = islandByTaskIndex.find(adjacent);
         if (island != islandByTaskIndex.end() &&
-            analogIslands.contains(island->second)) {
+            anchoredIslands.contains(island->second)) {
           candidates.push_back(island->second);
           continue;
         }
@@ -185,37 +240,29 @@ static void assignUncoveredExecutionEndpointIsland(
 
 static void assignExecutionEndpointIslands(
     const task_graph::TaskExecutionGraph &executionGraph,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
     llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
   if (executionGraph.topologicalOrder.empty())
     return;
 
-  llvm::DenseSet<unsigned> analogIslands;
-  for (const TaskGraphNode *setup : matrixSetupTasks) {
-    auto island = islandByTaskIndex.find(setup->index);
-    if (island != islandByTaskIndex.end())
-      analogIslands.insert(island->second);
-  }
+  llvm::DenseSet<unsigned> anchoredIslands;
+  for (const auto &entry : islandByTaskIndex)
+    anchoredIslands.insert(entry.second);
   assignUncoveredExecutionEndpointIsland(
-      executionGraph, analogIslands, executionGraph.topologicalOrder.front(),
+      executionGraph, anchoredIslands, executionGraph.topologicalOrder.front(),
       /*traverseForward=*/true, islandByTaskIndex);
   assignUncoveredExecutionEndpointIsland(
-      executionGraph, analogIslands, executionGraph.topologicalOrder.back(),
+      executionGraph, anchoredIslands, executionGraph.topologicalOrder.back(),
       /*traverseForward=*/false, islandByTaskIndex);
 }
 
-static mlir::LogicalResult assignUncoveredDigitalTasksToNearestAnalogIsland(
+static mlir::LogicalResult assignUncoveredDigitalTasksToNearestIsland(
     const task_graph::TaskGraphDAG &dag,
     const task_graph::TaskExecutionGraph &executionGraph,
-    llvm::ArrayRef<const TaskGraphNode *> matrixSetupTasks,
     llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex) {
-  llvm::DenseSet<unsigned> analogIslands;
-  for (const TaskGraphNode *setup : matrixSetupTasks) {
-    auto island = islandByTaskIndex.find(setup->index);
-    if (island != islandByTaskIndex.end())
-      analogIslands.insert(island->second);
-  }
-  if (analogIslands.empty())
+  llvm::DenseSet<unsigned> anchoredIslands;
+  for (const auto &entry : islandByTaskIndex)
+    anchoredIslands.insert(entry.second);
+  if (anchoredIslands.empty())
     return mlir::success();
 
   for (const TaskGraphNode &node : dag.nodes) {
@@ -241,7 +288,7 @@ static mlir::LogicalResult assignUncoveredDigitalTasksToNearestAnalogIsland(
         auto visitAdjacent = [&](unsigned adjacent) {
           auto island = islandByTaskIndex.find(adjacent);
           if (island != islandByTaskIndex.end() &&
-              analogIslands.contains(island->second)) {
+              anchoredIslands.contains(island->second)) {
             candidates.push_back(island->second);
             return;
           }
@@ -262,7 +309,7 @@ static mlir::LogicalResult assignUncoveredDigitalTasksToNearestAnalogIsland(
 
     if (!selectedIsland) {
       node.op->emitError(
-          "could not assign digital task to a reachable analog island");
+          "could not assign digital task to a reachable logical island");
       return mlir::failure();
     }
     islandByTaskIndex[node.index] = *selectedIsland;
@@ -302,6 +349,7 @@ assembleLogicalPlacementIslandGraph(
     task_graph::LogicalPlacementIsland island;
     island.islandIndex = islandIndex;
     bool foundReductionTask = false;
+    bool foundDigitalShardTask = false;
     for (const TaskGraphNode *node : nodesByIsland.lookup(islandIndex)) {
       if (task_graph::isMatrixSetupTask(node->op)) {
         if (island.matrixSetupTaskIndex) {
@@ -312,30 +360,58 @@ assembleLogicalPlacementIslandGraph(
         island.matrixSetupTaskIndex = node->index;
       }
 
-      if (!task_graph::isReductionTask(node->op))
+      if (!task_graph::isReductionTask(node->op)) {
+        auto distribution =
+            node->op->getAttrOfType<mlir::sculptor::TaskDistributionAttr>(
+                mlir::sculptor::task_graph_attrs::kTaskDistributionAttrName);
+        if (!distribution || distribution.getRole() !=
+                                 mlir::sculptor::TaskDistributionRole::Shard)
+          continue;
+        auto metadata = getShardDistributionMetadata(*node);
+        if (mlir::failed(metadata))
+          return mlir::failure();
+        if (foundDigitalShardTask) {
+          node->op->emitError(
+              "expected one digital shard anchor per placement island");
+          return mlir::failure();
+        }
+        island.distributionGroupId = metadata->getGroupId().getInt();
+        island.distributionShardId = metadata->getShardId().getInt();
+        island.distributionShardCount = metadata->getShardCount().getInt();
+        island.distributionPlacement = metadata->getPlacement();
+        foundDigitalShardTask = true;
         continue;
-      auto metadata = getReductionIslandMetadata(*node);
-      if (mlir::failed(metadata))
-        return mlir::failure();
-      if (!foundReductionTask) {
-        island.reductionTreeId = metadata->treeId;
-        island.reductionLevel = metadata->level;
-        island.reductionLane = metadata->lane;
-        island.reductionWidth = metadata->width;
-        foundReductionTask = true;
-      } else if (island.reductionTreeId != metadata->treeId ||
-                 island.reductionLevel != metadata->level ||
-                 island.reductionLane != metadata->lane ||
-                 island.reductionWidth != metadata->width) {
-        node->op->emitError(
-            "expected a reduction island to contain one tree branch");
-        return mlir::failure();
+      } else {
+        auto metadata = getReductionIslandMetadata(*node);
+        if (mlir::failed(metadata))
+          return mlir::failure();
+        if (!foundReductionTask) {
+          island.reductionTreeId = metadata->treeId;
+          island.reductionLevel = metadata->level;
+          island.reductionLane = metadata->lane;
+          island.reductionWidth = metadata->width;
+          foundReductionTask = true;
+        } else if (island.reductionTreeId != metadata->treeId ||
+                   island.reductionLevel != metadata->level ||
+                   island.reductionLane != metadata->lane ||
+                   island.reductionWidth != metadata->width) {
+          node->op->emitError(
+              "expected a reduction island to contain one tree branch");
+          return mlir::failure();
+        }
       }
     }
 
-    if (island.matrixSetupTaskIndex && foundReductionTask) {
-      dag.nodes[*island.matrixSetupTaskIndex].op->emitError(
-          "expected analog and reduction tasks to use separate islands");
+    unsigned anchorKindCount =
+        static_cast<unsigned>(island.matrixSetupTaskIndex.has_value()) +
+        static_cast<unsigned>(foundReductionTask) +
+        static_cast<unsigned>(foundDigitalShardTask);
+    if (anchorKindCount > 1) {
+      nodesByIsland.lookup(islandIndex)
+          .front()
+          ->op->emitError(
+              "expected analog, reduction, and digital shard tasks to use "
+              "separate islands");
       return mlir::failure();
     }
     if (foundReductionTask) {
@@ -347,9 +423,19 @@ assembleLogicalPlacementIslandGraph(
           return mlir::failure();
         }
       }
+    } else if (foundDigitalShardTask) {
+      island.kind = task_graph::LogicalPlacementIslandKind::DigitalShard;
+      for (const TaskGraphNode *node : nodesByIsland.lookup(islandIndex)) {
+        if (!task_graph::isDigitalTask(node->op)) {
+          node->op->emitError(
+              "expected digital shard islands to contain only digital tasks");
+          return mlir::failure();
+        }
+      }
     } else if (!island.matrixSetupTaskIndex) {
       dag.nodes[nodesByIsland.lookup(islandIndex).front()->index].op->emitError(
-          "expected logical island to have an analog or reduction anchor");
+          "expected logical island to have an analog, reduction, or digital "
+          "shard anchor");
       return mlir::failure();
     }
 
@@ -406,6 +492,8 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
                                   islandByTaskIndex);
   if (failed(recordInitialReductionIslands(dag, islandByTaskIndex)))
     return failure();
+  if (failed(recordInitialDigitalShardIslands(dag, islandByTaskIndex)))
+    return failure();
   if (failed(assignPrePlacementMinCutDigitalIslands(dag, islandByTaskIndex)))
     return failure();
 
@@ -417,10 +505,9 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
                                                           islandByTaskIndex)))
     return failure();
 
-  assignExecutionEndpointIslands(executionGraph, matrixSetupTasks,
-                                 islandByTaskIndex);
-  if (failed(assignUncoveredDigitalTasksToNearestAnalogIsland(
-          dag, executionGraph, matrixSetupTasks, islandByTaskIndex)))
+  assignExecutionEndpointIslands(executionGraph, islandByTaskIndex);
+  if (failed(assignUncoveredDigitalTasksToNearestIsland(dag, executionGraph,
+                                                        islandByTaskIndex)))
     return failure();
 
   llvm::SmallVector<IslandAffinityEdge, 16> affinityEdges =
@@ -454,7 +541,11 @@ loadLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
     auto islandId =
         node.op->getAttrOfType<IntegerAttr>(schedule_attrs::kIslandIdAttrName);
     if (!islandId) {
-      if (isMatrixSetupTask(node.op)) {
+      auto distribution = node.op->getAttrOfType<TaskDistributionAttr>(
+          task_graph_attrs::kTaskDistributionAttrName);
+      if (isMatrixSetupTask(node.op) ||
+          (distribution &&
+           distribution.getRole() == TaskDistributionRole::Shard)) {
         node.op->emitError("expected logical island ID; run "
                            "--sculptor-build-task-graph-islands before "
                            "--sculptor-schedule-task-graph");

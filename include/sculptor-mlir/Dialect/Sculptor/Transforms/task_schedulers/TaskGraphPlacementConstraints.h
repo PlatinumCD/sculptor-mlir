@@ -7,6 +7,9 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "llvm/ADT/SmallVector.h"
+
+#include <cstdint>
 #include <optional>
 
 namespace mlir {
@@ -24,8 +27,18 @@ struct SharedMeshBoundaryConstraint {
   std::optional<IslandBoundaryEndpoints> islands;
 };
 
+struct DistributedShardPlacementConstraint {
+  int64_t groupId = -1;
+  int64_t shardCount = 0;
+  DistributionPlacementPolicy policy =
+      DistributionPlacementPolicy::Unconstrained;
+  llvm::SmallVector<unsigned, 8> islandsByShard;
+};
+
 struct PlacementConstraints {
   std::optional<SharedMeshBoundaryConstraint> sharedEndpointBoundary;
+  llvm::SmallVector<DistributedShardPlacementConstraint, 4>
+      distributedShardGroups;
 };
 
 FailureOr<PlacementConstraints> buildPlacementConstraints(

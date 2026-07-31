@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphVis.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
@@ -69,6 +70,16 @@ struct TaskModel {
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
   std::optional<int64_t> reductionWidth;
+  std::optional<int64_t> distributionGroupId;
+  std::optional<std::string> distributionRole;
+  std::optional<int64_t> distributionShardId;
+  std::optional<int64_t> distributionShardCount;
+  std::optional<int64_t> distributionRowShard;
+  std::optional<int64_t> distributionRowShards;
+  std::optional<int64_t> distributionColumnShard;
+  std::optional<int64_t> distributionColumnShards;
+  std::optional<std::string> distributionStrategy;
+  std::optional<std::string> distributionPlacement;
   int64_t analogOps = 0;
   llvm::SmallVector<int64_t> inputResourceIds;
   llvm::SmallVector<int64_t> outputResourceIds;
@@ -405,6 +416,28 @@ mlir::LogicalResult collectTasks(mlir::ModuleOp module, GraphModel &graph) {
         taskOp, task_graph_attrs::kTaskReductionLaneAttrName);
     task.reductionWidth = getOptionalI64Attr(
         taskOp, task_graph_attrs::kTaskReductionWidthAttrName);
+    if (auto distribution =
+            taskOp->getAttrOfType<mlir::sculptor::TaskDistributionAttr>(
+                task_graph_attrs::kTaskDistributionAttrName)) {
+      task.distributionGroupId = distribution.getGroupId().getInt();
+      task.distributionRole =
+          mlir::sculptor::stringifyTaskDistributionRole(distribution.getRole())
+              .str();
+      task.distributionShardId = distribution.getShardId().getInt();
+      task.distributionShardCount = distribution.getShardCount().getInt();
+      task.distributionRowShard = distribution.getRowShard().getInt();
+      task.distributionRowShards = distribution.getRowShards().getInt();
+      task.distributionColumnShard = distribution.getColumnShard().getInt();
+      task.distributionColumnShards = distribution.getColumnShards().getInt();
+      task.distributionStrategy =
+          mlir::sculptor::stringifyMatmulDistributionStrategy(
+              distribution.getStrategy())
+              .str();
+      task.distributionPlacement =
+          mlir::sculptor::stringifyDistributionPlacementPolicy(
+              distribution.getPlacement())
+              .str();
+    }
     if (task.physicalArrayId && graph.arraysPerCore)
       task.localArrayId = *task.physicalArrayId % *graph.arraysPerCore;
     task.analogOps = countSculptorOps(module, taskOp);
@@ -607,6 +640,24 @@ void emitGraphMLNode(llvm::raw_ostream &os, const TaskModel &task) {
   emitGraphMLI64Data(os, "reduction_level", task.reductionLevel);
   emitGraphMLI64Data(os, "reduction_lane", task.reductionLane);
   emitGraphMLI64Data(os, "reduction_width", task.reductionWidth);
+  emitGraphMLI64Data(os, "distribution_group_id", task.distributionGroupId);
+  if (task.distributionRole)
+    emitGraphMLStringData(os, "distribution_role", *task.distributionRole);
+  emitGraphMLI64Data(os, "distribution_shard_id", task.distributionShardId);
+  emitGraphMLI64Data(os, "distribution_shard_count",
+                     task.distributionShardCount);
+  emitGraphMLI64Data(os, "distribution_row_shard", task.distributionRowShard);
+  emitGraphMLI64Data(os, "distribution_row_shards", task.distributionRowShards);
+  emitGraphMLI64Data(os, "distribution_column_shard",
+                     task.distributionColumnShard);
+  emitGraphMLI64Data(os, "distribution_column_shards",
+                     task.distributionColumnShards);
+  if (task.distributionStrategy)
+    emitGraphMLStringData(os, "distribution_strategy",
+                          *task.distributionStrategy);
+  if (task.distributionPlacement)
+    emitGraphMLStringData(os, "distribution_placement",
+                          *task.distributionPlacement);
   os << "    </node>\n";
 }
 
@@ -722,6 +773,26 @@ void emitGraphML(llvm::raw_ostream &os, llvm::ArrayRef<GraphModel> graphs) {
   emitGraphMLKey(os, "reduction_level", "node", "reduction_level", "long");
   emitGraphMLKey(os, "reduction_lane", "node", "reduction_lane", "long");
   emitGraphMLKey(os, "reduction_width", "node", "reduction_width", "long");
+  emitGraphMLKey(os, "distribution_group_id", "node", "distribution_group_id",
+                 "long");
+  emitGraphMLKey(os, "distribution_role", "node", "distribution_role",
+                 "string");
+  emitGraphMLKey(os, "distribution_shard_id", "node", "distribution_shard_id",
+                 "long");
+  emitGraphMLKey(os, "distribution_shard_count", "node",
+                 "distribution_shard_count", "long");
+  emitGraphMLKey(os, "distribution_row_shard", "node", "distribution_row_shard",
+                 "long");
+  emitGraphMLKey(os, "distribution_row_shards", "node",
+                 "distribution_row_shards", "long");
+  emitGraphMLKey(os, "distribution_column_shard", "node",
+                 "distribution_column_shard", "long");
+  emitGraphMLKey(os, "distribution_column_shards", "node",
+                 "distribution_column_shards", "long");
+  emitGraphMLKey(os, "distribution_strategy", "node", "distribution_strategy",
+                 "string");
+  emitGraphMLKey(os, "distribution_placement", "node", "distribution_placement",
+                 "string");
 
   emitGraphMLKey(os, "placement_cost_mode", "graph", "placement_cost_mode",
                  "string");

@@ -10,6 +10,7 @@ add_mlir_library(MLIRSculptorTransforms
   BuildTaskGraphIslands.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
+  DistributeDigitalMatmul.cpp
   ExportTaskGraphIslandMap.cpp
   ExportTaskGraphSimModel.cpp
   ExportTaskGraphVis.cpp
@@ -30,8 +31,10 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphIslandBuilder.cpp
   task_graph/TaskGraphIslandCommunication.cpp
   task_graph/TaskGraphIslandDigitalAssignment.cpp
+  task_graph/TaskGraphMatmulDistributor.cpp
   task_schedulers/TaskGraphPlacementUtils.cpp
   task_schedulers/TaskGraphPlacementPlan.cpp
+  task_schedulers/TaskGraphDigitalShardPlacement.cpp
   task_schedulers/TaskGraphReductionPlacement.cpp
   task_schedulers/TaskGraphPlacementConstraints.cpp
   task_schedulers/TaskGraphHardwareConfig.cpp

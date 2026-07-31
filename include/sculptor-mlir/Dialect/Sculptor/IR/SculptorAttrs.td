@@ -41,6 +41,84 @@ def Sculptor_TaskReductionAttr
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+def Sculptor_MatmulDistributionStrategyOutputColumns
+    : I32EnumAttrCase<"OutputColumns", 0, "output_columns">;
+def Sculptor_MatmulDistributionStrategyOutputRows
+    : I32EnumAttrCase<"OutputRows", 1, "output_rows">;
+def Sculptor_MatmulDistributionStrategyTwoDimensional
+    : I32EnumAttrCase<"TwoDimensional", 2, "two_dimensional">;
+def Sculptor_MatmulDistributionStrategyAttentionHeads
+    : I32EnumAttrCase<"AttentionHeads", 3, "attention_heads">;
+
+def Sculptor_MatmulDistributionStrategy
+    : I32EnumAttr<"MatmulDistributionStrategy",
+                  "Digital matmul distribution strategy", [
+        Sculptor_MatmulDistributionStrategyOutputColumns,
+        Sculptor_MatmulDistributionStrategyOutputRows,
+        Sculptor_MatmulDistributionStrategyTwoDimensional,
+        Sculptor_MatmulDistributionStrategyAttentionHeads
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_DistributionPlacementPolicyUnconstrained
+    : I32EnumAttrCase<"Unconstrained", 0, "unconstrained">;
+def Sculptor_DistributionPlacementPolicyPreferDistinct
+    : I32EnumAttrCase<"PreferDistinct", 1, "prefer_distinct">;
+def Sculptor_DistributionPlacementPolicyRequireDistinct
+    : I32EnumAttrCase<"RequireDistinct", 2, "require_distinct">;
+
+def Sculptor_DistributionPlacementPolicy
+    : I32EnumAttr<"DistributionPlacementPolicy",
+                  "Placement policy for a distributed task group", [
+        Sculptor_DistributionPlacementPolicyUnconstrained,
+        Sculptor_DistributionPlacementPolicyPreferDistinct,
+        Sculptor_DistributionPlacementPolicyRequireDistinct
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_TaskDistributionRolePartition
+    : I32EnumAttrCase<"Partition", 0, "partition">;
+def Sculptor_TaskDistributionRoleShard
+    : I32EnumAttrCase<"Shard", 1, "shard">;
+def Sculptor_TaskDistributionRoleAssembly
+    : I32EnumAttrCase<"Assembly", 2, "assembly">;
+
+def Sculptor_TaskDistributionRole
+    : I32EnumAttr<"TaskDistributionRole",
+                  "Role of a task in a distributed operation", [
+        Sculptor_TaskDistributionRolePartition,
+        Sculptor_TaskDistributionRoleShard,
+        Sculptor_TaskDistributionRoleAssembly
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_TaskDistributionAttr
+    : Sculptor_Attr<"TaskDistribution", "task_distribution"> {
+  let summary = "digital task distribution metadata";
+  let description = [{
+    Identifies the tasks introduced when one digital operation is partitioned
+    into independently placeable shards. The group and shard coordinates are
+    stable logical identities; physical core assignment remains a scheduler
+    decision.
+  }];
+  let parameters = (ins
+    "IntegerAttr":$groupId,
+    EnumParameter<Sculptor_TaskDistributionRole>:$role,
+    "IntegerAttr":$shardId,
+    "IntegerAttr":$shardCount,
+    "IntegerAttr":$rowShard,
+    "IntegerAttr":$rowShards,
+    "IntegerAttr":$columnShard,
+    "IntegerAttr":$columnShards,
+    EnumParameter<Sculptor_MatmulDistributionStrategy>:$strategy,
+    EnumParameter<Sculptor_DistributionPlacementPolicy>:$placement
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
 def Sculptor_TimingModelAttr
     : Sculptor_Attr<"TimingModel", "timing_model"> {
   let summary = "hardware timing model used for task graph analysis";

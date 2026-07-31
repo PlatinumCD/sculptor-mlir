@@ -28,6 +28,16 @@ inline constexpr llvm::StringLiteral kReductionTaskKind("digital.reduction");
 inline constexpr llvm::StringLiteral
     kStreamingConvolutionTaskKind("mixed.streaming_conv_mvm");
 inline constexpr llvm::StringLiteral kDigitalMatmulTaskKind("digital.matmul");
+inline constexpr llvm::StringLiteral
+    kDigitalMatmulPartitionTaskKind("digital.matmul_partition");
+inline constexpr llvm::StringLiteral
+    kDigitalMatmulShardTaskKind("digital.matmul_shard");
+inline constexpr llvm::StringLiteral
+    kDigitalMatmulAssemblyTaskKind("digital.matmul_assembly");
+inline constexpr llvm::StringLiteral
+    kDigitalAttentionScoresTaskKind("digital.attention_scores");
+inline constexpr llvm::StringLiteral
+    kDigitalAttentionApplyTaskKind("digital.attention_apply");
 
 inline constexpr llvm::StringLiteral kForwardSourceLayer("forward");
 

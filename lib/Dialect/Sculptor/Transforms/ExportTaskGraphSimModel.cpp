@@ -190,6 +190,16 @@ struct TaskModel {
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
   std::optional<int64_t> reductionWidth;
+  std::optional<int64_t> distributionGroupId;
+  std::optional<std::string> distributionRole;
+  std::optional<int64_t> distributionShardId;
+  std::optional<int64_t> distributionShardCount;
+  std::optional<int64_t> distributionRowShard;
+  std::optional<int64_t> distributionRowShards;
+  std::optional<int64_t> distributionColumnShard;
+  std::optional<int64_t> distributionColumnShards;
+  std::optional<std::string> distributionStrategy;
+  std::optional<std::string> distributionPlacement;
   std::optional<int64_t> physicalArrayId;
   std::optional<int64_t> localArrayId;
   TaskTimingModel timing;
@@ -788,6 +798,28 @@ mlir::FailureOr<llvm::SmallVector<TaskModel, 0>> collectTasks(
         taskOp, task_graph_attrs::kTaskReductionLaneAttrName);
     task.reductionWidth = getOptionalI64Attr(
         taskOp, task_graph_attrs::kTaskReductionWidthAttrName);
+    if (auto distribution =
+            taskOp->getAttrOfType<mlir::sculptor::TaskDistributionAttr>(
+                task_graph_attrs::kTaskDistributionAttrName)) {
+      task.distributionGroupId = distribution.getGroupId().getInt();
+      task.distributionRole =
+          mlir::sculptor::stringifyTaskDistributionRole(distribution.getRole())
+              .str();
+      task.distributionShardId = distribution.getShardId().getInt();
+      task.distributionShardCount = distribution.getShardCount().getInt();
+      task.distributionRowShard = distribution.getRowShard().getInt();
+      task.distributionRowShards = distribution.getRowShards().getInt();
+      task.distributionColumnShard = distribution.getColumnShard().getInt();
+      task.distributionColumnShards = distribution.getColumnShards().getInt();
+      task.distributionStrategy =
+          mlir::sculptor::stringifyMatmulDistributionStrategy(
+              distribution.getStrategy())
+              .str();
+      task.distributionPlacement =
+          mlir::sculptor::stringifyDistributionPlacementPolicy(
+              distribution.getPlacement())
+              .str();
+    }
     task.timing.topologicalIndex =
         getOptionalI64Attr(taskOp, timing_attrs::kTopologicalIndexAttrName);
     task.timing.localRuntimeIndex =
@@ -1263,6 +1295,26 @@ void emitTasks(llvm::json::OStream &json, llvm::ArrayRef<TaskModel> tasks) {
         emitOptionalI64Attr(json, "reduction_level", task.reductionLevel);
         emitOptionalI64Attr(json, "reduction_lane", task.reductionLane);
         emitOptionalI64Attr(json, "reduction_width", task.reductionWidth);
+        emitOptionalI64Attr(json, "distribution_group_id",
+                            task.distributionGroupId);
+        emitOptionalStringAttr(json, "distribution_role",
+                               task.distributionRole);
+        emitOptionalI64Attr(json, "distribution_shard_id",
+                            task.distributionShardId);
+        emitOptionalI64Attr(json, "distribution_shard_count",
+                            task.distributionShardCount);
+        emitOptionalI64Attr(json, "distribution_row_shard",
+                            task.distributionRowShard);
+        emitOptionalI64Attr(json, "distribution_row_shards",
+                            task.distributionRowShards);
+        emitOptionalI64Attr(json, "distribution_column_shard",
+                            task.distributionColumnShard);
+        emitOptionalI64Attr(json, "distribution_column_shards",
+                            task.distributionColumnShards);
+        emitOptionalStringAttr(json, "distribution_strategy",
+                               task.distributionStrategy);
+        emitOptionalStringAttr(json, "distribution_placement",
+                               task.distributionPlacement);
         emitOptionalI64Attr(json, "physical_array_id", task.physicalArrayId);
         emitOptionalI64Attr(json, "local_array_id", task.localArrayId);
         json.attribute("digital_ops", task.digitalOps);

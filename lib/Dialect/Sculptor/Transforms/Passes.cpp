@@ -5,6 +5,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/DistributeDigitalMatmul.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphIslandMap.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphSimModel.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphVis.h"
@@ -30,6 +31,7 @@ void registerSculptorPasses() {
   registerBuildTaskGraphIslandsPass();
   registerCanonicalizeLayersPass();
   registerConvertLayersPass();
+  registerDistributeDigitalMatmulPass();
   registerExportTaskGraphIslandMapPass();
   registerExportTaskGraphSimModelPass();
   registerExportTaskGraphVisPass();

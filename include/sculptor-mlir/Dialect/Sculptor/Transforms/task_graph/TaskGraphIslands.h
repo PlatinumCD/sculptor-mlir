@@ -1,6 +1,7 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHISLANDS_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_TASK_GRAPH_TASKGRAPHISLANDS_H
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphExecutionGraph.h"
 
@@ -20,6 +21,7 @@ namespace task_graph {
 enum class LogicalPlacementIslandKind {
   Analog,
   Reduction,
+  DigitalShard,
 };
 
 struct LogicalPlacementIsland {
@@ -30,6 +32,10 @@ struct LogicalPlacementIsland {
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionLane;
   std::optional<int64_t> reductionWidth;
+  std::optional<int64_t> distributionGroupId;
+  std::optional<int64_t> distributionShardId;
+  std::optional<int64_t> distributionShardCount;
+  std::optional<DistributionPlacementPolicy> distributionPlacement;
   llvm::SmallVector<unsigned, 4> mvmTaskIndices;
   llvm::SmallVector<unsigned, 16> digitalTaskIndices;
   llvm::SmallVector<unsigned, 16> taskIndices;
@@ -41,6 +47,10 @@ inline bool isAnalogIsland(const LogicalPlacementIsland &island) {
 
 inline bool isReductionIsland(const LogicalPlacementIsland &island) {
   return island.kind == LogicalPlacementIslandKind::Reduction;
+}
+
+inline bool isDigitalShardIsland(const LogicalPlacementIsland &island) {
+  return island.kind == LogicalPlacementIslandKind::DigitalShard;
 }
 
 inline bool isReductionLaneIsland(const LogicalPlacementIsland &island) {

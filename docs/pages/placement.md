@@ -210,6 +210,74 @@ cost timing -> schedule -> select execution backend -> actual timing
             -> optimize/fuse -> post-fusion timing
 ```
 
+### Distributed digital matmuls
+
+`sculptor-distribute-digital-matmul` runs on the assembled graph before island
+construction. It is intended for digital matmuls that cannot use the analog
+MVM path and should expose parallel work to placement rather than remain one
+large digital task.
+
+The pass accepts pure, statically shaped rank-2 `f32` `linalg.matmul` and
+`linalg.matmul_transpose_b` task bodies. It can split output rows, output
+columns, or both dimensions. It does not split the reduction dimension.
+
+It also accepts the typed `digital.attention_scores` and
+`digital.attention_apply` tasks produced by the transformer converter. Those
+tasks use the `attention-heads` strategy: query/key or probability/value
+operands are partitioned into contiguous head ranges, each shard computes its
+own heads, and assembly restores the original head order. Score shards preserve
+the causal-mask contract. Attention tasks require static `f32` shapes and
+explicit `head_dim` metadata; score tasks also require explicit `causal`
+metadata.
+
+Unsupported task bodies are left unchanged. Missing required metadata, dynamic
+shapes on otherwise eligible tasks, inconsistent geometry, and checked
+arithmetic overflow are compilation errors.
+
+The rewrite creates:
+
+```text
+operand partition task(s)
+        -> independent matmul shard tasks
+        -> deterministic output assembly task
+```
+
+Each shard anchors one logical digital island. The shared placement layer,
+rather than individual schedulers, applies its typed policy:
+
+| Policy | Meaning |
+|---|---|
+| `unconstrained` | Communication and existing core work determine placement; shard co-location is allowed. |
+| `prefer-distinct` | Reusing a core within the group adds a deterministic penalty but remains legal. |
+| `require-distinct` | Every shard in the group must use a different core; insufficient cores are a compilation error. |
+
+Distributed partition, shard, and assembly tasks are explicit generic-fusion
+boundaries. Their independent placement and timing identities therefore remain
+visible after `sculptor-fuse-task-graph`.
+
+The standalone interface is:
+
+```bash
+sculptor-mlir-opt graph.mlir \
+  --sculptor-distribute-digital-matmul="\
+strategy=auto max-shards=8 min-ops-per-shard=65536 \
+placement-policy=prefer-distinct"
+```
+
+`min-ops-per-shard` applies to every proposed shard. Its default is `65536`;
+short-sequence transformer tests therefore need a lower value when head
+distribution is intentionally being exercised, for example:
+
+```bash
+--sculptor-distribute-digital-matmul="\
+strategy=attention-heads max-shards=8 min-ops-per-shard=1 \
+placement-policy=require-distinct"
+```
+
+The composite `sculptor-lower-golem-to-task-graph` pipeline exposes the same
+behavior through `distribute-digital-matmuls=true` and the
+`digital-matmul-*` options. It remains disabled by default.
+
 `sculptor-schedule-task-graph` consumes those islands and owns physical
 placement and placement metadata:
 
@@ -344,7 +412,7 @@ The scheduler sees the graph as `TaskGraphDAG`:
 | `logicalArrayResources` | Task graph resources whose payload type is `!sculptor.logical.array`. |
 | `dependencyCount` | Number of explicit task dependencies. |
 
-The main placement unit is a logical island. There are two island kinds.
+The main placement unit is a logical island. There are three island kinds.
 
 An analog island starts from one matrix setup group: a
 `sculptor.matrix_setup` task and the direct `sculptor.mvm` tasks that consume
@@ -366,16 +434,24 @@ A reduction island is digital-only. First-stage tasks are grouped by
 This lets the scheduler place the final combination independently from every
 lane. Ordinary digital tasks are not absorbed into reduction islands.
 
+A digital-shard island is also digital-only. Each distributed rank-2 or
+attention shard anchors one island and carries its distribution group, shard
+ID/count, strategy, and placement policy. Its local partition or assembly work
+may be absorbed into a compatible shard island, but two shard anchors are never
+merged.
+
 Every strategy returns the same `IslandPlacementPlan`: one placement record per
 logical island, in island order. Every record has a core ID; only an analog
 island also has a physical-array ID. The shared commit helper validates and
-materializes that plan in four steps:
+materializes that plan in five steps:
 
 1. Attach analog placement to the matrix setup and its associated MVM tasks.
 2. Attach core-only placement to generated reduction tasks.
-3. Place unambiguous same-source-layer core-only tasks on their analog island's
+3. Place digital-shard islands using their group policy and byte-weighted
+   affinity to already placed islands.
+4. Place unambiguous same-source-layer core-only tasks on their analog island's
    core.
-4. Place any remaining core-only tasks from already placed graph neighbors.
+5. Place any remaining core-only tasks from already placed graph neighbors.
 
 The neighbor fallback is deterministic:
 

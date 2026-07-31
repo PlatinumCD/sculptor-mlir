@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphPlacementPlan.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphDigitalShardPlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_schedulers/TaskGraphReductionPlacement.h"
 
 #include "llvm/ADT/DenseSet.h"
@@ -35,6 +36,8 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
   llvm::DenseMap<int64_t, llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>
       laneCoresByTree;
   llvm::DenseMap<int64_t, unsigned> rootCountByTree;
+  llvm::DenseMap<int64_t, llvm::SmallVector<std::pair<int64_t, int64_t>, 8>>
+      shardCoresByGroup;
   for (auto indexedIsland : llvm::enumerate(problem.islandGraph.islands)) {
     const auto &island = indexedIsland.value();
     const LogicalIslandPlacement &placement =
@@ -63,6 +66,21 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
             << " to belong to its assigned core and hardware budget";
         return failure();
       }
+      continue;
+    }
+
+    if (task_graph::isDigitalShardIsland(island)) {
+      if (placement.physicalArrayId || !island.distributionGroupId ||
+          !island.distributionShardId || !island.distributionShardCount ||
+          !island.distributionPlacement) {
+        emitPlacementError(problem)
+            << "expected digital shard island " << island.islandIndex
+            << " to own a core, no analog array, and complete distribution "
+               "metadata";
+        return failure();
+      }
+      shardCoresByGroup[*island.distributionGroupId].push_back(
+          {*island.distributionShardId, placement.coreId});
       continue;
     }
 
@@ -115,6 +133,36 @@ LogicalResult validatePlacementPlan(const TaskGraphPlacementProblem &problem,
           << "expected reduction tree " << entry.first
           << " to contain one independently placed root";
       return failure();
+    }
+  }
+
+  for (const DistributedShardPlacementConstraint &group :
+       problem.constraints.distributedShardGroups) {
+    auto placements = shardCoresByGroup.find(group.groupId);
+    if (placements == shardCoresByGroup.end() ||
+        static_cast<int64_t>(placements->second.size()) != group.shardCount) {
+      emitPlacementError(problem)
+          << "expected one placement for every shard in digital distribution "
+             "group "
+          << group.groupId;
+      return failure();
+    }
+    llvm::DenseSet<int64_t> seenShardIds;
+    llvm::DenseSet<int64_t> seenCores;
+    for (const auto &[shardId, coreId] : placements->second) {
+      if (!seenShardIds.insert(shardId).second) {
+        emitPlacementError(problem)
+            << "expected unique shard IDs in digital distribution group "
+            << group.groupId;
+        return failure();
+      }
+      if (group.policy == DistributionPlacementPolicy::RequireDistinct &&
+          !seenCores.insert(coreId).second) {
+        emitPlacementError(problem)
+            << "expected digital distribution group " << group.groupId
+            << " to use distinct cores";
+        return failure();
+      }
     }
   }
 
@@ -191,6 +239,13 @@ FailureOr<IslandPlacementPlan> buildPlacementPlanFromAnalogPlacements(
       buildSpatialReductionCorePlacements(problem, coreByAnalogIsland);
   if (failed(reductionCoreByIsland))
     return failure();
+  llvm::DenseMap<unsigned, int64_t> initialCoreByIsland = coreByAnalogIsland;
+  for (const auto &entry : *reductionCoreByIsland)
+    initialCoreByIsland[entry.first] = entry.second;
+  auto digitalShardCoreByIsland =
+      buildDigitalShardCorePlacements(problem, initialCoreByIsland);
+  if (failed(digitalShardCoreByIsland))
+    return failure();
 
   IslandPlacementPlan plan;
   plan.placements.reserve(problem.islandGraph.islands.size());
@@ -200,6 +255,19 @@ FailureOr<IslandPlacementPlan> buildPlacementPlanFromAnalogPlacements(
       if (core == reductionCoreByIsland->end()) {
         emitPlacementError(problem)
             << "expected a core for reduction island " << island.islandIndex;
+        return failure();
+      }
+      plan.placements.push_back(
+          LogicalIslandPlacement{core->second, std::nullopt});
+      continue;
+    }
+
+    if (task_graph::isDigitalShardIsland(island)) {
+      auto core = digitalShardCoreByIsland->find(island.islandIndex);
+      if (core == digitalShardCoreByIsland->end()) {
+        emitPlacementError(problem)
+            << "expected a core for digital shard island "
+            << island.islandIndex;
         return failure();
       }
       plan.placements.push_back(

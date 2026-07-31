@@ -58,8 +58,8 @@ struct FullDeploymentTimingObjective {
   int64_t totalWordHops = 0;
 };
 
-// Indexed by LogicalPlacementIslandGraph::islands. Analog islands own an array;
-// digital-only reduction islands own a core but no analog array.
+// Indexed by LogicalPlacementIslandGraph::islands. Analog islands own an
+// array; reduction and distributed-digital islands own a core only.
 struct IslandPlacementPlan {
   llvm::SmallVector<LogicalIslandPlacement, 16> placements;
   std::optional<SearchProxyObjective> searchProxyObjective;

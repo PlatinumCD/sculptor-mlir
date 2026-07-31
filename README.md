@@ -60,6 +60,7 @@ The compiler is staged around explicit IR boundaries:
 | Expand MVMs | `sculptor.mvm` -> matrix/vector/logical-array operations | `sculptor-expand-mvm-to-golem` |
 | Materialize tasks | task regions -> callable task-stage functions | `sculptor-materialize-tasks` |
 | Assemble graph | outlined work and resources -> symbolic task graph | `sculptor-assemble-task-graph` |
+| Optional digital matmul distribution | eligible static digital matmuls -> partition, shard, and assembly tasks | `sculptor-distribute-digital-matmul` |
 | Build islands | symbolic tasks -> stable logical placement islands | `sculptor-build-task-graph-islands` |
 | Analyze timing | logical islands -> backend-costed task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
 | Schedule graph | island-annotated tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
@@ -78,6 +79,14 @@ how MVM work is costed before scheduling without changing graph topology.
 After scheduling, leaving MVM tasks unchanged selects analog execution, while
 `sculptor-lower-scheduled-mvm-to-digital` selects the matched-topology digital
 baseline and preserves the chosen placement.
+
+`sculptor-distribute-digital-matmul` addresses a different case: a digital
+matmul that is already present in the assembled graph. It runs before island
+construction, divides eligible static rank-2 `f32` matmuls or typed transformer
+attention contractions into independently placeable shards, and records typed
+distribution metadata. Rank-2 tasks can shard output rows, output columns, or
+both; attention score/apply tasks shard by head. The pass is opt-in and does not
+change analog MVM expansion or the matched-topology digital baseline.
 
 ## Repository Layout
 

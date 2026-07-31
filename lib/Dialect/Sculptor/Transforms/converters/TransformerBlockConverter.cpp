@@ -1339,6 +1339,7 @@ buildAttentionApplyRegion(TransformerBlockLowering &match,
   auto region = builder.create<mlir::sculptor::TaskRegionOp>(
       loc, mlir::TypeRange{headTy}, mlir::ValueRange{probabilities, value},
       "digital.attention_apply", builder.getStringAttr(name));
+  region->setAttr("head_dim", builder.getI64IntegerAttr(match.headDim));
   mlir::Block *body =
       addTaskRegionBody(region, mlir::ValueRange{probabilities, value});
 

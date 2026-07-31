@@ -2,6 +2,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResources.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
@@ -31,6 +32,7 @@ namespace {
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace schedule_attrs = mlir::sculptor::schedule_attrs;
 namespace task_attrs = mlir::sculptor::task_attrs;
+namespace task_graph_attrs = mlir::sculptor::task_graph_attrs;
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 
 static constexpr llvm::StringLiteral kFusedMixedTaskDomain("digital");
@@ -166,10 +168,13 @@ static bool isComponentFusibleTask(mlir::sculptor::TaskCreateOp taskOp) {
   // Matrix setup produces logical-array resources used by schedule metadata.
   // Reduction tasks also remain explicit because their tree/branch metadata is
   // a placement contract used to reload digital-only islands after fusion.
+  // Distributed tasks likewise retain partition/shard/assembly identities so
+  // their logical islands and placement constraints remain reconstructible.
   return !isMatrixSetupTask(taskOp) &&
          taskOp.getTaskKind() != task_graph_names::kReductionTaskKind &&
          taskOp.getTaskKind() !=
              task_graph_names::kStreamingConvolutionTaskKind &&
+         !taskOp->hasAttr(task_graph_attrs::kTaskDistributionAttrName) &&
          getOptionalScheduledCore(taskOp) &&
          getOptionalI64Attr(taskOp, schedule_attrs::kIslandIdAttrName);
 }

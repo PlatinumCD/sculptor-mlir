@@ -9,6 +9,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphOptimizationAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskMetadata.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
@@ -44,6 +45,7 @@ constexpr llvm::StringLiteral kForwardFunctionName = "forward";
 
 namespace task_graph_names = mlir::sculptor::task_graph_names;
 namespace task_metadata = mlir::sculptor::task_metadata;
+namespace task_attrs = mlir::sculptor::task_attrs;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
 namespace optimization_attrs = mlir::sculptor::optimization_attrs;
 namespace tiling_attrs = mlir::sculptor::tiling_attrs;
@@ -338,7 +340,9 @@ emitTaskFunctionDeclaration(mlir::ModuleOp module,
         tiling_attrs::kVectorTileAttrName,
         tiling_attrs::kVectorTileGridAttrName,
         tiling_attrs::kVectorTilePhysicalColsAttrName,
-        tiling_attrs::kVectorTileValidColsAttrName}) {
+        tiling_attrs::kVectorTileValidColsAttrName,
+        task_attrs::kAttentionHeadDimAttrName,
+        task_attrs::kAttentionCausalAttrName}) {
     if (mlir::Attribute attr = region->getAttr(attrName))
       taskFunc->setAttr(attrName, attr);
   }

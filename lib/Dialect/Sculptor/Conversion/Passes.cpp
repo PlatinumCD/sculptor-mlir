@@ -9,6 +9,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/DistributeDigitalMatmul.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
@@ -42,6 +43,38 @@ struct SculptorLowerToGolemPipelineOptions
 
 struct SculptorLowerGolemToTaskGraphPipelineOptions
     : public PassPipelineOptions<SculptorLowerGolemToTaskGraphPipelineOptions> {
+  PassOptions::Option<bool> distributeDigitalMatmuls{
+      *this, "distribute-digital-matmuls",
+      llvm::cl::desc("Distribute eligible static digital matmuls and "
+                     "attention contractions before building logical "
+                     "placement islands"),
+      llvm::cl::init(false)};
+
+  PassOptions::Option<int64_t> digitalMatmulMaxShards{
+      *this, "digital-matmul-max-shards",
+      llvm::cl::desc("Maximum number of shards for a distributed digital "
+                     "matmul"),
+      llvm::cl::init(8)};
+
+  PassOptions::Option<int64_t> digitalMatmulMinOpsPerShard{
+      *this, "digital-matmul-min-ops-per-shard",
+      llvm::cl::desc("Minimum scalar matmul operations in every distributed "
+                     "digital shard"),
+      llvm::cl::init(65536)};
+
+  PassOptions::Option<std::string> digitalMatmulStrategy{
+      *this, "digital-matmul-strategy",
+      llvm::cl::desc("Digital matmul distribution strategy: auto, "
+                     "output-columns, output-rows, two-dimensional, or "
+                     "attention-heads"),
+      llvm::cl::init("auto")};
+
+  PassOptions::Option<std::string> digitalMatmulPlacementPolicy{
+      *this, "digital-matmul-placement-policy",
+      llvm::cl::desc("Digital matmul shard placement policy: unconstrained, "
+                     "prefer-distinct, or require-distinct"),
+      llvm::cl::init("prefer-distinct")};
+
   PassOptions::Option<bool> balanceTaskGraphReductions{
       *this, "balance-task-graph-reductions",
       llvm::cl::desc(
@@ -235,6 +268,14 @@ void buildSculptorLowerGolemToTaskGraphPipeline(
     OpPassManager &pm,
     const SculptorLowerGolemToTaskGraphPipelineOptions &options) {
   pm.addPass(std::make_unique<AssembleTaskGraphPass>());
+  if (options.distributeDigitalMatmuls) {
+    auto pass = std::make_unique<DistributeDigitalMatmulPass>();
+    pass->maxShards = options.digitalMatmulMaxShards;
+    pass->minOpsPerShard = options.digitalMatmulMinOpsPerShard;
+    pass->strategy = options.digitalMatmulStrategy;
+    pass->placementPolicy = options.digitalMatmulPlacementPolicy;
+    pm.addPass(std::move(pass));
+  }
   if (options.balanceTaskGraphReductions) {
     auto pass = std::make_unique<BalanceTaskGraphReductionsPass>();
     pass->reductionWidth = options.reductionWidth;

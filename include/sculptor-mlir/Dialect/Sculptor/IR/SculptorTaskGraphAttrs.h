@@ -19,6 +19,8 @@ inline constexpr llvm::StringLiteral
     kTaskReductionLaneAttrName("sculptor.task.reduction_lane");
 inline constexpr llvm::StringLiteral
     kTaskReductionWidthAttrName("sculptor.task.reduction_width");
+inline constexpr llvm::StringLiteral
+    kTaskDistributionAttrName("sculptor.task.distribution");
 
 } // namespace task_graph_attrs
 } // namespace sculptor
