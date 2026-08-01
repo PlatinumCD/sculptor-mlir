@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseFusionOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseSlicesOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/SegmentedConcatConsumerOptimizer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/SeparableRegionOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/StreamingConvolutionOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/VectorizedElementwiseOptimizer.h"
 
@@ -15,11 +16,18 @@ namespace task_graph {
 llvm::ArrayRef<TaskGraphOptimizationPattern>
 getTaskGraphOptimizationPatterns() {
   static const TaskGraphOptimizationPattern patterns[] = {
-      {"streaming-convolution", optimizeStreamingConvolution},
-      {"elementwise-slices", optimizeElementwiseSlices},
-      {"elementwise-fusion", optimizeElementwiseFusion},
-      {"segmented-concat-consumer", optimizeSegmentedConcatConsumer},
-      {"vectorized-elementwise", optimizeVectorizedElementwise},
+      {"separable-regions", TaskGraphOptimizationStage::PreSchedule,
+       optimizeSeparableRegions},
+      {"streaming-convolution", TaskGraphOptimizationStage::PostSchedule,
+       optimizeStreamingConvolution},
+      {"elementwise-slices", TaskGraphOptimizationStage::PostSchedule,
+       optimizeElementwiseSlices},
+      {"elementwise-fusion", TaskGraphOptimizationStage::PostSchedule,
+       optimizeElementwiseFusion},
+      {"segmented-concat-consumer", TaskGraphOptimizationStage::PostSchedule,
+       optimizeSegmentedConcatConsumer},
+      {"vectorized-elementwise", TaskGraphOptimizationStage::PostSchedule,
+       optimizeVectorizedElementwise},
   };
   return patterns;
 }

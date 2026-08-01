@@ -30,21 +30,59 @@ static bool returnsTaskGraph(mlir::func::FuncOp func) {
 }
 
 static mlir::LogicalResult
-verifyScheduledAndUnfinalized(mlir::func::FuncOp taskGraphFunc,
-                              const task_graph::TaskGraphDAG &dag) {
+getOptimizationStage(mlir::func::FuncOp taskGraphFunc,
+                     const task_graph::TaskGraphDAG &dag,
+                     task_graph::TaskGraphOptimizationStage &stage) {
+  bool hasScheduledTask = false;
+  bool hasUnscheduledTask = false;
+  for (const task_graph::TaskGraphNode &node : dag.nodes) {
+    mlir::sculptor::TaskCreateOp taskOp = node.op;
+    bool scheduled = static_cast<bool>(taskOp->getAttrOfType<mlir::IntegerAttr>(
+        runtime_attrs::kTaskCoreIdAttrName));
+    hasScheduledTask |= scheduled;
+    hasUnscheduledTask |= !scheduled;
+  }
+  if (hasScheduledTask && hasUnscheduledTask)
+    return taskGraphFunc.emitError(
+        "expected task graph to be entirely scheduled or unscheduled");
+  stage = hasScheduledTask
+              ? task_graph::TaskGraphOptimizationStage::PostSchedule
+              : task_graph::TaskGraphOptimizationStage::PreSchedule;
+  return mlir::success();
+}
+
+static mlir::LogicalResult
+verifyOptimizationStage(mlir::func::FuncOp taskGraphFunc,
+                        task_graph::TaskGraphOptimizationStage graphStage,
+                        llvm::ArrayRef<llvm::StringRef> selectedPatterns) {
   if (taskGraphFunc->hasAttr(runtime_attrs::kTaskGraphResourceCountAttrName)) {
     return taskGraphFunc.emitError(
         "--sculptor-optimize-task-graph must run before "
         "--sculptor-finalize-task-graph-resources");
   }
 
-  for (const task_graph::TaskGraphNode &node : dag.nodes) {
-    mlir::sculptor::TaskCreateOp taskOp = node.op;
-    if (!taskOp->getAttrOfType<mlir::IntegerAttr>(
-            runtime_attrs::kTaskCoreIdAttrName)) {
-      return taskOp.emitError("expected scheduled core placement; run "
-                              "--sculptor-schedule-task-graph before "
-                              "--sculptor-optimize-task-graph");
+  for (llvm::StringRef selected : selectedPatterns) {
+    const task_graph::TaskGraphOptimizationPattern *pattern = nullptr;
+    for (const auto &candidate :
+         task_graph::getTaskGraphOptimizationPatterns()) {
+      if (candidate.name == selected) {
+        pattern = &candidate;
+        break;
+      }
+    }
+    if (!pattern)
+      continue;
+
+    if (pattern->stage ==
+            task_graph::TaskGraphOptimizationStage::PostSchedule &&
+        graphStage == task_graph::TaskGraphOptimizationStage::PreSchedule) {
+      return taskGraphFunc.emitError("optimization pattern '")
+             << selected << "' requires scheduled placement";
+    }
+    if (pattern->stage == task_graph::TaskGraphOptimizationStage::PreSchedule &&
+        graphStage == task_graph::TaskGraphOptimizationStage::PostSchedule) {
+      return taskGraphFunc.emitError("optimization pattern '")
+             << selected << "' must run before task-graph scheduling";
     }
   }
   return mlir::success();
@@ -144,15 +182,35 @@ void OptimizeTaskGraphPass::runOnOperation() {
     foundTaskGraph = true;
 
     auto dag = task_graph::parseTaskGraphDAG(taskGraphFunc);
-    if (failed(dag) ||
-        failed(verifyScheduledAndUnfinalized(taskGraphFunc, *dag))) {
+    if (failed(dag)) {
+      signalPassFailure();
+      return;
+    }
+    task_graph::TaskGraphOptimizationStage graphStage =
+        task_graph::TaskGraphOptimizationStage::PreSchedule;
+    if (failed(getOptimizationStage(taskGraphFunc, *dag, graphStage))) {
+      signalPassFailure();
+      return;
+    }
+
+    llvm::SmallVector<llvm::StringRef, 4> graphPatterns = *selectedPatterns;
+    if (llvm::StringRef(patterns).trim() == "all") {
+      graphPatterns.clear();
+      for (const task_graph::TaskGraphOptimizationPattern &pattern :
+           task_graph::getTaskGraphOptimizationPatterns()) {
+        if (pattern.stage == graphStage)
+          graphPatterns.push_back(pattern.name);
+      }
+    }
+    if (failed(verifyOptimizationStage(taskGraphFunc, graphStage,
+                                       graphPatterns))) {
       signalPassFailure();
       return;
     }
 
     bool changed = false;
     if (failed(task_graph::optimizeTaskGraph(module, taskGraphFunc, *dag,
-                                             *selectedPatterns, changed))) {
+                                             graphPatterns, changed))) {
       signalPassFailure();
       return;
     }

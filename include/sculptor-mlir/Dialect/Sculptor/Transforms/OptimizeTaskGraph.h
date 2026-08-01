@@ -50,7 +50,7 @@ struct OptimizeTaskGraphPass
   StringRef getArgument() const final { return "sculptor-optimize-task-graph"; }
 
   StringRef getDescription() const final {
-    return "Apply placement-preserving optimizations to a scheduled task graph";
+    return "Apply stage-specific task-graph optimizations";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {

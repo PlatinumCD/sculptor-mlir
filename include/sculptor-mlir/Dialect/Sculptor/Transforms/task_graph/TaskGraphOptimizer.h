@@ -13,8 +13,14 @@ namespace mlir {
 namespace sculptor {
 namespace task_graph {
 
+enum class TaskGraphOptimizationStage {
+  PreSchedule,
+  PostSchedule,
+};
+
 struct TaskGraphOptimizationPattern {
   llvm::StringRef name;
+  TaskGraphOptimizationStage stage;
   LogicalResult (*apply)(ModuleOp module, func::FuncOp taskGraphFunc,
                          const TaskGraphDAG &dag, bool &changed);
 };
