@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Assembly/TaskGraphExecutionPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScratchpadAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphRuntimeOrder.h"
 
@@ -26,6 +27,7 @@ namespace {
 
 namespace deployment_attrs = mlir::sculptor::deployment_attrs;
 namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace scratchpad_attrs = mlir::sculptor::scratchpad_attrs;
 
 constexpr size_t kWorkspaceAlignment = alignof(std::max_align_t);
 
@@ -58,6 +60,7 @@ struct ResourceInfo {
   size_t byteSize = 0;
   std::optional<uint32_t> tempIndex;
   std::optional<uint32_t> routeIndex;
+  bool scratchpad = false;
 };
 
 struct RouteResource {
@@ -103,9 +106,16 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
   ResourceInfo info;
   info.slot = resourceInfoByValue.size();
   info.byteSize = static_cast<size_t>(*byteSize);
+  auto storageClass = resourceOp->template getAttrOfType<mlir::StringAttr>(
+      scratchpad_attrs::kStorageClassAttrName);
+  info.scratchpad =
+      storageClass &&
+      storageClass.getValue() == scratchpad_attrs::kScratchpadStorageClass;
   if constexpr (std::is_same_v<OpT, mlir::sculptor::TaskGraphIntermediateOp>) {
-    info.tempIndex = intermediateResources.size();
-    intermediateResources.push_back(resourceOp.getResult());
+    if (!info.scratchpad) {
+      info.tempIndex = intermediateResources.size();
+      intermediateResources.push_back(resourceOp.getResult());
+    }
   } else if constexpr (std::is_same_v<OpT,
                                       mlir::sculptor::TaskGraphRouteInputOp> ||
                        std::is_same_v<OpT,
@@ -429,6 +439,8 @@ void packRouteWorkspace(
   plan.routeOffsets.assign(routeResources.size(), 0);
   for (const RouteResource &route : orderedRoutes) {
     const ResourceInfo &resourceInfo = resourceInfoByValue.lookup(route.value);
+    if (resourceInfo.scratchpad)
+      continue;
     size_t offset = llvm::alignTo(plan.workspaceSize, kWorkspaceAlignment);
     plan.routeOffsets[route.routeIndex] = offset;
     plan.workspaceSize =
@@ -544,6 +556,9 @@ annotateTaskGraphWithExecutablePlan(mlir::func::FuncOp taskGraphFunc,
   }
 
   for (const RouteResource &route : routeResources) {
+    const ResourceInfo &resourceInfo = resourceInfoByValue.lookup(route.value);
+    if (resourceInfo.scratchpad)
+      continue;
     mlir::Operation *resourceOp = route.value.getDefiningOp();
     resourceOp->setAttr(
         runtime_attrs::kResourceTempOffsetAttrName,

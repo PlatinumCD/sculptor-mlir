@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScratchpadAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
 
@@ -20,6 +21,8 @@
 namespace mlir {
 namespace sculptor {
 namespace golem_tile_abi {
+
+namespace scratchpad_attrs = mlir::sculptor::scratchpad_attrs;
 
 namespace {
 
@@ -258,9 +261,20 @@ LogicalResult collectResources(TileModel &model) {
     }
 
     std::optional<uint64_t> workspaceOffset;
-    if (kindAndValue->first == ResourceKind::Intermediate ||
-        kindAndValue->first == ResourceKind::RouteInput ||
-        kindAndValue->first == ResourceKind::RouteOutput) {
+    auto storageClass =
+        op.getAttrOfType<StringAttr>(scratchpad_attrs::kStorageClassAttrName);
+    bool scratchpad =
+        storageClass &&
+        storageClass.getValue() == scratchpad_attrs::kScratchpadStorageClass;
+    if (scratchpad) {
+      auto offset = getRequiredUnsignedAttr<uint64_t>(
+          &op, scratchpad_attrs::kScratchpadOffsetAttrName);
+      if (failed(offset))
+        return failure();
+      workspaceOffset = *offset;
+    } else if (kindAndValue->first == ResourceKind::Intermediate ||
+               kindAndValue->first == ResourceKind::RouteInput ||
+               kindAndValue->first == ResourceKind::RouteOutput) {
       auto offset = getRequiredUnsignedAttr<uint64_t>(
           &op, runtime_attrs::kResourceTempOffsetAttrName);
       if (failed(offset))
@@ -272,7 +286,7 @@ LogicalResult collectResources(TileModel &model) {
     model.resourceIndexByValue.try_emplace(kindAndValue->second, resourceIndex);
     model.resources.push_back(ResourceModel{
         &op, kindAndValue->second, *shapedType, kindAndValue->first, *globalId,
-        routeId, *slot, 0, *byteSize, workspaceOffset});
+        routeId, *slot, 0, *byteSize, workspaceOffset, scratchpad});
     if (kindAndValue->first == ResourceKind::RouteInput) {
       model.routeInputResourceIndexByRouteId.try_emplace(*routeId,
                                                          resourceIndex);
@@ -666,6 +680,8 @@ LogicalResult collectWorkspaceMetadata(TileModel &model) {
   model.workspaceSize = *workspaceSize;
 
   for (const ResourceModel &resource : model.resources) {
+    if (resource.scratchpad)
+      continue;
     bool usesWorkspace = resource.kind == ResourceKind::Intermediate ||
                          resource.kind == ResourceKind::RouteInput ||
                          resource.kind == ResourceKind::RouteOutput;
@@ -684,6 +700,148 @@ LogicalResult collectWorkspaceMetadata(TileModel &model) {
       return failure();
     }
   }
+  return success();
+}
+
+LogicalResult collectScratchpadMetadata(TileModel &model) {
+  auto requiredBytes = model.taskGraphFunc->getAttrOfType<IntegerAttr>(
+      scratchpad_attrs::kScratchpadRequiredBytesAttrName);
+  auto descriptors = model.taskGraphFunc->getAttrOfType<ArrayAttr>(
+      scratchpad_attrs::kScratchpadDMADescriptorsAttrName);
+  auto abiVersion = model.taskGraphFunc->getAttrOfType<IntegerAttr>(
+      scratchpad_attrs::kScratchpadABIVersionAttrName);
+  auto featureBits = model.taskGraphFunc->getAttrOfType<IntegerAttr>(
+      scratchpad_attrs::kScratchpadFeatureBitsAttrName);
+  if (!requiredBytes && !descriptors)
+    return success();
+  if (!requiredBytes || requiredBytes.getInt() < 0 || !descriptors ||
+      !abiVersion || abiVersion.getInt() != 2 || !featureBits ||
+      featureBits.getInt() != kScratchpadDMAFeature) {
+    model.taskGraphFunc.emitError(
+        "incomplete scratchpad plan metadata on task graph");
+    return failure();
+  }
+  model.scratchpadRequiredBytes = static_cast<uint64_t>(requiredBytes.getInt());
+  model.abiFeatures |= kScratchpadDMAFeature;
+  for (const ResourceModel &resource : model.resources) {
+    if (!resource.scratchpad)
+      continue;
+    if (!resource.workspaceOffset ||
+        *resource.workspaceOffset > model.scratchpadRequiredBytes ||
+        resource.byteSize >
+            model.scratchpadRequiredBytes - *resource.workspaceOffset) {
+      resource.op->emitError(
+          "scratchpad resource range exceeds required scratchpad bytes");
+      return failure();
+    }
+  }
+
+  auto getU32 = [&](DictionaryAttr descriptor,
+                    StringRef name) -> FailureOr<uint32_t> {
+    auto value = descriptor.getAs<IntegerAttr>(name);
+    if (!value || value.getInt() < 0 ||
+        static_cast<uint64_t>(value.getInt()) > UINT32_MAX) {
+      model.taskGraphFunc.emitError("invalid scratchpad DMA field '")
+          << name << "'";
+      return failure();
+    }
+    return static_cast<uint32_t>(value.getInt());
+  };
+  auto getU64 = [&](DictionaryAttr descriptor,
+                    StringRef name) -> FailureOr<uint64_t> {
+    auto value = descriptor.getAs<IntegerAttr>(name);
+    if (!value || value.getInt() < 0) {
+      model.taskGraphFunc.emitError("invalid scratchpad DMA field '")
+          << name << "'";
+      return failure();
+    }
+    return static_cast<uint64_t>(value.getInt());
+  };
+
+  DenseSet<uint32_t> descriptorIds;
+  DenseSet<uint32_t> completionTokens;
+  for (Attribute entry : descriptors) {
+    auto descriptor = dyn_cast<DictionaryAttr>(entry);
+    if (!descriptor) {
+      model.taskGraphFunc.emitError(
+          "scratchpad DMA descriptors must be dictionaries");
+      return failure();
+    }
+    auto descriptorId = getU32(descriptor, scratchpad_attrs::kDMAIdFieldName);
+    auto direction =
+        getU32(descriptor, scratchpad_attrs::kDMADirectionFieldName);
+    auto globalResourceId =
+        getU32(descriptor, scratchpad_attrs::kDMAGlobalResourceIdFieldName);
+    auto routeId = getU32(descriptor, scratchpad_attrs::kDMARouteIdFieldName);
+    auto scratchpadOffset =
+        getU64(descriptor, scratchpad_attrs::kDMAScratchpadOffsetFieldName);
+    auto byteSize = getU64(descriptor, scratchpad_attrs::kDMAByteSizeFieldName);
+    auto completionToken =
+        getU32(descriptor, scratchpad_attrs::kDMACompletionTokenFieldName);
+    auto triggerKind =
+        getU32(descriptor, scratchpad_attrs::kDMATriggerKindFieldName);
+    auto triggerId =
+        getU32(descriptor, scratchpad_attrs::kDMATriggerIdFieldName);
+    auto flags = getU32(descriptor, scratchpad_attrs::kDMAFlagsFieldName);
+    auto sourceStorage =
+        getU32(descriptor, scratchpad_attrs::kDMASourceStorageFieldName);
+    auto destinationStorage =
+        getU32(descriptor, scratchpad_attrs::kDMADestinationStorageFieldName);
+    auto reserved = getU64(descriptor, scratchpad_attrs::kDMAReservedFieldName);
+    if (failed(descriptorId) || failed(direction) || failed(globalResourceId) ||
+        failed(routeId) || failed(scratchpadOffset) || failed(byteSize) ||
+        failed(completionToken) || failed(triggerKind) || failed(triggerId) ||
+        failed(flags) || failed(sourceStorage) || failed(destinationStorage) ||
+        failed(reserved))
+      return failure();
+    if (!descriptorIds.insert(*descriptorId).second ||
+        !completionTokens.insert(*completionToken).second) {
+      model.taskGraphFunc.emitError(
+          "scratchpad DMA descriptor and completion token IDs must be unique");
+      return failure();
+    }
+    if (*direction > scratchpad_attrs::kDirectionScratchpadToNic ||
+        *sourceStorage > scratchpad_attrs::kStorageNic ||
+        *destinationStorage > scratchpad_attrs::kStorageNic ||
+        *triggerKind > scratchpad_attrs::kTriggerTaskComplete ||
+        *flags != scratchpad_attrs::kDMAAsynchronous || *reserved != 0) {
+      model.taskGraphFunc.emitError(
+          "scratchpad DMA descriptor violates Platform v0.2");
+      return failure();
+    }
+
+    ResourceModel *resource = nullptr;
+    for (ResourceModel &candidate : model.resources) {
+      if (candidate.globalId != *globalResourceId)
+        continue;
+      if (*routeId != UINT32_MAX &&
+          candidate.routeId != std::optional<uint32_t>(*routeId))
+        continue;
+      resource = &candidate;
+      break;
+    }
+    if (!resource || !resource->scratchpad || !resource->workspaceOffset ||
+        *resource->workspaceOffset != *scratchpadOffset ||
+        resource->byteSize != *byteSize) {
+      model.taskGraphFunc.emitError(
+          "scratchpad DMA descriptor does not match a planned resource");
+      return failure();
+    }
+    if (*scratchpadOffset > model.scratchpadRequiredBytes ||
+        *byteSize > model.scratchpadRequiredBytes - *scratchpadOffset) {
+      resource->op->emitError(
+          "scratchpad resource range exceeds required scratchpad bytes");
+      return failure();
+    }
+    model.dmaDescriptors.push_back(DMADescriptorModel{
+        *descriptorId, *direction, resource->slot, *routeId, *scratchpadOffset,
+        *byteSize, *completionToken, *triggerKind, *triggerId, *flags,
+        *sourceStorage, *destinationStorage, *reserved});
+  }
+  llvm::sort(model.dmaDescriptors,
+             [](const DMADescriptorModel &lhs, const DMADescriptorModel &rhs) {
+               return lhs.descriptorId < rhs.descriptorId;
+             });
   return success();
 }
 
@@ -1062,6 +1220,14 @@ LLVM::LLVMStructType getModelIOType(MLIRContext *context) {
       context, {i32Type, i32Type, i32Type, i32Type, i64Type});
 }
 
+LLVM::LLVMStructType getDMADescriptorType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i64Type, i64Type, i32Type,
+                i32Type, i32Type, i32Type, i32Type, i32Type, i64Type});
+}
+
 LLVM::LLVMStructType getMemRefDescriptorType(MLIRContext *context,
                                              ShapedType shapedType) {
   Type ptrType = LLVM::LLVMPointerType::get(context);
@@ -1102,6 +1268,7 @@ FailureOr<TileModel> collectTileModel(ModuleOp module) {
           module, model, deployment_attrs::kModelOutputsAttrName,
           "output_index", ResourceKind::ModelOutput, model.modelOutputs)) ||
       failed(collectWorkspaceMetadata(model)) ||
+      failed(collectScratchpadMetadata(model)) ||
       failed(buildTaskBindings(model)) || failed(validateDeploymentPlan(model)))
     return failure();
 

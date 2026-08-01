@@ -139,8 +139,40 @@ LogicalResult emitWorkspaceSizeAccessor(ModuleOp module,
   return success();
 }
 
-uint32_t getResourceFlags(ResourceKind kind) {
-  switch (kind) {
+LogicalResult emitU32Accessor(ModuleOp module, StringRef name, uint32_t value) {
+  if (failed(checkAvailableSymbol(module, name)))
+    return failure();
+  Location loc = module.getLoc();
+  auto functionType = LLVM::LLVMFunctionType::get(
+      IntegerType::get(module.getContext(), 32), {}, false);
+  OpBuilder builder(module.getContext());
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = builder.create<LLVM::LLVMFuncOp>(loc, name, functionType);
+  Block *entry = function.addEntryBlock(builder);
+  OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
+  bodyBuilder.create<LLVM::ReturnOp>(loc, buildI32(bodyBuilder, loc, value));
+  return success();
+}
+
+LogicalResult emitU64Accessor(ModuleOp module, StringRef name, uint64_t value) {
+  if (failed(checkAvailableSymbol(module, name)))
+    return failure();
+  Location loc = module.getLoc();
+  auto functionType = LLVM::LLVMFunctionType::get(
+      IntegerType::get(module.getContext(), 64), {}, false);
+  OpBuilder builder(module.getContext());
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = builder.create<LLVM::LLVMFuncOp>(loc, name, functionType);
+  Block *entry = function.addEntryBlock(builder);
+  OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
+  bodyBuilder.create<LLVM::ReturnOp>(loc, buildI64(bodyBuilder, loc, value));
+  return success();
+}
+
+uint32_t getResourceFlags(const ResourceModel &resource) {
+  if (resource.scratchpad)
+    return kResourceScratchpadFlag;
+  switch (resource.kind) {
   case ResourceKind::ModelInput:
   case ResourceKind::ModelOutput:
     return kResourceExternalFlag;
@@ -177,7 +209,7 @@ LogicalResult emitResourceTable(ModuleOp module, const TileModel &model) {
               kFloat32ElementType,
               static_cast<uint32_t>(resource.shapedType.getRank()),
               resource.dimensionOffset,
-              getResourceFlags(resource.kind),
+              getResourceFlags(resource),
           };
 
           Value entry =
@@ -294,6 +326,61 @@ LogicalResult emitTaskBindingDataTable(ModuleOp module,
           emitPointerAccessor(module, kTaskBindingDataAccessorName, global)) ||
       failed(emitCountAccessor(module, kTaskBindingDataCountAccessorName,
                                model.taskBindingData.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitDMADescriptorTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kDMADescriptorsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kDMADescriptorsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kDMADescriptorCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!model.dmaDescriptors.empty()) {
+    auto descriptorType = getDMADescriptorType(module.getContext());
+    global = emitArrayGlobal(
+        module, kDMADescriptorsGlobalName, descriptorType,
+        model.dmaDescriptors.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const DMADescriptorModel &descriptor = model.dmaDescriptors[index];
+          Value entry =
+              builder.create<LLVM::ZeroOp>(module.getLoc(), descriptorType);
+          const uint32_t head[] = {descriptor.descriptorId,
+                                   descriptor.direction, descriptor.localSlot,
+                                   descriptor.routeId};
+          for (auto value : llvm::enumerate(head))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), descriptor.scratchpadOffset),
+              ArrayRef<int64_t>{4});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), descriptor.byteSize),
+              ArrayRef<int64_t>{5});
+          const uint32_t tail[] = {
+              descriptor.completionTokenId, descriptor.triggerKind,
+              descriptor.triggerId,         descriptor.flags,
+              descriptor.sourceStorage,     descriptor.destinationStorage};
+          for (auto value : llvm::enumerate(tail))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(6 + value.index())});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), descriptor.reserved),
+              ArrayRef<int64_t>{12});
+          return entry;
+        });
+  }
+  if (failed(
+          emitPointerAccessor(module, kDMADescriptorsAccessorName, global)) ||
+      failed(emitCountAccessor(module, kDMADescriptorCountAccessorName,
+                               model.dmaDescriptors.size())))
     return failure();
   return success();
 }
@@ -439,6 +526,11 @@ LogicalResult emitModelIOTable(ModuleOp module, ArrayRef<ModelIOModel> entries,
 
 LogicalResult emitTileTables(ModuleOp module, const TileModel &model) {
   if (failed(emitCoreIdAccessor(module, model.coreId)) ||
+      failed(emitU32Accessor(module, kABIFeaturesAccessorName,
+                             model.abiFeatures)) ||
+      failed(emitU64Accessor(module, kScratchpadRequiredBytesAccessorName,
+                             model.scratchpadRequiredBytes)) ||
+      failed(emitDMADescriptorTable(module, model)) ||
       failed(emitResourceTable(module, model)) ||
       failed(emitResourceDimensionTable(module, model)) ||
       failed(emitWorkspaceSizeAccessor(module, model.workspaceSize)) ||

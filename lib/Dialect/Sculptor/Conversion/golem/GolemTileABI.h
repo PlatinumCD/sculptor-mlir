@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -39,6 +40,8 @@ inline constexpr llvm::StringLiteral
     kTaskBindingsGlobalName("__golem_tile_task_bindings");
 inline constexpr llvm::StringLiteral
     kTaskBindingDataGlobalName("__golem_tile_task_binding_data");
+inline constexpr llvm::StringLiteral
+    kDMADescriptorsGlobalName("__golem_tile_dma_descriptors");
 
 inline constexpr llvm::StringLiteral
     kBootTasksAccessorName("golem_tile_boot_tasks");
@@ -83,12 +86,23 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral
     kTaskBindingDataCountAccessorName("golem_tile_task_binding_data_count");
 inline constexpr llvm::StringLiteral kCoreIdAccessorName("golem_tile_core_id");
+inline constexpr llvm::StringLiteral
+    kABIFeaturesAccessorName("golem_tile_abi_features");
+inline constexpr llvm::StringLiteral kScratchpadRequiredBytesAccessorName(
+    "golem_tile_scratchpad_required_bytes");
+inline constexpr llvm::StringLiteral
+    kDMADescriptorsAccessorName("golem_tile_dma_descriptors");
+inline constexpr llvm::StringLiteral
+    kDMADescriptorCountAccessorName("golem_tile_dma_descriptor_count");
 
 inline constexpr uint32_t kFloat32ElementType = 1;
 inline constexpr uint32_t kTaskSuccess = 0;
 inline constexpr uint32_t kTaskFailure = 1;
 inline constexpr uint32_t kResourceWorkspaceFlag = 1U << 0;
 inline constexpr uint32_t kResourceExternalFlag = 1U << 1;
+inline constexpr uint32_t kResourceScratchpadFlag = 1U << 2;
+inline constexpr uint32_t kResourceSpillFlag = 1U << 3;
+inline constexpr uint32_t kScratchpadDMAFeature = 1U << 0;
 
 enum class ResourceKind : uint32_t {
   ModelInput = 0,
@@ -98,6 +112,43 @@ enum class ResourceKind : uint32_t {
   RouteInput = 4,
   RouteOutput = 5,
 };
+
+struct ResourceWireLayout {
+  uint32_t globalResourceId;
+  uint32_t routeId;
+  uint32_t localSlot;
+  uint32_t kind;
+  uint32_t elementType;
+  uint32_t rank;
+  uint32_t dimensionOffset;
+  uint32_t flags;
+  uint64_t byteSize;
+  uint64_t localStorageOffset;
+};
+static_assert(sizeof(ResourceWireLayout) == 48);
+static_assert(offsetof(ResourceWireLayout, localStorageOffset) == 40);
+
+struct DMADescriptorWireLayout {
+  uint32_t descriptorId;
+  uint32_t direction;
+  uint32_t localSlot;
+  uint32_t routeId;
+  uint64_t scratchpadOffset;
+  uint64_t byteSize;
+  uint32_t completionTokenId;
+  uint32_t triggerKind;
+  uint32_t triggerId;
+  uint32_t flags;
+  uint32_t sourceStorage;
+  uint32_t destinationStorage;
+  uint64_t reserved;
+};
+static_assert(sizeof(DMADescriptorWireLayout) == 64);
+static_assert(alignof(DMADescriptorWireLayout) == 8);
+static_assert(offsetof(DMADescriptorWireLayout, scratchpadOffset) == 16);
+static_assert(offsetof(DMADescriptorWireLayout, completionTokenId) == 32);
+static_assert(offsetof(DMADescriptorWireLayout, sourceStorage) == 48);
+static_assert(offsetof(DMADescriptorWireLayout, reserved) == 56);
 
 struct ResourceModel {
   Operation *op = nullptr;
@@ -110,6 +161,7 @@ struct ResourceModel {
   uint32_t dimensionOffset = 0;
   uint64_t byteSize = 0;
   std::optional<uint64_t> workspaceOffset;
+  bool scratchpad = false;
 };
 
 struct TaskModel {
@@ -155,6 +207,22 @@ struct ModelIOModel {
   uint64_t byteSize = 0;
 };
 
+struct DMADescriptorModel {
+  uint32_t descriptorId = 0;
+  uint32_t direction = 0;
+  uint32_t localSlot = 0;
+  uint32_t routeId = UINT32_MAX;
+  uint64_t scratchpadOffset = 0;
+  uint64_t byteSize = 0;
+  uint32_t completionTokenId = 0;
+  uint32_t triggerKind = 0;
+  uint32_t triggerId = UINT32_MAX;
+  uint32_t flags = 0;
+  uint32_t sourceStorage = 0;
+  uint32_t destinationStorage = 0;
+  uint64_t reserved = 0;
+};
+
 struct TileModel {
   uint32_t coreId = 0;
   func::FuncOp taskGraphFunc;
@@ -175,6 +243,9 @@ struct TileModel {
   SmallVector<ModelIOModel> modelInputs;
   SmallVector<ModelIOModel> modelOutputs;
   uint64_t workspaceSize = 0;
+  uint64_t scratchpadRequiredBytes = 0;
+  uint32_t abiFeatures = 0;
+  SmallVector<DMADescriptorModel> dmaDescriptors;
 };
 
 LLVM::LLVMStructType getTensorType(MLIRContext *context);
@@ -183,6 +254,7 @@ LLVM::LLVMStructType getResourceType(MLIRContext *context);
 LLVM::LLVMStructType getTaskBindingType(MLIRContext *context);
 LLVM::LLVMStructType getRouteType(MLIRContext *context);
 LLVM::LLVMStructType getModelIOType(MLIRContext *context);
+LLVM::LLVMStructType getDMADescriptorType(MLIRContext *context);
 LLVM::LLVMStructType getMemRefDescriptorType(MLIRContext *context,
                                              ShapedType shapedType);
 

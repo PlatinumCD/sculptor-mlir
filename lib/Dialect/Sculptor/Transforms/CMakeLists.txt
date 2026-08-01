@@ -22,6 +22,7 @@ add_mlir_library(MLIRSculptorTransforms
   MaterializeTasks.cpp
   OptimizeTaskGraph.cpp
   PartitionTaskGraphByCore.cpp
+  PlanCoreScratchpad.cpp
   ScheduleTaskGraph.cpp
   TaskGraphTaskMetadata.cpp
   VectorizeMarkedElementwise.cpp

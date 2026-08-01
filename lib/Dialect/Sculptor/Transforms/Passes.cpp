@@ -18,6 +18,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/OptimizeTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PlanCoreScratchpad.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/VectorizeMarkedElementwise.h"
 
@@ -45,6 +46,7 @@ void registerSculptorPasses() {
   registerMaterializeTasksPass();
   registerOptimizeTaskGraphPass();
   registerPartitionTaskGraphByCorePass();
+  registerPlanCoreScratchpadPass();
   registerScheduleTaskGraphPass();
   registerVectorizeMarkedElementwisePass();
 }
