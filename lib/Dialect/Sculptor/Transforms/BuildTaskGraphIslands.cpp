@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScheduleAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphDAG.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphExecutionGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphIslands.h"
@@ -15,12 +16,30 @@ bool returnsTaskGraph(mlir::func::FuncOp func) {
          llvm::isa<mlir::sculptor::TaskGraphType>(functionType.getResult(0));
 }
 
+mlir::FailureOr<mlir::sculptor::task_graph::DigitalIslandAssignmentPolicy>
+parseDigitalAssignmentPolicy(mlir::StringRef value) {
+  using Policy = mlir::sculptor::task_graph::DigitalIslandAssignmentPolicy;
+  if (value == "legacy")
+    return Policy::Legacy;
+  if (value == "multi-terminal-balanced")
+    return Policy::MultiTerminalBalanced;
+  return mlir::failure();
+}
+
 } // namespace
 
 namespace mlir {
 namespace sculptor {
 
 void BuildTaskGraphIslandsPass::runOnOperation() {
+  auto assignmentPolicy = parseDigitalAssignmentPolicy(digitalAssignment);
+  if (failed(assignmentPolicy)) {
+    getOperation().emitError("unknown digital island assignment policy '")
+        << digitalAssignment << "'; expected legacy or multi-terminal-balanced";
+    signalPassFailure();
+    return;
+  }
+
   bool foundTaskGraph = false;
   for (func::FuncOp func : getOperation().getOps<func::FuncOp>()) {
     if (!returnsTaskGraph(func))
@@ -39,7 +58,7 @@ void BuildTaskGraphIslandsPass::runOnOperation() {
     }
 
     auto islandGraph = task_graph::buildLogicalPlacementIslandGraph(
-        *parsedDag, *executionGraph);
+        *parsedDag, *executionGraph, *assignmentPolicy);
     if (failed(islandGraph)) {
       func.emitError("failed to build logical placement islands");
       signalPassFailure();
@@ -51,6 +70,8 @@ void BuildTaskGraphIslandsPass::runOnOperation() {
       signalPassFailure();
       return;
     }
+    func->setAttr(schedule_attrs::kIslandAssignmentPolicyAttrName,
+                  StringAttr::get(&getContext(), digitalAssignment));
     task_timing::invalidateTaskGraphTiming(func, /*advanceGeneration=*/false);
 
     foundTaskGraph = true;

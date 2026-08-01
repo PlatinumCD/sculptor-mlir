@@ -87,6 +87,8 @@ inline constexpr llvm::StringLiteral kLogicalArrayToAnalogArrayAttrName(
     "sculptor.schedule.logical_array_to_analog_array");
 inline constexpr llvm::StringLiteral
     kIslandIdAttrName("sculptor.schedule.island_id");
+inline constexpr llvm::StringLiteral kIslandAssignmentPolicyAttrName(
+    "sculptor.schedule.island_assignment_policy");
 inline constexpr llvm::StringLiteral
     kPlacementCostModeAttrName("sculptor.schedule.placement_cost_mode");
 inline constexpr llvm::StringLiteral kSearchCompletionTimeProxyAttrName(

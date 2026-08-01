@@ -36,5 +36,6 @@ nav:
   - Design: design.md
   - Walkthrough: walkthrough.md
   - Placement: placement.md
+  - Island Formation: island-formation.md
   - Timing: timing.md
   - GitHub: https://github.com/PlatinumCD/sculptor-mlir

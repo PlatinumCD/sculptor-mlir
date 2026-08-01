@@ -68,6 +68,18 @@ producing an unchanged comparison graph.
 3. Assign digital tasks and construct island communication edges.
 4. Attach stable island IDs to the resulting island members.
 
+The `digital-assignment` option selects the digital grouping policy. The
+default `legacy` policy preserves the two-terminal min-cut and local-affinity
+behavior. The experimental `multi-terminal-balanced` policy supports any
+number of adjacent terminal islands. It uses communication affinity, digital
+work, and incident storage bytes, then applies communication-first local
+refinement. The pass records the selected policy in
+`sculptor.schedule.island_assignment_policy`.
+
+```bash
+--sculptor-build-task-graph-islands="digital-assignment=multi-terminal-balanced"
+```
+
 `sculptor-analyze-task-graph-timing` operates in two modes. Before placement it
 computes the dependency-only profile consumed by timing-aware schedulers.
 Ordinary schedulers do not require this invocation. After placement it detects

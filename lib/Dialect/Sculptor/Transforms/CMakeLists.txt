@@ -49,6 +49,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphDAG.cpp
   task_graph/TaskGraphExecutionGraph.cpp
   task_graph/TaskGraphDigitalOps.cpp
+  task_graph/TaskGraphIslandMultiTerminalAssignment.cpp
   task_graph/TaskGraphCleanup.cpp
   task_graph/TaskGraphResourceUtils.cpp
   task_graph/TaskGraphRuntimeOrder.cpp

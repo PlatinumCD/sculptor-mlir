@@ -481,7 +481,8 @@ namespace task_graph {
 
 FailureOr<LogicalPlacementIslandGraph>
 buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
-                                 const TaskExecutionGraph &executionGraph) {
+                                 const TaskExecutionGraph &executionGraph,
+                                 DigitalIslandAssignmentPolicy policy) {
   llvm::SmallVector<const TaskGraphNode *, 8> matrixSetupTasks =
       collectMatrixSetupTasks(dag);
   MatrixSetupMVMMap mvmTasksByMatrixSetupTask =
@@ -494,12 +495,19 @@ buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
     return failure();
   if (failed(recordInitialDigitalShardIslands(dag, islandByTaskIndex)))
     return failure();
-  if (failed(assignPrePlacementMinCutDigitalIslands(dag, islandByTaskIndex)))
+  if (policy == DigitalIslandAssignmentPolicy::Legacy &&
+      failed(assignPrePlacementMinCutDigitalIslands(dag, islandByTaskIndex)))
     return failure();
 
   auto resourceEdges = collectResourceEdges(dag);
   if (failed(resourceEdges))
     return failure();
+
+  if (policy == DigitalIslandAssignmentPolicy::MultiTerminalBalanced &&
+      failed(assignMultiTerminalBalancedDigitalIslands(dag, *resourceEdges,
+                                                       islandByTaskIndex))) {
+    return failure();
+  }
 
   if (failed(assignRemainingDigitalIslandsByLocalAffinity(dag, *resourceEdges,
                                                           islandByTaskIndex)))

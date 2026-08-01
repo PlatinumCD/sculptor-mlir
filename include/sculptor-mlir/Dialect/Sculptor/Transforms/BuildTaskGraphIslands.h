@@ -8,12 +8,32 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/Pass.h"
 
+#include <string>
+
 namespace mlir {
 namespace sculptor {
 
 struct BuildTaskGraphIslandsPass
     : public PassWrapper<BuildTaskGraphIslandsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BuildTaskGraphIslandsPass)
+
+  Option<std::string> digitalAssignment{
+      *this, "digital-assignment",
+      llvm::cl::desc("Digital island assignment policy: legacy or "
+                     "multi-terminal-balanced"),
+      llvm::cl::init("legacy")};
+
+  BuildTaskGraphIslandsPass() = default;
+
+  BuildTaskGraphIslandsPass(const BuildTaskGraphIslandsPass &pass)
+      : PassWrapper(pass),
+        digitalAssignment(
+            *this, "digital-assignment",
+            llvm::cl::desc("Digital island assignment policy: legacy or "
+                           "multi-terminal-balanced"),
+            llvm::cl::init("legacy")) {
+    digitalAssignment = pass.digitalAssignment;
+  }
 
   StringRef getArgument() const final {
     return "sculptor-build-task-graph-islands";

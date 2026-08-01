@@ -22,6 +22,10 @@ LogicalResult assignRemainingDigitalIslandsByLocalAffinity(
     const TaskGraphDAG &dag, llvm::ArrayRef<ResourceEdge> resourceEdges,
     llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex);
 
+LogicalResult assignMultiTerminalBalancedDigitalIslands(
+    const TaskGraphDAG &dag, llvm::ArrayRef<ResourceEdge> resourceEdges,
+    llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex);
+
 llvm::SmallVector<IslandAffinityEdge, 16> buildIslandAffinityEdges(
     const TaskGraphDAG &dag, llvm::ArrayRef<ResourceEdge> resourceEdges,
     const llvm::DenseMap<unsigned, unsigned> &islandByTaskIndex);

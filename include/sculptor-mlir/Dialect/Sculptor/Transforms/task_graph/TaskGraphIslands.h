@@ -18,6 +18,11 @@ namespace mlir {
 namespace sculptor {
 namespace task_graph {
 
+enum class DigitalIslandAssignmentPolicy {
+  Legacy,
+  MultiTerminalBalanced,
+};
+
 enum class LogicalPlacementIslandKind {
   Analog,
   Reduction,
@@ -95,7 +100,9 @@ struct LogicalPlacementIslandGraph {
 
 FailureOr<LogicalPlacementIslandGraph>
 buildLogicalPlacementIslandGraph(const TaskGraphDAG &dag,
-                                 const TaskExecutionGraph &executionGraph);
+                                 const TaskExecutionGraph &executionGraph,
+                                 DigitalIslandAssignmentPolicy policy =
+                                     DigitalIslandAssignmentPolicy::Legacy);
 
 LogicalResult
 attachLogicalPlacementIslandIds(func::FuncOp taskGraphFunc,
