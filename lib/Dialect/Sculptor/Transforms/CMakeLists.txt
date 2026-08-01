@@ -60,6 +60,7 @@ add_mlir_library(MLIRSculptorTransforms
   task_graph/TaskGraphOptimizer.cpp
   task_graph/ElementwiseFusionOptimizer.cpp
   task_graph/ElementwiseSlicesOptimizer.cpp
+  task_graph/SegmentedConcatConsumerOptimizer.cpp
   task_graph/StreamingConvolutionOptimizer.cpp
   task_graph/VectorizedElementwiseOptimizer.cpp
   task_timing/TaskGraphTimingAnalysis.cpp

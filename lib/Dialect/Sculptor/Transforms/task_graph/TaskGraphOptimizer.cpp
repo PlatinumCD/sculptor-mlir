@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseFusionOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/ElementwiseSlicesOptimizer.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/SegmentedConcatConsumerOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/StreamingConvolutionOptimizer.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/VectorizedElementwiseOptimizer.h"
 
@@ -17,6 +18,7 @@ getTaskGraphOptimizationPatterns() {
       {"streaming-convolution", optimizeStreamingConvolution},
       {"elementwise-slices", optimizeElementwiseSlices},
       {"elementwise-fusion", optimizeElementwiseFusion},
+      {"segmented-concat-consumer", optimizeSegmentedConcatConsumer},
       {"vectorized-elementwise", optimizeVectorizedElementwise},
   };
   return patterns;
