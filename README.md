@@ -37,7 +37,6 @@ The compiler driver is `build/bin/sculptor-mlir-opt`.
 | Expand independently mappable digital work | `--sculptor-expand-digital-work` |
 | Build the RA tree | `--sculptor-build-ra-tree` |
 | Select spatial and temporal cuts | `--sculptor-plan-mapping` |
-| Apply tiled work units | `--sculptor-apply-mapping-plan` |
 | Place logical tiles on the mesh | `--sculptor-place-logical-tiles` |
 | Create tile routines | `--sculptor-outline-tile-routines` |
 | Create tile-local runtime graphs | `--sculptor-materialize-tile-runtime-graph` |

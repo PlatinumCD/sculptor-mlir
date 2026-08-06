@@ -159,6 +159,8 @@ LogicalResult applyWorkUnits(func::FuncOp function, const ComputeGraph &graph,
     function->setAttr("sculptor.mapping.applied_strategies", plan.getPlanner());
   function->setAttr("sculptor.mapping.applied_work_unit_count",
                     rewriter.getI64IntegerAttr(appliedWorkUnits));
+  // This pass is a terminal materialization utility. The deployment pipeline
+  // places the logical plan first and materializes work units while outlining.
   function->removeAttr(kRATreeAttrName);
   function->removeAttr(kMappingPlanAttrName);
   function->removeAttr(kLogicalTileGraphAttrName);

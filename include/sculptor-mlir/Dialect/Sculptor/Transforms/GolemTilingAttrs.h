@@ -9,6 +9,8 @@ namespace golem_tiling_attrs {
 
 inline constexpr llvm::StringLiteral
     kSourceResourceAttrName("sculptor.source_resource");
+inline constexpr llvm::StringLiteral
+    kSourceMVMIdAttrName("sculptor.source_mvm_id");
 inline constexpr llvm::StringLiteral kMatrixIdAttrName("sculptor.matrix_id");
 inline constexpr llvm::StringLiteral
     kMatrixReplicaIdAttrName("sculptor.matrix_replica_id");

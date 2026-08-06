@@ -27,12 +27,15 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -53,6 +56,7 @@ struct MatrixPartitionSpec {
   mlir::RankedTensorType type;
   std::string sourceResource;
   std::string taskPrefix;
+  int64_t sourceMVMId = -1;
   llvm::SmallVector<float> values;
   int64_t gridRows = 0;
   int64_t gridCols = 0;
@@ -84,6 +88,7 @@ struct FunctionExpansionState {
   llvm::StringMap<MatrixPartitionSpec> matrixSpecs;
   llvm::StringMap<LogicalArrayGrid> logicalArrays;
   llvm::SmallVector<mlir::arith::ConstantOp> matrixConstants;
+  llvm::DenseMap<mlir::Operation *, int64_t> sourceMVMIds;
 };
 
 struct MVMSequenceMatch {
@@ -145,10 +150,26 @@ static std::string getTaskNamePrefix(mlir::Operation *op) {
   return func.getSymName().str();
 }
 
+static std::string buildSourceMVMPrefix(mlir::sculptor::MVMOp mvmOp,
+                                        int64_t sourceMVMId) {
+  return (llvm::Twine(getTaskNamePrefix(mvmOp.getOperation())) + "_mvm_" +
+          llvm::Twine(sourceMVMId))
+      .str();
+}
+
+static int64_t getSourceMVMId(mlir::sculptor::MVMOp mvmOp) {
+  auto sourceMVMId = mvmOp->getAttrOfType<mlir::IntegerAttr>(
+      golem_tiling_attrs::kSourceMVMIdAttrName);
+  assert(sourceMVMId &&
+         "source MVM identity must be assigned before expansion");
+  return sourceMVMId.getInt();
+}
+
 static void copyMappingIdentity(mlir::Operation *source,
                                 SemanticOperationScope &scope) {
   scope.copyIfPresent(source, mapping::kMappingOperationIdAttrName);
   scope.copyIfPresent(source, mapping::kRALeafIdAttrName);
+  scope.copyIfPresent(source, golem_tiling_attrs::kSourceMVMIdAttrName);
   for (mlir::NamedAttribute attribute : source->getAttrs()) {
     llvm::StringRef name = attribute.getName().strref();
     if (name.starts_with("sculptor.semantic.") &&
@@ -216,7 +237,7 @@ static mlir::StringAttr buildMatrixSetupName(mlir::OpBuilder &builder,
 static mlir::StringAttr buildVectorTileName(mlir::OpBuilder &builder,
                                             mlir::sculptor::MVMOp mvmOp,
                                             int64_t vectorTile) {
-  std::string name = getTaskNamePrefix(mvmOp.getOperation());
+  std::string name = buildSourceMVMPrefix(mvmOp, getSourceMVMId(mvmOp));
   name += "_vector_tile_";
   name += std::to_string(vectorTile);
   return builder.getStringAttr(name);
@@ -225,8 +246,8 @@ static mlir::StringAttr buildVectorTileName(mlir::OpBuilder &builder,
 static mlir::StringAttr buildMVMName(mlir::OpBuilder &builder,
                                      mlir::sculptor::MVMOp mvmOp,
                                      int64_t tileRow, int64_t tileCol) {
-  std::string name = getTaskNamePrefix(mvmOp.getOperation());
-  name += "_mvm_";
+  std::string name = buildSourceMVMPrefix(mvmOp, getSourceMVMId(mvmOp));
+  name += "_array_";
   name += std::to_string(tileRow);
   name += "_";
   name += std::to_string(tileCol);
@@ -235,7 +256,7 @@ static mlir::StringAttr buildMVMName(mlir::OpBuilder &builder,
 
 static mlir::StringAttr buildTileRecombineName(mlir::OpBuilder &builder,
                                                mlir::sculptor::MVMOp mvmOp) {
-  std::string name = getTaskNamePrefix(mvmOp.getOperation());
+  std::string name = buildSourceMVMPrefix(mvmOp, getSourceMVMId(mvmOp));
   name += "_tile_recombine";
   return builder.getStringAttr(name);
 }
@@ -369,7 +390,7 @@ matchMVMSequence(mlir::scf::ForOp loop) {
 static mlir::FailureOr<MatrixPartitionSpec>
 buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp,
                          const MatrixOperand &matrixOperand, int64_t arrayRows,
-                         int64_t arrayCols) {
+                         int64_t arrayCols, int64_t sourceMVMId) {
   auto matrixConst = matrixOperand.constant;
 
   auto values =
@@ -389,7 +410,8 @@ buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp,
   spec.constant = matrixConst;
   spec.type = matrixOperand.type;
   spec.sourceResource = matrixOperand.resource.getRawHandle().getKey().str();
-  spec.taskPrefix = getTaskNamePrefix(mvmOp.getOperation());
+  spec.sourceMVMId = sourceMVMId;
+  spec.taskPrefix = buildSourceMVMPrefix(mvmOp, spec.sourceMVMId);
   spec.values = std::move(*values);
   auto physicalPlan =
       mapping::planGolemMVM(mvmOp, shape[0], shape[1], arrayRows, arrayCols);
@@ -537,6 +559,8 @@ static void setMatrixTileAttrs(SemanticOperationScope &scope,
       getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
   scope.set(golem_tiling_attrs::kSourceResourceAttrName,
             builder.getStringAttr(spec.sourceResource));
+  scope.set(golem_tiling_attrs::kSourceMVMIdAttrName,
+            builder.getI64IntegerAttr(spec.sourceMVMId));
   scope.set(golem_tiling_attrs::kTileAttrName,
             builder.getI64ArrayAttr({tileRow, tileCol}));
   scope.set(golem_tiling_attrs::kTileGridAttrName,
@@ -1145,6 +1169,18 @@ private:
 
   mlir::LogicalResult walkFunction(mlir::func::FuncOp func) {
     FunctionExpansionState state;
+    llvm::SmallVector<mlir::sculptor::MVMOp> sourceMVMOps;
+    func.walk([&](mlir::sculptor::MVMOp mvmOp) {
+      sourceMVMOps.push_back(mvmOp);
+    });
+    mlir::Builder builder(func.getContext());
+    for (auto [sourceMVMIndex, mvmOp] : llvm::enumerate(sourceMVMOps)) {
+      int64_t sourceMVMId = static_cast<int64_t>(sourceMVMIndex);
+      state.sourceMVMIds[mvmOp.getOperation()] = sourceMVMId;
+      mvmOp->setAttr(golem_tiling_attrs::kSourceMVMIdAttrName,
+                     builder.getI64IntegerAttr(sourceMVMId));
+    }
+
     if (failed(indexExistingLogicalArrays(func, state.logicalArrays)))
       return mlir::failure();
 
@@ -1236,6 +1272,11 @@ private:
 
     llvm::StringRef sourceResource =
         matrixOperand->resource.getRawHandle().getKey();
+    auto sourceMVMId = state.sourceMVMIds.find(op.getOperation());
+    if (sourceMVMId == state.sourceMVMIds.end())
+      return op.emitError("source MVM has no expansion identity"),
+             mlir::failure();
+
     auto existing = state.matrixSpecs.find(sourceResource);
     if (existing != state.matrixSpecs.end()) {
       if (existing->second.type != matrixOperand->type)
@@ -1245,8 +1286,8 @@ private:
       return &existing->second;
     }
 
-    auto spec =
-        buildMatrixPartitionSpec(op, *matrixOperand, arrayRows, arrayCols);
+    auto spec = buildMatrixPartitionSpec(op, *matrixOperand, arrayRows,
+                                         arrayCols, sourceMVMId->second);
     if (failed(spec))
       return mlir::failure();
     auto [it, inserted] =

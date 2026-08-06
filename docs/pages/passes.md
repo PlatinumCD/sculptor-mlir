@@ -15,12 +15,21 @@ the mapping is selected.
 | 5 | `--sculptor-expand-digital-work` | Create independently mappable digital work units. |
 | 6 | `--sculptor-build-ra-tree` | Build spatial cuts, temporal cuts, and operation leaves. |
 | 7 | `--sculptor-plan-mapping` | Apply an ordered mapping strategy list. |
-| 8 | `--sculptor-apply-mapping-plan` | Materialize the selected tiled work units. |
-| 9 | `--sculptor-place-logical-tiles` | Assign logical tiles to mesh coordinates. |
-| 10 | `--sculptor-outline-tile-routines` | Create tile-local boot and dispatch routines. |
-| 11 | `--sculptor-materialize-tile-runtime-graph` | Create local task and route metadata. |
-| 12 | `--sculptor-extract-tile-module` | Isolate one physical tile module. |
-| 13 | `--sculptor-plan-tile-scratchpad` | Plan tile-local storage. |
+| 8 | `--sculptor-place-logical-tiles` | Assign logical tiles to mesh coordinates. |
+| 9 | `--sculptor-outline-tile-routines` | Materialize selected work units and create tile-local boot and dispatch routines. |
+| 10 | `--sculptor-materialize-tile-runtime-graph` | Create local task and route metadata. |
+| 11 | `--sculptor-extract-tile-module` | Isolate one physical tile module. |
+| 12 | `--sculptor-plan-tile-scratchpad` | Plan tile-local storage. |
+
+## Terminal Mapping Materialization
+
+`--sculptor-apply-mapping-plan` is an inspection utility outside the executable
+deployment pipeline. It materializes selected tiled work units and consumes the
+RA tree, mapping plan, and logical-tile graph. Do not run placement or routine
+outlining after it.
+
+The executable path places the logical plan first. Routine outlining then
+materializes the selected work units under the locked physical placement.
 
 ## Inspecting Intermediate IR
 
@@ -40,4 +49,3 @@ boundary.
 `sculptor.mvm` remains the logical analog operation until Golem expansion.
 The RA tree and logical-tile graph are mapping representations. Runtime task
 graphs, slots, offsets, and tile routines are downstream deployment artifacts.
-

@@ -13,7 +13,8 @@ struct ApplyMappingPlanPass
 
   StringRef getArgument() const final { return "sculptor-apply-mapping-plan"; }
   StringRef getDescription() const final {
-    return "Materialize selected RA-tree work units through MLIR interfaces";
+    return "Terminally materialize selected RA-tree work units and consume "
+           "mapping metadata (outside the deployment pipeline)";
   }
 
   void runOnOperation() override;

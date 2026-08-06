@@ -49,11 +49,15 @@ void PlaceLogicalTilesPass::runOnOperation() {
   }
 
   bool placedFunction = false;
+  bool foundTerminallyMaterializedPlan = false;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     auto tileGraphAttr = function->getAttrOfType<LogicalTileGraphAttr>(
         mapping::kLogicalTileGraphAttrName);
-    if (!tileGraphAttr)
+    if (!tileGraphAttr) {
+      foundTerminallyMaterializedPlan |=
+          function->hasAttr("sculptor.mapping.applied_work_unit_count");
       continue;
+    }
     auto treeAttr =
         function->getAttrOfType<RATreeAttr>(mapping::kRATreeAttrName);
     if (!treeAttr) {
@@ -180,6 +184,15 @@ void PlaceLogicalTilesPass::runOnOperation() {
   }
 
   if (!placedFunction) {
+    if (foundTerminallyMaterializedPlan) {
+      module.emitError(
+          "cannot place after --sculptor-apply-mapping-plan: that terminal "
+          "utility consumes the RA tree and logical-tile graph; run "
+          "--sculptor-place-logical-tiles directly after "
+          "--sculptor-plan-mapping");
+      signalPassFailure();
+      return;
+    }
     module.emitError(
         "expected at least one function with a logical-tile graph");
     signalPassFailure();

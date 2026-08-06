@@ -14,7 +14,6 @@ The compiler keeps computation structure visible until mapping is complete.
 | Expand digital work | `--sculptor-expand-digital-work` | Independently mappable digital work units |
 | Build hierarchy | `--sculptor-build-ra-tree` | A Resource Allocation tree over compute operations |
 | Select a plan | `--sculptor-plan-mapping` | Ordered spatial and temporal planning decisions |
-| Apply the plan | `--sculptor-apply-mapping-plan` | Tiled operations and plan bindings |
 | Place logical tiles | `--sculptor-place-logical-tiles` | Logical tiles assigned to mesh coordinates |
 | Outline routines | `--sculptor-outline-tile-routines` | Tensor-level routines inside tile modules |
 | Build runtime graph | `--sculptor-materialize-tile-runtime-graph` | Tile-local tasks and communication resources |
