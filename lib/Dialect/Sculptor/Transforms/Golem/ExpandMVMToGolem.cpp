@@ -1,16 +1,19 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
 
-// ExpandMVMToGolem is the sculptor.mvm -> Golem execution IR boundary. It
-// prepares fixed-size resource tiles for MVM matrix constants inside
-// layer/helper functions while leaving forward alone.
+// ExpandMVMToGolem materializes fixed-size logical arrays and inline Golem
+// execution operations. Mapping consumes this physical realization rather
+// than the logical sculptor.mvm operations that preceded it.
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/ConstantUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/SemanticOperationNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/GolemTilingAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/GolemMVMPlanning.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -40,11 +43,10 @@ namespace sculptor {
 
 namespace {
 
-constexpr llvm::StringLiteral kForwardFunctionName = "forward";
-
-namespace task_graph_names = mlir::sculptor::task_graph_names;
-namespace runtime_attrs = mlir::sculptor::runtime_attrs;
-namespace tiling_attrs = mlir::sculptor::tiling_attrs;
+namespace semantic_operation_names = mlir::sculptor::semantic_operation_names;
+namespace tile_runtime_attrs = mlir::sculptor::tile_runtime_attrs;
+namespace golem_tiling_attrs = mlir::sculptor::golem_tiling_attrs;
+namespace mapping = mlir::sculptor::mapping;
 
 struct MatrixPartitionSpec {
   mlir::arith::ConstantOp constant;
@@ -54,6 +56,9 @@ struct MatrixPartitionSpec {
   llvm::SmallVector<float> values;
   int64_t gridRows = 0;
   int64_t gridCols = 0;
+  mapping::GolemMVMPlan physicalPlan;
+  mlir::IntegerAttr mappingOperationId;
+  mlir::IntegerAttr raLeafId;
 };
 
 struct MatrixOperand {
@@ -82,28 +87,35 @@ struct FunctionExpansionState {
 };
 
 struct MVMSequenceMatch {
-  mlir::sculptor::TaskRegionOp region;
+  mlir::Operation *anchor = nullptr;
+  llvm::SmallVector<mlir::Operation *> members;
   mlir::sculptor::MVMOp mvm;
   mlir::Value vectors;
   mlir::RankedTensorType vectorSequenceType;
   mlir::RankedTensorType resultSequenceType;
   int64_t sequenceLength = 0;
-};
 
-static int64_t ceilDiv(int64_t value, int64_t divisor) {
-  return (value + divisor - 1) / divisor;
-}
+  mlir::Location getLoc() const { return anchor->getLoc(); }
+
+  mlir::InFlightDiagnostic emitError(llvm::StringRef message) const {
+    return anchor->emitError(message);
+  }
+
+  mlir::Operation *getInsertionAnchor() const {
+    return members.empty() ? anchor : members.front();
+  }
+};
 
 static MatrixTileExtent getMatrixTileExtent(const MatrixPartitionSpec &spec,
                                             int64_t tileRow, int64_t tileCol,
                                             int64_t arrayRows,
                                             int64_t arrayCols) {
-  auto matrixShape = spec.type.getShape();
-  int64_t rowOffset = tileRow * arrayRows;
-  int64_t colOffset = tileCol * arrayCols;
-  return MatrixTileExtent{arrayRows, arrayCols,
-                          std::min(arrayRows, matrixShape[0] - rowOffset),
-                          std::min(arrayCols, matrixShape[1] - colOffset)};
+  (void)arrayRows;
+  (void)arrayCols;
+  const mapping::GolemMVMTile &tile =
+      spec.physicalPlan.tiles[tileRow * spec.gridCols + tileCol];
+  return MatrixTileExtent{tile.physicalRows, tile.physicalColumns,
+                          tile.validRows, tile.validColumns};
 }
 
 static llvm::SmallVector<mlir::OpFoldResult>
@@ -121,18 +133,73 @@ buildRowOffsets(mlir::OpBuilder &builder, mlir::Value row,
   return {row, builder.getIndexAttr(columnOffset)};
 }
 
-// Keeps the new expansion scoped to layer/helper bodies. Forward is the caller
-// graph and should be rewritten by outlining/task graph passes instead.
-static bool shouldProcessFunction(mlir::func::FuncOp func) {
-  return func.getSymName() != kForwardFunctionName;
-}
-
 static std::string getTaskNamePrefix(mlir::Operation *op) {
+  if (auto semanticName =
+          op->getAttrOfType<mlir::StringAttr>("sculptor.semantic.name"))
+    return semanticName.getValue().str();
+
   auto func = op->getParentOfType<mlir::func::FuncOp>();
   if (!func)
     return "mvm";
 
   return func.getSymName().str();
+}
+
+static void copyMappingIdentity(mlir::Operation *source,
+                                SemanticOperationScope &scope) {
+  scope.copyIfPresent(source, mapping::kMappingOperationIdAttrName);
+  scope.copyIfPresent(source, mapping::kRALeafIdAttrName);
+  for (mlir::NamedAttribute attribute : source->getAttrs()) {
+    llvm::StringRef name = attribute.getName().strref();
+    if (name.starts_with("sculptor.semantic.") &&
+        name != "sculptor.semantic.name" &&
+        name != "sculptor.semantic.section")
+      scope.set(attribute.getName().strref(), attribute.getValue());
+  }
+}
+
+static llvm::StringRef getStageKind(llvm::StringRef kind) {
+  if (kind == semantic_operation_names::kMatrixSetupTaskKind)
+    return mapping::kMatrixSetupStageKind;
+  if (kind == "digital.vector_tile")
+    return mapping::kVectorTileStageKind;
+  if (kind == semantic_operation_names::kMVMTaskKind ||
+      kind == semantic_operation_names::kConvTileMVMTaskKind)
+    return mapping::kPhysicalMVMStageKind;
+  if (kind == semantic_operation_names::kTileRecombineTaskKind ||
+      kind == "digital.tile_recombine")
+    return mapping::kTileRecombineStageKind;
+  return mapping::kDigitalStageKind;
+}
+
+static void assignStageMetadata(mlir::func::FuncOp func) {
+  mlir::Builder builder(func.getContext());
+  mlir::StringAttr previousSection;
+  mlir::StringAttr previousName;
+  int64_t stageId = -1;
+
+  for (mlir::Operation &operation : func.front().without_terminator()) {
+    auto section = operation.getAttrOfType<mlir::StringAttr>(
+        "sculptor.semantic.section");
+    if (!section)
+      continue;
+    auto name = operation.getAttrOfType<mlir::StringAttr>(
+        "sculptor.semantic.name");
+    if (!name)
+      name = section;
+
+    if (section != previousSection || name != previousName) {
+      ++stageId;
+      previousSection = section;
+      previousName = name;
+    }
+
+    operation.setAttr(mapping::kStageIdAttrName,
+                      builder.getI64IntegerAttr(stageId));
+    operation.setAttr(mapping::kStageKindAttrName,
+                      builder.getStringAttr(getStageKind(section.getValue())));
+    operation.setAttr(mapping::kStageNameAttrName, name);
+  }
 }
 
 static mlir::StringAttr buildMatrixSetupName(mlir::OpBuilder &builder,
@@ -188,21 +255,9 @@ getStaticRank2F32Tensor(mlir::Type type) {
   return tensorTy;
 }
 
-static mlir::Value resolveTaskRegionInput(mlir::Value value) {
-  auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(value);
-  if (!blockArg)
-    return value;
-
-  auto taskRegion = llvm::dyn_cast_or_null<mlir::sculptor::TaskRegionOp>(
-      blockArg.getOwner()->getParentOp());
-  if (!taskRegion || blockArg.getArgNumber() >= taskRegion.getInputs().size())
-    return value;
-  return taskRegion.getInputs()[blockArg.getArgNumber()];
-}
-
 static mlir::FailureOr<MatrixOperand>
 matchMatrixOperand(mlir::sculptor::MVMOp mvmOp) {
-  mlir::Value matrix = resolveTaskRegionInput(mvmOp.getMatrix());
+  mlir::Value matrix = mvmOp.getMatrix();
   auto matrixConst = matrix.getDefiningOp<mlir::arith::ConstantOp>();
   if (!matrixConst)
     return mvmOp.emitError("expected sculptor.mvm matrix operand to be an "
@@ -225,56 +280,59 @@ matchMatrixOperand(mlir::sculptor::MVMOp mvmOp) {
   return MatrixOperand{matrixConst, *matrixType, denseResourceAttr};
 }
 
+static bool belongsToSemanticGroup(mlir::Operation *operation,
+                                   mlir::StringAttr section,
+                                   mlir::StringAttr name) {
+  return operation->getAttrOfType<mlir::StringAttr>(
+             "sculptor.semantic.section") == section &&
+         operation->getAttrOfType<mlir::StringAttr>(
+             "sculptor.semantic.name") == name;
+}
+
 static mlir::FailureOr<MVMSequenceMatch>
-matchMVMSequence(mlir::sculptor::TaskRegionOp region) {
-  if (region.getKind() != task_graph_names::kMVMSequenceTaskKind)
+matchMVMSequence(mlir::scf::ForOp loop) {
+  auto section = loop->getAttrOfType<mlir::StringAttr>(
+      "sculptor.semantic.section");
+  if (!section || section.getValue() != semantic_operation_names::kMVMSequenceTaskKind)
     return mlir::failure();
 
-  if (region.getInputs().size() != 2 || region.getNumResults() != 1) {
-    return region.emitOpError(
-               "expected MVM sequence to have vector and matrix inputs and "
-               "one result"),
+  if (loop.getNumResults() != 1)
+    return loop.emitOpError("expected MVM sequence loop to have one result"),
            mlir::failure();
-  }
 
-  auto vectorSequenceType =
-      getStaticRank2F32Tensor(region.getInputs().front().getType());
   auto resultSequenceType =
-      getStaticRank2F32Tensor(region.getResult(0).getType());
-  if (failed(vectorSequenceType) || failed(resultSequenceType)) {
-    return region.emitOpError(
-               "expected MVM sequence vectors and result to be static "
-               "rank-2 f32 tensors"),
+      getStaticRank2F32Tensor(loop.getResult(0).getType());
+  if (failed(resultSequenceType))
+    return loop.emitOpError(
+               "expected MVM sequence result to be a static rank-2 f32 tensor"),
            mlir::failure();
-  }
-
-  int64_t sequenceLength = (*vectorSequenceType).getDimSize(0);
-  if ((*resultSequenceType).getDimSize(0) != sequenceLength) {
-    return region.emitOpError(
-               "expected MVM sequence input and result leading dimensions "
-               "to match"),
-           mlir::failure();
-  }
 
   llvm::SmallVector<mlir::sculptor::MVMOp> mvmOps;
-  region.walk([&](mlir::sculptor::MVMOp mvmOp) { mvmOps.push_back(mvmOp); });
-  if (mvmOps.size() != 1) {
-    return region.emitOpError(
-               "expected MVM sequence body to contain exactly one "
-               "sculptor.mvm"),
+  loop.walk([&](mlir::sculptor::MVMOp mvmOp) { mvmOps.push_back(mvmOp); });
+  if (mvmOps.size() != 1)
+    return loop.emitOpError(
+               "expected MVM sequence loop to contain exactly one sculptor.mvm"),
            mlir::failure();
-  }
 
   mlir::sculptor::MVMOp mvmOp = mvmOps.front();
-  if (!mvmOp->getParentOfType<mlir::scf::ForOp>()) {
+  auto vectorSlice =
+      mvmOp.getVector().getDefiningOp<mlir::tensor::ExtractSliceOp>();
+  if (!vectorSlice)
     return mvmOp.emitOpError(
-               "expected MVM sequence execution to be nested in scf.for"),
+               "expected MVM sequence vector to come from tensor.extract_slice"),
            mlir::failure();
-  }
 
+  mlir::Value vectors = vectorSlice.getSource();
+  auto vectorSequenceType = getStaticRank2F32Tensor(vectors.getType());
   auto vectorType = getStaticRank2F32Tensor(mvmOp.getVector().getType());
   auto resultType = getStaticRank2F32Tensor(mvmOp.getResult().getType());
-  if (failed(vectorType) || failed(resultType) ||
+  if (failed(vectorSequenceType) || failed(vectorType) || failed(resultType))
+    return mvmOp.emitOpError(
+               "expected static rank-2 f32 MVM sequence tensor types"),
+           mlir::failure();
+
+  int64_t sequenceLength = (*vectorSequenceType).getDimSize(0);
+  if ((*resultSequenceType).getDimSize(0) != sequenceLength ||
       (*vectorType).getDimSize(0) != 1 || (*resultType).getDimSize(0) != 1 ||
       (*vectorType).getDimSize(1) != (*vectorSequenceType).getDimSize(1) ||
       (*resultType).getDimSize(1) != (*resultSequenceType).getDimSize(1)) {
@@ -284,9 +342,25 @@ matchMVMSequence(mlir::sculptor::TaskRegionOp region) {
            mlir::failure();
   }
 
-  return MVMSequenceMatch{region,
+  auto name = loop->getAttrOfType<mlir::StringAttr>("sculptor.semantic.name");
+  if (!name)
+    name = section;
+  llvm::SmallVector<mlir::Operation *> members;
+  mlir::Operation *first = loop.getOperation();
+  while (mlir::Operation *previous = first->getPrevNode()) {
+    if (!belongsToSemanticGroup(previous, section, name))
+      break;
+    first = previous;
+  }
+  for (mlir::Operation *operation = first;
+       operation && belongsToSemanticGroup(operation, section, name);
+       operation = operation->getNextNode())
+    members.push_back(operation);
+
+  return MVMSequenceMatch{loop.getOperation(),
+                          std::move(members),
                           mvmOp,
-                          region.getInputs().front(),
+                          vectors,
                           *vectorSequenceType,
                           *resultSequenceType,
                           sequenceLength};
@@ -317,8 +391,17 @@ buildMatrixPartitionSpec(mlir::sculptor::MVMOp mvmOp,
   spec.sourceResource = matrixOperand.resource.getRawHandle().getKey().str();
   spec.taskPrefix = getTaskNamePrefix(mvmOp.getOperation());
   spec.values = std::move(*values);
-  spec.gridRows = ceilDiv(shape[0], arrayRows);
-  spec.gridCols = ceilDiv(shape[1], arrayCols);
+  auto physicalPlan =
+      mapping::planGolemMVM(mvmOp, shape[0], shape[1], arrayRows, arrayCols);
+  if (failed(physicalPlan))
+    return mlir::failure();
+  spec.gridRows = physicalPlan->gridRows;
+  spec.gridCols = physicalPlan->gridColumns;
+  spec.physicalPlan = std::move(*physicalPlan);
+  spec.mappingOperationId = mvmOp->getAttrOfType<mlir::IntegerAttr>(
+      mapping::kMappingOperationIdAttrName);
+  spec.raLeafId =
+      mvmOp->getAttrOfType<mlir::IntegerAttr>(mapping::kRALeafIdAttrName);
   return spec;
 }
 
@@ -344,9 +427,9 @@ static mlir::LogicalResult
 recordLogicalArray(mlir::Operation *op, mlir::Value logicalArray,
                    llvm::StringMap<LogicalArrayGrid> &logicalArrays) {
   auto sourceAttr = op->getAttrOfType<mlir::StringAttr>(
-      tiling_attrs::kSourceResourceAttrName);
-  auto tile = getI64PairAttr(op, tiling_attrs::kTileAttrName);
-  auto grid = getI64PairAttr(op, tiling_attrs::kTileGridAttrName);
+      golem_tiling_attrs::kSourceResourceAttrName);
+  auto tile = getI64PairAttr(op, golem_tiling_attrs::kTileAttrName);
+  auto grid = getI64PairAttr(op, golem_tiling_attrs::kTileGridAttrName);
   if (!sourceAttr || !tile || !grid)
     return mlir::success();
 
@@ -378,21 +461,7 @@ recordLogicalArray(mlir::Operation *op, mlir::Value logicalArray,
 static mlir::LogicalResult
 indexExistingLogicalArrays(mlir::func::FuncOp func,
                            llvm::StringMap<LogicalArrayGrid> &logicalArrays) {
-  mlir::WalkResult result = func.walk([&](mlir::sculptor::TaskRegionOp region) {
-    if (region.getKind() != task_graph_names::kMatrixSetupTaskKind ||
-        region.getNumResults() != 1 ||
-        !llvm::isa<mlir::sculptor::LogicalArrayType>(
-            region.getResult(0).getType()))
-      return mlir::WalkResult::advance();
-    if (failed(recordLogicalArray(region.getOperation(), region.getResult(0),
-                                  logicalArrays)))
-      return mlir::WalkResult::interrupt();
-    return mlir::WalkResult::advance();
-  });
-  if (result.wasInterrupted())
-    return mlir::failure();
-
-  result = func.walk([&](mlir::sculptor::ArraySetOp arraySet) {
+  mlir::WalkResult result = func.walk([&](mlir::sculptor::ArraySetOp arraySet) {
     if (failed(recordLogicalArray(arraySet.getOperation(), arraySet.getArray(),
                                   logicalArrays)))
       return mlir::WalkResult::interrupt();
@@ -459,24 +528,24 @@ createTileConstant(const MatrixPartitionSpec &spec, int64_t tileRow,
   return tileConstant;
 }
 
-static void attachMatrixTileAttrs(mlir::Operation *op,
-                                  const MatrixPartitionSpec &spec,
-                                  int64_t tileRow, int64_t tileCol,
-                                  int64_t arrayRows, int64_t arrayCols,
-                                  mlir::RewriterBase &rewriter) {
+static void setMatrixTileAttrs(SemanticOperationScope &scope,
+                               const MatrixPartitionSpec &spec,
+                               int64_t tileRow, int64_t tileCol,
+                               int64_t arrayRows, int64_t arrayCols,
+                               mlir::Builder &builder) {
   MatrixTileExtent extent =
       getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
-  op->setAttr(tiling_attrs::kSourceResourceAttrName,
-              rewriter.getStringAttr(spec.sourceResource));
-  op->setAttr(tiling_attrs::kTileAttrName,
-              rewriter.getI64ArrayAttr({tileRow, tileCol}));
-  op->setAttr(tiling_attrs::kTileGridAttrName,
-              rewriter.getI64ArrayAttr({spec.gridRows, spec.gridCols}));
-  op->setAttr(
-      tiling_attrs::kTilePhysicalShapeAttrName,
-      rewriter.getI64ArrayAttr({extent.physicalRows, extent.physicalCols}));
-  op->setAttr(tiling_attrs::kTileValidShapeAttrName,
-              rewriter.getI64ArrayAttr({extent.validRows, extent.validCols}));
+  scope.set(golem_tiling_attrs::kSourceResourceAttrName,
+            builder.getStringAttr(spec.sourceResource));
+  scope.set(golem_tiling_attrs::kTileAttrName,
+            builder.getI64ArrayAttr({tileRow, tileCol}));
+  scope.set(golem_tiling_attrs::kTileGridAttrName,
+            builder.getI64ArrayAttr({spec.gridRows, spec.gridCols}));
+  scope.set(golem_tiling_attrs::kTilePhysicalShapeAttrName,
+            builder.getI64ArrayAttr(
+                {extent.physicalRows, extent.physicalCols}));
+  scope.set(golem_tiling_attrs::kTileValidShapeAttrName,
+            builder.getI64ArrayAttr({extent.validRows, extent.validCols}));
 }
 
 static mlir::sculptor::ArraySetOp
@@ -489,31 +558,25 @@ createArraySet(mlir::arith::ConstantOp tileConstant,
   return arraySet;
 }
 
-static mlir::Value createMatrixSetupRegion(MatrixPartitionSpec &spec,
-                                           int64_t tileRow, int64_t tileCol,
-                                           int64_t arrayRows, int64_t arrayCols,
-                                           mlir::RewriterBase &rewriter) {
-  auto logicalArrayType =
-      mlir::sculptor::LogicalArrayType::get(rewriter.getContext());
-  mlir::Location loc = spec.constant.getOperation()->getLoc();
-  auto setupRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{logicalArrayType}, mlir::ValueRange{},
-      task_graph_names::kMatrixSetupTaskKind,
-      buildMatrixSetupName(rewriter, spec, tileRow, tileCol));
-  attachMatrixTileAttrs(setupRegion.getOperation(), spec, tileRow, tileCol,
-                        arrayRows, arrayCols, rewriter);
-
-  mlir::Block *body = new mlir::Block();
-  setupRegion.getBody().push_back(body);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+static mlir::Value createMatrixSetup(MatrixPartitionSpec &spec, int64_t tileRow,
+                                     int64_t tileCol, int64_t arrayRows,
+                                     int64_t arrayCols,
+                                     mlir::RewriterBase &rewriter) {
+  SemanticOperationScope scope(
+      rewriter, semantic_operation_names::kMatrixSetupTaskKind,
+      buildMatrixSetupName(rewriter, spec, tileRow, tileCol).getValue());
+  if (spec.mappingOperationId)
+    scope.set(mapping::kMappingOperationIdAttrName, spec.mappingOperationId);
+  if (spec.raLeafId)
+    scope.set(mapping::kRALeafIdAttrName, spec.raLeafId);
+  setMatrixTileAttrs(scope, spec, tileRow, tileCol, arrayRows, arrayCols,
+                     rewriter);
 
   mlir::arith::ConstantOp tileConstant = createTileConstant(
       spec, tileRow, tileCol, arrayRows, arrayCols, rewriter);
   mlir::sculptor::ArraySetOp arraySet = createArraySet(tileConstant, rewriter);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, arraySet.getArray());
-  return setupRegion.getResult(0);
+  scope.annotate();
+  return arraySet.getArray();
 }
 
 static mlir::FailureOr<mlir::RankedTensorType>
@@ -538,35 +601,18 @@ getMVMVectorType(mlir::sculptor::MVMOp mvmOp,
   return *vectorType;
 }
 
-static void attachVectorTileAttrs(mlir::Operation *op, int64_t vectorTile,
-                                  int64_t vectorTileGrid, int64_t physicalCols,
-                                  int64_t validCols,
-                                  mlir::RewriterBase &rewriter) {
-  op->setAttr(tiling_attrs::kVectorTileAttrName,
-              rewriter.getI64IntegerAttr(vectorTile));
-  op->setAttr(tiling_attrs::kVectorTileGridAttrName,
-              rewriter.getI64IntegerAttr(vectorTileGrid));
-  op->setAttr(tiling_attrs::kVectorTilePhysicalColsAttrName,
-              rewriter.getI64IntegerAttr(physicalCols));
-  op->setAttr(tiling_attrs::kVectorTileValidColsAttrName,
-              rewriter.getI64IntegerAttr(validCols));
-}
-
-static mlir::sculptor::TaskRegionOp createDigitalPreparationRegion(
-    mlir::sculptor::MVMOp mvmOp, mlir::RankedTensorType resultType,
-    int64_t vectorTile, int64_t vectorTileGrid, int64_t physicalCols,
-    int64_t validCols, mlir::RewriterBase &rewriter) {
-  auto prepRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      mvmOp.getLoc(), mlir::TypeRange{resultType},
-      mlir::ValueRange{mvmOp.getVector()}, "digital.vector_tile",
-      buildVectorTileName(rewriter, mvmOp, vectorTile));
-  attachVectorTileAttrs(prepRegion.getOperation(), vectorTile, vectorTileGrid,
-                        physicalCols, validCols, rewriter);
-
-  mlir::Block *body = new mlir::Block();
-  prepRegion.getBody().push_back(body);
-  body->addArgument(mvmOp.getVector().getType(), mvmOp.getVector().getLoc());
-  return prepRegion;
+static void setVectorTileAttrs(SemanticOperationScope &scope,
+                               int64_t vectorTile, int64_t vectorTileGrid,
+                               int64_t physicalCols, int64_t validCols,
+                               mlir::Builder &builder) {
+  scope.set(golem_tiling_attrs::kVectorTileAttrName,
+            builder.getI64IntegerAttr(vectorTile));
+  scope.set(golem_tiling_attrs::kVectorTileGridAttrName,
+            builder.getI64IntegerAttr(vectorTileGrid));
+  scope.set(golem_tiling_attrs::kVectorTilePhysicalColsAttrName,
+            builder.getI64IntegerAttr(physicalCols));
+  scope.set(golem_tiling_attrs::kVectorTileValidColsAttrName,
+            builder.getI64IntegerAttr(validCols));
 }
 
 static mlir::Value createFullVectorTile(mlir::sculptor::MVMOp mvmOp,
@@ -576,20 +622,19 @@ static mlir::Value createFullVectorTile(mlir::sculptor::MVMOp mvmOp,
                                         mlir::RewriterBase &rewriter) {
   mlir::RankedTensorType tileType =
       mlir::RankedTensorType::get({1, arrayCols}, rewriter.getF32Type());
-  auto prepRegion = createDigitalPreparationRegion(mvmOp, tileType, vectorTile,
-                                                   vectorTileGrid, arrayCols,
-                                                   arrayCols, rewriter);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&prepRegion.getBody().front());
-  mlir::Value vectorArg = prepRegion.getBody().front().getArgument(0);
+  SemanticOperationScope scope(
+      rewriter, "digital.vector_tile",
+      buildVectorTileName(rewriter, mvmOp, vectorTile).getValue());
+  copyMappingIdentity(mvmOp, scope);
+  setVectorTileAttrs(scope, vectorTile, vectorTileGrid, arrayCols, arrayCols,
+                     rewriter);
   auto slice = rewriter.create<mlir::tensor::ExtractSliceOp>(
-      mvmOp.getLoc(), tileType, vectorArg,
+      mvmOp.getLoc(), tileType, mvmOp.getVector(),
       buildIndexAttrs(rewriter, {0, vectorTile * arrayCols}),
       buildIndexAttrs(rewriter, {1, arrayCols}),
       buildIndexAttrs(rewriter, {1, 1}));
-  rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(), slice.getResult());
-  return prepRegion.getResult(0);
+  scope.annotate();
+  return slice.getResult();
 }
 
 static mlir::Value
@@ -600,19 +645,18 @@ createPaddedVectorTile(mlir::sculptor::MVMOp mvmOp, int64_t vectorTile,
       mlir::RankedTensorType::get({1, arrayCols}, rewriter.getF32Type());
   mlir::RankedTensorType sourceTileType =
       mlir::RankedTensorType::get({1, remainingCols}, rewriter.getF32Type());
-  auto prepRegion = createDigitalPreparationRegion(
-      mvmOp, fullTileType, vectorTile, vectorTileGrid, arrayCols, remainingCols,
-      rewriter);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&prepRegion.getBody().front());
-  mlir::Value vectorArg = prepRegion.getBody().front().getArgument(0);
+  SemanticOperationScope scope(
+      rewriter, "digital.vector_tile",
+      buildVectorTileName(rewriter, mvmOp, vectorTile).getValue());
+  copyMappingIdentity(mvmOp, scope);
+  setVectorTileAttrs(scope, vectorTile, vectorTileGrid, arrayCols, remainingCols,
+                     rewriter);
   auto zeroAttr =
       llvm::cast<mlir::TypedAttr>(rewriter.getZeroAttr(fullTileType));
   auto zeroTile = rewriter.create<mlir::arith::ConstantOp>(
       mvmOp.getLoc(), fullTileType, zeroAttr);
   auto sourceSlice = rewriter.create<mlir::tensor::ExtractSliceOp>(
-      mvmOp.getLoc(), sourceTileType, vectorArg,
+      mvmOp.getLoc(), sourceTileType, mvmOp.getVector(),
       buildIndexAttrs(rewriter, {0, vectorTile * arrayCols}),
       buildIndexAttrs(rewriter, {1, remainingCols}),
       buildIndexAttrs(rewriter, {1, 1}));
@@ -621,9 +665,8 @@ createPaddedVectorTile(mlir::sculptor::MVMOp mvmOp, int64_t vectorTile,
       buildIndexAttrs(rewriter, {0, 0}),
       buildIndexAttrs(rewriter, {1, remainingCols}),
       buildIndexAttrs(rewriter, {1, 1}));
-  rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(),
-                                           paddedTile.getResult());
-  return prepRegion.getResult(0);
+  scope.annotate();
+  return paddedTile.getResult();
 }
 
 static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
@@ -652,31 +695,30 @@ createVectorTiles(mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
   return vectorTiles;
 }
 
-static void attachArrayExecutionAttrs(mlir::Operation *op,
-                                      const MatrixPartitionSpec &spec,
-                                      int64_t tileRow, int64_t tileCol,
-                                      int64_t vectorTile, int64_t arrayRows,
-                                      int64_t arrayCols,
-                                      mlir::RewriterBase &rewriter) {
+static void setArrayExecutionAttrs(SemanticOperationScope &scope,
+                                   const MatrixPartitionSpec &spec,
+                                   int64_t tileRow, int64_t tileCol,
+                                   int64_t vectorTile, int64_t arrayRows,
+                                   int64_t arrayCols, mlir::Builder &builder) {
   MatrixTileExtent extent =
       getMatrixTileExtent(spec, tileRow, tileCol, arrayRows, arrayCols);
-  attachMatrixTileAttrs(op, spec, tileRow, tileCol, arrayRows, arrayCols,
-                        rewriter);
-  attachVectorTileAttrs(op, vectorTile, spec.gridCols, extent.physicalCols,
-                        extent.validCols, rewriter);
+  setMatrixTileAttrs(scope, spec, tileRow, tileCol, arrayRows, arrayCols,
+                     builder);
+  setVectorTileAttrs(scope, vectorTile, spec.gridCols, extent.physicalCols,
+                     extent.validCols, builder);
 }
 
 static void attachArrayStoreShapeAttrs(mlir::Operation *op,
                                        const MatrixTileExtent &extent,
                                        mlir::Builder &builder) {
   op->setAttr(
-      tiling_attrs::kTilePhysicalShapeAttrName,
+      golem_tiling_attrs::kTilePhysicalShapeAttrName,
       builder.getI64ArrayAttr({extent.physicalRows, extent.physicalCols}));
-  op->setAttr(tiling_attrs::kTileValidShapeAttrName,
+  op->setAttr(golem_tiling_attrs::kTileValidShapeAttrName,
               builder.getI64ArrayAttr({extent.validRows, extent.validCols}));
 }
 
-static mlir::Value createArrayExecutionRegion(
+static mlir::Value createArrayExecution(
     mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
     mlir::Value vectorTileValue, mlir::Value logicalArray, int64_t tileRow,
     int64_t vectorTile, int64_t arrayRows, int64_t arrayCols,
@@ -686,42 +728,26 @@ static mlir::Value createArrayExecutionRegion(
   mlir::RankedTensorType storeType =
       mlir::RankedTensorType::get({1, extent.validRows}, rewriter.getF32Type());
 
-  llvm::SmallVector<mlir::Value> inputs = {vectorTileValue, logicalArray};
-  auto executionRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      mvmOp.getLoc(), mlir::TypeRange{storeType}, mlir::ValueRange(inputs),
-      task_graph_names::kMVMTaskKind,
-      buildMVMName(rewriter, mvmOp, tileRow, vectorTile));
-  attachArrayExecutionAttrs(executionRegion.getOperation(), spec, tileRow,
-                            vectorTile, vectorTile, arrayRows, arrayCols,
-                            rewriter);
+  SemanticOperationScope scope(
+      rewriter, semantic_operation_names::kMVMTaskKind,
+      buildMVMName(rewriter, mvmOp, tileRow, vectorTile).getValue());
+  copyMappingIdentity(mvmOp, scope);
+  setArrayExecutionAttrs(scope, spec, tileRow, vectorTile, vectorTile,
+                         arrayRows, arrayCols, rewriter);
 
-  mlir::Block *body = new mlir::Block();
-  executionRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {vectorTileValue.getType(),
-                                              logicalArray.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {vectorTileValue.getLoc(),
-                                                 logicalArray.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-
-  mlir::Value vectorArg = body->getArgument(0);
-  mlir::Value arrayArg = body->getArgument(1);
-  rewriter.create<mlir::sculptor::ArrayLoadOp>(mvmOp.getLoc(), vectorArg,
-                                               arrayArg);
+  auto loadedType = mlir::sculptor::ArrayLoadedType::get(rewriter.getContext());
+  auto arrayLoad = rewriter.create<mlir::sculptor::ArrayLoadOp>(
+      mvmOp.getLoc(), loadedType, vectorTileValue, logicalArray);
 
   auto resultType = mlir::sculptor::ArrayResultType::get(rewriter.getContext());
   auto arrayExecute = rewriter.create<mlir::sculptor::ArrayExecuteOp>(
-      mvmOp.getLoc(), resultType, arrayArg);
+      mvmOp.getLoc(), resultType, arrayLoad.getLoaded(), logicalArray);
 
   auto arrayStore = rewriter.create<mlir::sculptor::ArrayStoreOp>(
-      mvmOp.getLoc(), storeType, arrayExecute.getResult());
+      mvmOp.getLoc(), storeType, arrayExecute.getResult(), logicalArray);
   attachArrayStoreShapeAttrs(arrayStore, extent, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(),
-                                           arrayStore.getOutput());
-  return executionRegion.getResult(0);
+  scope.annotate();
+  return arrayStore.getOutput();
 }
 
 static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
@@ -753,7 +779,7 @@ getOrCreateLogicalArrays(MatrixPartitionSpec &spec,
       }
 
       rewriter.setInsertionPointAfter(insertAfter);
-      mlir::Value setupResult = createMatrixSetupRegion(
+      mlir::Value setupResult = createMatrixSetup(
           spec, tileRow, tileCol, arrayRows, arrayCols, rewriter);
       cached.values[index] = setupResult;
       insertAfter = setupResult.getDefiningOp();
@@ -778,7 +804,7 @@ createArrayLoads(mlir::sculptor::MVMOp mvmOp, const MatrixPartitionSpec &spec,
   for (int64_t vectorTile = 0; vectorTile < spec.gridCols; ++vectorTile) {
     for (int64_t tileRow = 0; tileRow < spec.gridRows; ++tileRow) {
       int64_t index = getTileIndex(spec, tileRow, vectorTile);
-      partialTiles[index] = createArrayExecutionRegion(
+      partialTiles[index] = createArrayExecution(
           mvmOp, spec, vectorTiles[vectorTile], logicalArrays[index], tileRow,
           vectorTile, arrayRows, arrayCols, rewriter);
     }
@@ -791,7 +817,7 @@ static mlir::Value createEmptyTensor(mlir::Location loc,
                                      mlir::RankedTensorType type,
                                      mlir::RewriterBase &rewriter);
 
-static mlir::Value createSequenceArrayExecutionRegion(
+static mlir::Value createSequenceArrayExecution(
     MVMSequenceMatch &sequence, const MatrixPartitionSpec &spec,
     mlir::Value logicalArray, int64_t tileRow, int64_t vectorTile,
     int64_t arrayRows, int64_t arrayCols, mlir::RewriterBase &rewriter) {
@@ -806,33 +832,20 @@ static mlir::Value createSequenceArrayExecutionRegion(
   mlir::RankedTensorType storedRowType =
       mlir::RankedTensorType::get({1, extent.validRows}, rewriter.getF32Type());
 
-  auto executionRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      sequence.region.getLoc(), mlir::TypeRange{partialType},
-      mlir::ValueRange{sequence.vectors, logicalArray},
-      task_graph_names::kConvTileMVMTaskKind,
-      buildMVMName(rewriter, sequence.mvm, tileRow, vectorTile));
-  attachArrayExecutionAttrs(executionRegion.getOperation(), spec, tileRow,
-                            vectorTile, vectorTile, arrayRows, arrayCols,
-                            rewriter);
-  executionRegion->setAttr(runtime_attrs::kTaskAnalogExecutionCountAttrName,
-                           rewriter.getI64IntegerAttr(sequence.sequenceLength));
-
-  mlir::Block *body = new mlir::Block();
-  executionRegion.getBody().push_back(body);
-  body->addArgument(sequence.vectorSequenceType, sequence.vectors.getLoc());
-  body->addArgument(logicalArray.getType(), logicalArray.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-
+  SemanticOperationScope scope(
+      rewriter, semantic_operation_names::kConvTileMVMTaskKind,
+      buildMVMName(rewriter, sequence.mvm, tileRow, vectorTile).getValue());
+  copyMappingIdentity(sequence.mvm, scope);
+  setArrayExecutionAttrs(scope, spec, tileRow, vectorTile, vectorTile,
+                         arrayRows, arrayCols, rewriter);
   mlir::Value zero = rewriter.create<mlir::arith::ConstantIndexOp>(
-      sequence.region.getLoc(), 0);
+      sequence.getLoc(), 0);
   mlir::Value one = rewriter.create<mlir::arith::ConstantIndexOp>(
-      sequence.region.getLoc(), 1);
+      sequence.getLoc(), 1);
   mlir::Value upper = rewriter.create<mlir::arith::ConstantIndexOp>(
-      sequence.region.getLoc(), sequence.sequenceLength);
+      sequence.getLoc(), sequence.sequenceLength);
   mlir::Value partialInit = rewriter.create<mlir::tensor::EmptyOp>(
-      sequence.region.getLoc(), partialType.getShape(),
+      sequence.getLoc(), partialType.getShape(),
       partialType.getElementType());
 
   mlir::Value zeroVector;
@@ -841,17 +854,17 @@ static mlir::Value createSequenceArrayExecutionRegion(
         llvm::cast<mlir::TypedAttr>(rewriter.getZeroAttr(physicalVectorType));
     zeroVector = rewriter
                      .create<mlir::arith::ConstantOp>(
-                         sequence.region.getLoc(), physicalVectorType, zeroAttr)
+                         sequence.getLoc(), physicalVectorType, zeroAttr)
                      .getResult();
   }
 
   int64_t columnOffset = vectorTile * arrayCols;
   auto rowLoop = rewriter.create<mlir::scf::ForOp>(
-      sequence.region.getLoc(), zero, upper, one, mlir::ValueRange{partialInit},
+      sequence.getLoc(), zero, upper, one, mlir::ValueRange{partialInit},
       [&](mlir::OpBuilder &loopBuilder, mlir::Location loopLoc, mlir::Value row,
           mlir::ValueRange iterArgs) {
         auto sourceSlice = loopBuilder.create<mlir::tensor::ExtractSliceOp>(
-            loopLoc, sourceVectorType, body->getArgument(0),
+            loopLoc, sourceVectorType, sequence.vectors,
             buildRowOffsets(loopBuilder, row, columnOffset),
             buildIndexAttrs(loopBuilder, {1, extent.validCols}),
             buildIndexAttrs(loopBuilder, {1, 1}));
@@ -867,14 +880,17 @@ static mlir::Value createSequenceArrayExecutionRegion(
                        .getResult();
         }
 
-        mlir::Value array = body->getArgument(1);
-        loopBuilder.create<mlir::sculptor::ArrayLoadOp>(loopLoc, vector, array);
+        mlir::Value array = logicalArray;
+        auto loadedType =
+            mlir::sculptor::ArrayLoadedType::get(rewriter.getContext());
+        auto loaded = loopBuilder.create<mlir::sculptor::ArrayLoadOp>(
+            loopLoc, loadedType, vector, array);
         auto resultType =
             mlir::sculptor::ArrayResultType::get(rewriter.getContext());
         auto executed = loopBuilder.create<mlir::sculptor::ArrayExecuteOp>(
-            loopLoc, resultType, array);
+            loopLoc, resultType, loaded.getLoaded(), array);
         auto store = loopBuilder.create<mlir::sculptor::ArrayStoreOp>(
-            loopLoc, storedRowType, executed.getResult());
+            loopLoc, storedRowType, executed.getResult(), array);
         attachArrayStoreShapeAttrs(store, extent, loopBuilder);
         mlir::Value stored = store.getOutput();
         mlir::Value updated =
@@ -889,9 +905,8 @@ static mlir::Value createSequenceArrayExecutionRegion(
       });
 
   rewriter.setInsertionPointAfter(rowLoop);
-  rewriter.create<mlir::sculptor::YieldOp>(sequence.region.getLoc(),
-                                           rowLoop.getResult(0));
-  return executionRegion.getResult(0);
+  scope.annotate();
+  return rowLoop.getResult(0);
 }
 
 static mlir::FailureOr<llvm::SmallVector<mlir::Value>>
@@ -902,7 +917,7 @@ createSequenceArrayExecutions(MVMSequenceMatch &sequence,
                               mlir::RewriterBase &rewriter) {
   if (static_cast<int64_t>(logicalArrays.size()) !=
       spec.gridRows * spec.gridCols) {
-    return sequence.region.emitOpError(
+    return sequence.emitError(
                "internal error: mismatched logical-array tile count for "
                "MVM sequence expansion"),
            mlir::failure();
@@ -912,7 +927,7 @@ createSequenceArrayExecutions(MVMSequenceMatch &sequence,
   for (int64_t vectorTile = 0; vectorTile < spec.gridCols; ++vectorTile) {
     for (int64_t tileRow = 0; tileRow < spec.gridRows; ++tileRow) {
       int64_t index = getTileIndex(spec, tileRow, vectorTile);
-      partials[index] = createSequenceArrayExecutionRegion(
+      partials[index] = createSequenceArrayExecution(
           sequence, spec, logicalArrays[index], tileRow, vectorTile, arrayRows,
           arrayCols, rewriter);
     }
@@ -930,9 +945,9 @@ static mlir::Value sumSequenceRowPartials(MVMSequenceMatch &sequence,
   for (int64_t tileCol = 1; tileCol < spec.gridCols; ++tileCol) {
     mlir::Value rhs = partials[getTileIndex(spec, tileRow, tileCol)];
     mlir::Value init =
-        createEmptyTensor(sequence.region.getLoc(), rowType, rewriter);
+        createEmptyTensor(sequence.getLoc(), rowType, rewriter);
     row = rewriter
-              .create<mlir::linalg::AddOp>(sequence.region.getLoc(),
+              .create<mlir::linalg::AddOp>(sequence.getLoc(),
                                            mlir::ValueRange{row, rhs},
                                            mlir::ValueRange{init})
               .getResult(0);
@@ -945,36 +960,23 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMSequenceResult(
     llvm::ArrayRef<mlir::Value> partials, int64_t arrayRows, int64_t arrayCols,
     mlir::RewriterBase &rewriter) {
   if (static_cast<int64_t>(partials.size()) != spec.gridRows * spec.gridCols) {
-    return sequence.region.emitOpError(
+    return sequence.emitError(
                "internal error: mismatched partial tile count for MVM "
                "sequence recombination"),
            mlir::failure();
   }
 
-  auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      sequence.region.getLoc(), mlir::TypeRange{sequence.resultSequenceType},
-      mlir::ValueRange(partials), task_graph_names::kTileRecombineTaskKind,
-      buildTileRecombineName(rewriter, sequence.mvm));
+  SemanticOperationScope scope(
+      rewriter, semantic_operation_names::kTileRecombineTaskKind,
+      buildTileRecombineName(rewriter, sequence.mvm).getValue());
+  copyMappingIdentity(sequence.mvm, scope);
   if (spec.gridRows == 1 && spec.gridCols > 1) {
-    recombineRegion->setAttr(
+    scope.set(
         mlir::sculptor::task_graph_attrs::kTaskReductionAttrName,
         mlir::sculptor::TaskReductionAttr::get(
             rewriter.getContext(), mlir::sculptor::TaskReductionKind::Add,
             rewriter.getBoolAttr(true)));
   }
-
-  mlir::Block *body = new mlir::Block();
-  recombineRegion.getBody().push_back(body);
-  for (mlir::Value partial : partials)
-    body->addArgument(partial.getType(), partial.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-
-  llvm::SmallVector<mlir::Value> regionPartials;
-  regionPartials.reserve(body->getNumArguments());
-  for (mlir::BlockArgument arg : body->getArguments())
-    regionPartials.push_back(arg);
 
   llvm::SmallVector<mlir::Value> rowResults;
   rowResults.reserve(spec.gridRows);
@@ -984,13 +986,13 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMSequenceResult(
         getMatrixTileExtent(spec, tileRow, 0, arrayRows, arrayCols);
     mlir::RankedTensorType rowType = mlir::RankedTensorType::get(
         {sequence.sequenceLength, extent.validRows}, rewriter.getF32Type());
-    rowResults.push_back(sumSequenceRowPartials(sequence, spec, regionPartials,
+    rowResults.push_back(sumSequenceRowPartials(sequence, spec, partials,
                                                 tileRow, rowType, rewriter));
     recombinedWidth += extent.validRows;
   }
 
   if (recombinedWidth != sequence.resultSequenceType.getDimSize(1)) {
-    return sequence.region.emitOpError(
+    return sequence.emitError(
                "internal error: valid row tile extents do not match MVM "
                "sequence result width"),
            mlir::failure();
@@ -1000,14 +1002,13 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMSequenceResult(
   if (spec.gridRows > 1) {
     recombined = rewriter
                      .create<mlir::tensor::ConcatOp>(
-                         sequence.region.getLoc(), sequence.resultSequenceType,
+                         sequence.getLoc(), sequence.resultSequenceType,
                          /*dim=*/1, mlir::ValueRange(rowResults))
                      .getResult();
   }
 
-  rewriter.create<mlir::sculptor::YieldOp>(sequence.region.getLoc(),
-                                           recombined);
-  return recombineRegion.getResult(0);
+  scope.annotate();
+  return recombined;
 }
 
 static mlir::FailureOr<mlir::RankedTensorType>
@@ -1077,39 +1078,19 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMResult(
 
   int64_t resultWidth = (*resultType).getDimSize(1);
 
-  auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      mvmOp.getLoc(), mlir::TypeRange{*resultType},
-      mlir::ValueRange(partialTiles), "digital.tile_recombine",
-      buildTileRecombineName(rewriter, mvmOp));
+  SemanticOperationScope scope(
+      rewriter, "digital.tile_recombine",
+      buildTileRecombineName(rewriter, mvmOp).getValue());
+  copyMappingIdentity(mvmOp, scope);
   // One-row recombination is an associative sum of equal-shaped partials.
   // Multi-row recombination also concatenates rows and is not one reduction.
   if (spec.gridRows == 1 && spec.gridCols > 1) {
-    recombineRegion->setAttr(
+    scope.set(
         mlir::sculptor::task_graph_attrs::kTaskReductionAttrName,
         mlir::sculptor::TaskReductionAttr::get(
             rewriter.getContext(), mlir::sculptor::TaskReductionKind::Add,
             rewriter.getBoolAttr(true)));
   }
-
-  mlir::Block *body = new mlir::Block();
-  recombineRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> partialTypes;
-  llvm::SmallVector<mlir::Location> partialLocs;
-  partialTypes.reserve(partialTiles.size());
-  partialLocs.reserve(partialTiles.size());
-  for (mlir::Value partialTile : partialTiles) {
-    partialTypes.push_back(partialTile.getType());
-    partialLocs.push_back(partialTile.getLoc());
-  }
-  body->addArguments(partialTypes, partialLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-
-  llvm::SmallVector<mlir::Value> regionPartialTiles;
-  regionPartialTiles.reserve(body->getNumArguments());
-  for (mlir::BlockArgument arg : body->getArguments())
-    regionPartialTiles.push_back(arg);
 
   llvm::SmallVector<mlir::Value> rowResults;
   rowResults.reserve(spec.gridRows);
@@ -1119,7 +1100,7 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMResult(
         getMatrixTileExtent(spec, tileRow, 0, arrayRows, arrayCols);
     mlir::RankedTensorType rowTileType = mlir::RankedTensorType::get(
         {1, extent.validRows}, rewriter.getF32Type());
-    rowResults.push_back(sumRowPartials(mvmOp, spec, regionPartialTiles,
+    rowResults.push_back(sumRowPartials(mvmOp, spec, partialTiles,
                                         tileRow, rowTileType, rewriter));
     recombinedWidth += extent.validRows;
   }
@@ -1138,8 +1119,8 @@ static mlir::FailureOr<mlir::Value> createRecombinedMVMResult(
                      .getResult();
   }
 
-  rewriter.create<mlir::sculptor::YieldOp>(mvmOp.getLoc(), recombined);
-  return recombineRegion.getResult(0);
+  scope.annotate();
+  return recombined;
 }
 
 struct MVMExpansionWalker {
@@ -1148,7 +1129,7 @@ struct MVMExpansionWalker {
 
   mlir::LogicalResult run(mlir::ModuleOp module) {
     for (mlir::func::FuncOp func : module.getOps<mlir::func::FuncOp>()) {
-      if (!shouldProcessFunction(func))
+      if (func.isExternal())
         continue;
 
       if (failed(walkFunction(func)))
@@ -1167,15 +1148,24 @@ private:
     if (failed(indexExistingLogicalArrays(func, state.logicalArrays)))
       return mlir::failure();
 
-    llvm::SmallVector<mlir::sculptor::TaskRegionOp> sequenceRegions;
+    llvm::SmallVector<MVMSequenceMatch> sequences;
     for (mlir::Operation &op : func.front().without_terminator()) {
-      auto region = llvm::dyn_cast<mlir::sculptor::TaskRegionOp>(&op);
-      if (region && region.getKind() == task_graph_names::kMVMSequenceTaskKind)
-        sequenceRegions.push_back(region);
+      auto loop = llvm::dyn_cast<mlir::scf::ForOp>(&op);
+      if (!loop)
+        continue;
+      auto section = loop->getAttrOfType<mlir::StringAttr>(
+          "sculptor.semantic.section");
+      if (!section ||
+          section.getValue() != semantic_operation_names::kMVMSequenceTaskKind)
+        continue;
+      auto sequence = matchMVMSequence(loop);
+      if (failed(sequence))
+        return mlir::failure();
+      sequences.push_back(std::move(*sequence));
     }
 
-    for (mlir::sculptor::TaskRegionOp region : sequenceRegions) {
-      if (failed(handleMVMSequenceRegion(state, region)))
+    for (MVMSequenceMatch &sequence : sequences) {
+      if (failed(handleMVMSequence(state, sequence)))
         return mlir::failure();
     }
 
@@ -1190,6 +1180,8 @@ private:
         return mlir::failure();
     }
 
+    assignStageMetadata(func);
+
     llvm::SmallPtrSet<mlir::Operation *, 16> seenConstants;
     for (mlir::arith::ConstantOp constant : state.matrixConstants) {
       if (constant && seenConstants.insert(constant.getOperation()).second &&
@@ -1200,41 +1192,37 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult
-  handleMVMSequenceRegion(FunctionExpansionState &state,
-                          mlir::sculptor::TaskRegionOp region) {
-    auto sequence = matchMVMSequence(region);
-    if (failed(sequence))
-      return mlir::failure();
-
-    auto spec = getOrCreateMatrixSpec(state, sequence->mvm);
+  mlir::LogicalResult handleMVMSequence(FunctionExpansionState &state,
+                                        MVMSequenceMatch &sequence) {
+    auto spec = getOrCreateMatrixSpec(state, sequence.mvm);
     if (failed(spec))
       return mlir::failure();
-    if (sequence->vectorSequenceType.getDimSize(1) !=
+    if (sequence.vectorSequenceType.getDimSize(1) !=
         (*spec)->type.getDimSize(1)) {
-      return region.emitOpError(
+      return sequence.emitError(
           "expected MVM sequence vector width to match matrix width");
     }
 
-    mlir::IRRewriter rewriter(region.getContext());
+    mlir::IRRewriter rewriter(sequence.anchor->getContext());
     auto logicalArrays = getOrCreateLogicalArrays(
         **spec, state.logicalArrays, arrayRows, arrayCols, rewriter);
     if (failed(logicalArrays))
       return mlir::failure();
 
-    rewriter.setInsertionPoint(region);
+    rewriter.setInsertionPoint(sequence.getInsertionAnchor());
     auto partials = createSequenceArrayExecutions(
-        *sequence, **spec, *logicalArrays, arrayRows, arrayCols, rewriter);
+        sequence, **spec, *logicalArrays, arrayRows, arrayCols, rewriter);
     if (failed(partials))
       return mlir::failure();
 
     auto recombined = createRecombinedMVMSequenceResult(
-        *sequence, **spec, *partials, arrayRows, arrayCols, rewriter);
+        sequence, **spec, *partials, arrayRows, arrayCols, rewriter);
     if (failed(recombined))
       return mlir::failure();
 
-    region.getResult(0).replaceAllUsesWith(*recombined);
-    rewriter.eraseOp(region);
+    sequence.anchor->getResult(0).replaceAllUsesWith(*recombined);
+    for (mlir::Operation *member : llvm::reverse(sequence.members))
+      rewriter.eraseOp(member);
     return mlir::success();
   }
 

@@ -1,0 +1,9 @@
+set(SCULPTOR_MAPPING_PLANNER_SOURCES
+  planners/MappingPlannerRegistry.cpp
+  planners/RegisterMappingPlanners.cpp
+  planners/ConsumerBoundFill/ConsumerBoundFillPlanner.cpp
+  planners/FanOutCut/FanOutCutPlanner.cpp
+  planners/MVMWave/MVMWavePlanner.cpp
+  planners/SetupFirst/SetupFirstPlanner.cpp
+  PARENT_SCOPE
+)

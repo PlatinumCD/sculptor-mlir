@@ -1,0 +1,14 @@
+set(SCULPTOR_MAPPING_SOURCES
+  mapping/ComputeGraph.cpp
+  mapping/GolemMVMPlanning.cpp
+  mapping/LogicalTile.cpp
+  mapping/LogicalTileGraph.cpp
+  mapping/LogicalTilePlacement.cpp
+  mapping/LogicalTileSchedulers.cpp
+  mapping/MappingConfig.cpp
+  mapping/MappingEvaluator.cpp
+  mapping/MappingPlan.cpp
+  mapping/MappingRealization.cpp
+  mapping/ResourceAllocationTree.cpp
+  PARENT_SCOPE
+)

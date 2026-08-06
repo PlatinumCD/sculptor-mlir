@@ -1,6 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/LowerTaskGraphABI.h"
+#include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/LowerTileRuntimeABI.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 
 // Converts Sculptor Golem execution ops and task graph array bindings to
@@ -41,10 +41,11 @@ void populateConversionPatterns(RewritePatternSet &patterns,
 void configureConversionTarget(ConversionTarget &target,
                                TypeConverter &typeConverter) {
   target.addIllegalDialect<sculptor::SculptorDialect>();
-  target.addLegalOp<sculptor::TaskGraphCreateOp, sculptor::TaskGraphInputOp,
-                    sculptor::TaskGraphOutputOp,
-                    sculptor::TaskGraphIntermediateOp,
-                    sculptor::TaskGraphPersistentOp>();
+  target.addLegalOp<
+      sculptor::TaskGraphCreateOp, sculptor::TaskGraphInputOp,
+      sculptor::TaskGraphOutputOp, sculptor::TaskGraphIntermediateOp,
+      sculptor::TaskGraphPersistentOp, sculptor::TaskGraphRouteInputOp,
+      sculptor::TaskGraphRouteOutputOp>();
   target.addDynamicallyLegalOp<sculptor::TaskCreateOp>(
       [](sculptor::TaskCreateOp op) {
         auto hasLogicalArrayResource = [](ValueRange resources) {
@@ -91,7 +92,7 @@ void LowerGolemToLLVMShimsPass::runOnOperation() {
   TypeConverter typeConverter;
   golem::populateSculptorTypeConversions(typeConverter);
 
-  if (failed(golem::lowerTaskGraphABI(module, typeConverter))) {
+  if (failed(golem::lowerTileRuntimeABI(module, typeConverter))) {
     signalPassFailure();
     return;
   }

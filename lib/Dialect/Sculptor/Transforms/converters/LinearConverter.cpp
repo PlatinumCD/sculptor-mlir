@@ -101,6 +101,54 @@ matchExtractedLinearLayer(mlir::func::FuncOp func) {
   return lowering;
 }
 
+// Validates one inline canonical linear operation without imposing an
+// outlining or task boundary.
+static mlir::FailureOr<LinearLowering>
+matchInlineLinearLayer(NNLinearOp linearOp) {
+  auto inputTy =
+      tensor_type::getStaticRank2F32Tensor(linearOp.getInput().getType());
+  auto weightTy =
+      tensor_type::getStaticRank2F32Tensor(linearOp.getWeight().getType());
+  auto resultTy =
+      tensor_type::getStaticRank2F32Tensor(linearOp.getResult().getType());
+  if (mlir::failed(inputTy) || mlir::failed(weightTy) ||
+      mlir::failed(resultTy))
+    return mlir::failure();
+
+  auto inputShape = (*inputTy).getShape();
+  auto weightShape = (*weightTy).getShape();
+  auto resultShape = (*resultTy).getShape();
+  if (inputShape[0] <= 0 || inputShape[1] <= 0 || weightShape[0] <= 0 ||
+      weightShape[1] <= 0 || inputShape[1] != weightShape[1] ||
+      resultShape[0] != inputShape[0] ||
+      resultShape[1] != weightShape[0] ||
+      !linearOp.getWeight().getDefiningOp<ConstantOp>())
+    return mlir::failure();
+
+  ConstantOp biasConstant;
+  mlir::Value bias = linearOp.getBias();
+  if (linearOp.getHasBias()) {
+    if (!bias)
+      return mlir::failure();
+    auto biasTy = llvm::dyn_cast<mlir::RankedTensorType>(bias.getType());
+    biasConstant = bias.getDefiningOp<ConstantOp>();
+    if (!biasTy || !biasTy.hasStaticShape() || biasTy.getRank() != 1 ||
+        !biasTy.getElementType().isF32() ||
+        biasTy.getShape()[0] != weightShape[0] || !biasConstant)
+      return mlir::failure();
+  } else if (bias) {
+    return mlir::failure();
+  }
+
+  LinearLowering lowering;
+  lowering.linearOp = linearOp;
+  lowering.inputTy = *inputTy;
+  lowering.weightTy = *weightTy;
+  lowering.resultTy = *resultTy;
+  lowering.biasConstant = biasConstant;
+  return lowering;
+}
+
 static mlir::Value buildMVM(LinearLowering &match,
                             mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.linearOp.getLoc();
@@ -110,49 +158,46 @@ static mlir::Value buildMVM(LinearLowering &match,
 }
 
 static mlir::FailureOr<mlir::Value>
-buildPostProcessRegion(LinearLowering &match,
-                       mlir::Value mvmResult,
-                       mlir::RewriterBase &rewriter) {
+buildPostProcess(LinearLowering &match, mlir::Value mvmResult,
+                 mlir::RewriterBase &rewriter) {
   mlir::Value bias = match.linearOp.getBias();
   mlir::Location loc = match.linearOp.getLoc();
   rewriter.setInsertionPoint(match.linearOp);
+  if (!bias)
+    return mvmResult;
 
-  llvm::SmallVector<mlir::Value> inputs = {mvmResult};
-  llvm::SmallVector<mlir::Type> inputTypes = {mvmResult.getType()};
-
-  auto postProcess = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy}, mlir::ValueRange(inputs),
-      "digital.bias_add", rewriter.getStringAttr("linear_bias_add"));
-
-  mlir::Block *body = new mlir::Block();
-  postProcess.getBody().push_back(body);
-  llvm::SmallVector<mlir::Location> argLocs(inputTypes.size(), loc);
-  body->addArguments(inputTypes, argLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-
-  mlir::Value postProcessResult = body->getArgument(0);
-  if (!bias) {
-    rewriter.create<mlir::sculptor::YieldOp>(loc, postProcessResult);
-    return postProcess.getResult(0);
-  }
-
-  mlir::IRMapping mapping;
-  auto clonedBiasConstant =
-      llvm::cast<ConstantOp>(rewriter.clone(*match.biasConstant, mapping));
   llvm::SmallVector<mlir::ReassociationIndices, 2> reassociation = {{0, 1}};
   mlir::Value expandedBias = rewriter.create<mlir::tensor::ExpandShapeOp>(
-      loc, match.resultTy, clonedBiasConstant.getResult(), reassociation);
+      loc, match.resultTy, bias, reassociation);
   mlir::Value biasedInit = rewriter.create<EmptyOp>(
       loc, match.resultTy.getShape(), match.resultTy.getElementType());
-  postProcessResult = rewriter
-      .create<mlir::linalg::AddOp>(
-          loc, mlir::ValueRange{body->getArgument(0), expandedBias},
-          mlir::ValueRange{biasedInit})
-      .getResult(0);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, postProcessResult);
-  return postProcess.getResult(0);
+  auto add = rewriter.create<mlir::linalg::AddOp>(
+      loc, mlir::ValueRange{mvmResult, expandedBias},
+      mlir::ValueRange{biasedInit});
+  add->setAttr("sculptor.semantic.section",
+               rewriter.getStringAttr("digital.bias_add"));
+  add->setAttr("sculptor.semantic.name",
+               rewriter.getStringAttr("linear_bias_add"));
+  return add.getResult(0);
+}
+
+static mlir::LogicalResult
+lowerInlineLinearLayerToMVM(NNLinearOp linearOp,
+                            mlir::RewriterBase &rewriter) {
+  auto match = matchInlineLinearLayer(linearOp);
+  if (mlir::failed(match))
+    return mlir::failure();
+
+  mlir::Value mvmResult = buildMVM(*match, rewriter);
+  mvmResult.getDefiningOp()->setAttr(
+      "sculptor.semantic.kind", rewriter.getStringAttr("projection"));
+  auto replacement = buildPostProcess(*match, mvmResult, rewriter);
+  if (mlir::failed(replacement))
+    return mlir::failure();
+
+  linearOp.getResult().replaceAllUsesWith(*replacement);
+  rewriter.eraseOp(linearOp);
+  return mlir::success();
 }
 
 static mlir::LogicalResult lowerLinearLayerToMVM(mlir::func::FuncOp func,
@@ -162,7 +207,7 @@ static mlir::LogicalResult lowerLinearLayerToMVM(mlir::func::FuncOp func,
     return mlir::failure();
 
   mlir::Value mvmResult = buildMVM(*match, rewriter);
-  auto replacement = buildPostProcessRegion(*match, mvmResult, rewriter);
+  auto replacement = buildPostProcess(*match, mvmResult, rewriter);
   if (failed(replacement))
     return mlir::failure();
 
@@ -190,6 +235,20 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineLinearLayers(func::FuncOp func) {
+  SmallVector<NNLinearOp> linearOps;
+  func.walk([&](NNLinearOp linearOp) { linearOps.push_back(linearOp); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNLinearOp linearOp : linearOps) {
+    if (!linearOp || !linearOp->getBlock())
+      continue;
+    if (failed(lowerInlineLinearLayerToMVM(linearOp, rewriter)))
+      return linearOp.emitOpError("failed to decompose inline linear layer");
+  }
+  return success();
+}
 
 // Registers the linear converter for both biased and bias-free extracted
 // layers.

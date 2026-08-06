@@ -7,7 +7,6 @@ add_mlir_dialect_library(SculptorIR
   Ops/SculptorGolemOps.cpp
   Ops/SculptorTaskGraphOps.cpp
   Ops/SculptorExecutionOps.cpp
-  Ops/SculptorTaskRegionOps.cpp
 
   DEPENDS
   SculptorIRIncGen

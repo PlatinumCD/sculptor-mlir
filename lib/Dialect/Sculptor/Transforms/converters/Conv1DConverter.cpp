@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/I64ArrayAttrUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RewriteUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -294,45 +295,28 @@ static mlir::Value buildFlattenedPatch(mlir::OpBuilder &builder,
   return patch;
 }
 
-static mlir::Value buildPatchPreparationRegion(mlir::OpBuilder &builder,
+static mlir::Value buildPatchPreparationStage(mlir::OpBuilder &builder,
                                                const Conv1DMatch &match,
                                                const Conv1DLoweringState &state,
                                                int64_t outputIndex) {
-  auto prepRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.patchTy},
-      mlir::ValueRange{match.activation}, "digital.conv_patch",
-      builder.getStringAttr("conv1d_ow_" + std::to_string(outputIndex)));
-
-  mlir::Block *body = new mlir::Block();
-  prepRegion.getBody().push_back(body);
-  body->addArgument(match.activation.getType(), match.activation.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.conv_patch",
+      "conv1d_ow_" + std::to_string(outputIndex));
   mlir::Value patch =
-      buildFlattenedPatch(builder, state, body->getArgument(0), outputIndex);
-  builder.create<mlir::sculptor::YieldOp>(state.loc, patch);
-  return prepRegion.getResult(0);
+      buildFlattenedPatch(builder, state, match.activation, outputIndex);
+  scope.annotate();
+  return patch;
 }
 
-static mlir::Value buildPostProcessRegion(mlir::OpBuilder &builder,
+static mlir::Value buildPostProcessStage(mlir::OpBuilder &builder,
                                           PreparedBias &preparedBias,
                                           const Conv1DLoweringState &state,
                                           mlir::Value channelResult,
                                           int64_t outputIndex) {
-  auto postProcess = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.matmulResultTy},
-      mlir::ValueRange{channelResult}, "digital.bias_add",
-      builder.getStringAttr("conv1d_ow_" + std::to_string(outputIndex) +
-                            "_bias_add"));
-
-  mlir::Block *body = new mlir::Block();
-  postProcess.getBody().push_back(body);
-  body->addArgument(channelResult.getType(), channelResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value postProcessResult = body->getArgument(0);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.bias_add",
+      "conv1d_ow_" + std::to_string(outputIndex) + "_bias_add");
+  mlir::Value postProcessResult = channelResult;
   if (preparedBias.bias) {
     auto biasConstant = builder.create<ConstantOp>(
         preparedBias.biasConstant.getLoc(), preparedBias.biasConstant.getType(),
@@ -342,8 +326,8 @@ static mlir::Value buildPostProcessRegion(mlir::OpBuilder &builder,
         biasConstant.getResult(), builder);
   }
 
-  builder.create<mlir::sculptor::YieldOp>(state.loc, postProcessResult);
-  return postProcess.getResult(0);
+  scope.annotate();
+  return postProcessResult;
 }
 
 static mlir::Value buildOutputPosition(mlir::OpBuilder &builder,
@@ -353,11 +337,11 @@ static mlir::Value buildOutputPosition(mlir::OpBuilder &builder,
                                        const Conv1DLoweringState &state,
                                        int64_t outputIndex) {
   mlir::Value patch =
-      buildPatchPreparationRegion(builder, match, state, outputIndex);
+      buildPatchPreparationStage(builder, match, state, outputIndex);
   mlir::Value channelResult =
       converter_conv::buildPatchMVM(state.loc, state.matmulResultTy, patch,
                                     preparedFilter.filterMatrix, builder);
-  return buildPostProcessRegion(builder, preparedBias, state, channelResult,
+  return buildPostProcessStage(builder, preparedBias, state, channelResult,
                                 outputIndex);
 }
 
@@ -367,18 +351,8 @@ assembleOutputTensor(mlir::OpBuilder &builder, const Conv1DLoweringState &state,
   if (positionResults.empty())
     return mlir::failure();
 
-  auto outputAssembly = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.outputTy},
-      mlir::ValueRange(positionResults), "digital.output_recombine",
-      builder.getStringAttr("conv1d_output_recombine"));
-
-  mlir::Block *body = new mlir::Block();
-  outputAssembly.getBody().push_back(body);
-  for (mlir::Value positionResult : positionResults)
-    body->addArgument(positionResult.getType(), positionResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.output_recombine", "conv1d_output_recombine");
 
   mlir::RankedTensorType positionExpandedTy = mlir::RankedTensorType::get(
       {state.shape.n, state.shape.f, 1}, state.elementType);
@@ -387,7 +361,7 @@ assembleOutputTensor(mlir::OpBuilder &builder, const Conv1DLoweringState &state,
 
   llvm::SmallVector<mlir::Value> expandedPositions;
   expandedPositions.reserve(positionResults.size());
-  for (mlir::BlockArgument positionResult : body->getArguments()) {
+  for (mlir::Value positionResult : positionResults) {
     expandedPositions.push_back(
         builder
             .create<mlir::tensor::ExpandShapeOp>(state.loc, positionExpandedTy,
@@ -404,8 +378,8 @@ assembleOutputTensor(mlir::OpBuilder &builder, const Conv1DLoweringState &state,
                  .getResult();
   }
 
-  builder.create<mlir::sculptor::YieldOp>(state.loc, output);
-  return outputAssembly.getResult(0);
+  scope.annotate();
+  return output;
 }
 
 static mlir::FailureOr<mlir::Value> emitUnrolledOutputPositions(
@@ -434,6 +408,25 @@ static void eraseUnusedConv1DOps(Conv1DMatch &match,
         match.biasConstant.getOperation(), rewriter);
 }
 
+static mlir::LogicalResult lowerConv1DOp(NNConv1DOp layerOp,
+                                         mlir::RewriterBase &rewriter) {
+  auto match = matchSupportedConv1D(layerOp, rewriter);
+  if (failed(match))
+    return mlir::failure();
+
+  Conv1DLoweringState state = buildLoweringState(*match);
+  PreparedFilter preparedFilter = prepareFilter(*match);
+  PreparedBias preparedBias = prepareBias(*match, state, rewriter);
+  auto rewrittenOutput = emitUnrolledOutputPositions(
+      rewriter, *match, preparedFilter, preparedBias, state);
+  if (failed(rewrittenOutput))
+    return mlir::failure();
+
+  match->result.replaceAllUsesWith(*rewrittenOutput);
+  eraseUnusedConv1DOps(*match, rewriter);
+  return mlir::success();
+}
+
 // Converts extracted sculptor.nn.conv1d layer bodies into per-position sculptor.mvm
 // execution.
 class Conv1DConverter : public mlir::sculptor::LayerToMVMConverter {
@@ -450,22 +443,7 @@ public:
             func, "conv1d", "conv1d_w_bias", (*layerOp).getHasBias()))
       return;
 
-    mlir::FailureOr<Conv1DMatch> match =
-        matchSupportedConv1D(*layerOp, rewriter);
-    if (failed(match))
-      return;
-
-    Conv1DLoweringState state = buildLoweringState(*match);
-    PreparedFilter preparedFilter = prepareFilter(*match);
-    PreparedBias preparedBias = prepareBias(*match, state, rewriter);
-
-    auto rewrittenOutput = emitUnrolledOutputPositions(
-        rewriter, *match, preparedFilter, preparedBias, state);
-    if (failed(rewrittenOutput))
-      return;
-
-    match->result.replaceAllUsesWith(*rewrittenOutput);
-    eraseUnusedConv1DOps(*match, rewriter);
+    (void)lowerConv1DOp(*layerOp, rewriter);
   }
 };
 
@@ -473,6 +451,22 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineConv1DLayers(func::FuncOp func) {
+  SmallVector<NNConv1DOp> layerOps;
+  func.walk([&](NNConv1DOp layerOp) { layerOps.push_back(layerOp); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNConv1DOp layerOp : layerOps) {
+    if (!layerOp || !layerOp->getBlock())
+      continue;
+    if (failed(lowerConv1DOp(layerOp, rewriter))) {
+      layerOp.emitOpError("failed to decompose inline Conv1D layer");
+      return failure();
+    }
+  }
+  return success();
+}
 
 // Registers the Conv1D converter for both biased and bias-free layer slices.
 void registerConv1DConverter(LayerToMVMConverters &converters,

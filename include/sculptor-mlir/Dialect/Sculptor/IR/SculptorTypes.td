@@ -125,6 +125,21 @@ def Sculptor_LogicalArrayType
 }
 
 // =====-------------------------------------------=====
+//       ArrayLoadedType
+// =====-------------------------------------------=====
+
+def Sculptor_ArrayLoadedType
+    : Sculptor_Type<"ArrayLoaded", "array.loaded"> {
+  let summary = "Loaded analog array command token type";
+
+  let description = [{
+    Represents the SSA dependency produced after loading a vector into a
+    logical accelerator array. The token is consumed together with the same
+    logical array by sculptor.array.execute.
+  }];
+}
+
+// =====-------------------------------------------=====
 //       ArrayResultType
 // =====-------------------------------------------=====
 

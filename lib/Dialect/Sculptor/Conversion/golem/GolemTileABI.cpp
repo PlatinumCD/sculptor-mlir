@@ -2,10 +2,10 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphScratchpadAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphResourceUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/task_graph/TaskGraphTaskKinds.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileScratchpadAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeTaskKinds.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <optional>
+#include <tuple>
 
 namespace mlir {
 namespace sculptor {
@@ -200,8 +202,8 @@ FailureOr<func::FuncOp> findTaskGraphFunction(ModuleOp module) {
 
 LogicalResult collectResources(TileModel &model) {
   // Global IDs identify logical payloads, while route IDs identify individual
-  // transfers of those payloads. Keep the identity domains separate so fan-out
-  // routes can share a global resource without sharing a local buffer.
+  // transfers of those payloads. Incoming transfers have distinct receive
+  // buffers. Outgoing fan-out transfers of one payload share one send buffer.
   DenseSet<uint32_t> nonRouteGlobalIds;
   DenseSet<uint32_t> routeIds;
   DenseSet<uint32_t> slots;
@@ -221,9 +223,9 @@ LogicalResult collectResources(TileModel &model) {
     auto globalId = getRequiredUnsignedAttr<uint32_t>(
         &op, deployment_attrs::kGlobalResourceIdAttrName);
     auto slot = getRequiredUnsignedAttr<uint32_t>(
-        &op, runtime_attrs::kResourceSlotAttrName);
+        &op, tile_runtime_attrs::kResourceSlotAttrName);
     auto byteSize = getRequiredUnsignedAttr<uint64_t>(
-        &op, runtime_attrs::kResourceByteSizeAttrName);
+        &op, tile_runtime_attrs::kResourceByteSizeAttrName);
     if (failed(shapedType) || failed(globalId) || failed(slot) ||
         failed(byteSize))
       return failure();
@@ -276,7 +278,7 @@ LogicalResult collectResources(TileModel &model) {
                kindAndValue->first == ResourceKind::RouteInput ||
                kindAndValue->first == ResourceKind::RouteOutput) {
       auto offset = getRequiredUnsignedAttr<uint64_t>(
-          &op, runtime_attrs::kResourceTempOffsetAttrName);
+          &op, tile_runtime_attrs::kResourceTempOffsetAttrName);
       if (failed(offset))
         return failure();
       workspaceOffset = *offset;
@@ -291,8 +293,13 @@ LogicalResult collectResources(TileModel &model) {
       model.routeInputResourceIndexByRouteId.try_emplace(*routeId,
                                                          resourceIndex);
     } else if (kindAndValue->first == ResourceKind::RouteOutput) {
-      model.routeOutputResourceIndexByRouteId.try_emplace(*routeId,
-                                                          resourceIndex);
+      if (!model.routeOutputResourceIndexByGlobalId
+               .try_emplace(*globalId, resourceIndex)
+               .second) {
+        op.emitError("duplicate outgoing route resource with global ID ")
+            << *globalId;
+        return failure();
+      }
     } else {
       model.nonRouteResourceIndexByGlobalId.try_emplace(*globalId,
                                                         resourceIndex);
@@ -349,7 +356,7 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
                                                   unsigned outputCount) {
   SmallVector<unsigned> result;
   auto attr =
-      task->getAttrOfType<ArrayAttr>(runtime_attrs::kTaskResultIndicesAttrName);
+      task->getAttrOfType<ArrayAttr>(tile_runtime_attrs::kTaskResultIndicesAttrName);
   if (!attr) {
     result.reserve(outputCount);
     for (unsigned index = 0; index < outputCount; ++index)
@@ -358,7 +365,7 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
   }
 
   if (attr.size() != outputCount) {
-    task.emitError("expected '") << runtime_attrs::kTaskResultIndicesAttrName
+    task.emitError("expected '") << tile_runtime_attrs::kTaskResultIndicesAttrName
                                  << "' to match the number of task outputs";
     return failure();
   }
@@ -369,7 +376,7 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
         static_cast<uint64_t>(integer.getInt()) >
             std::numeric_limits<unsigned>::max()) {
       task.emitError("expected '")
-          << runtime_attrs::kTaskResultIndicesAttrName
+          << tile_runtime_attrs::kTaskResultIndicesAttrName
           << "' to contain non-negative result indexes";
       return failure();
     }
@@ -509,17 +516,17 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
     auto globalId = getRequiredUnsignedAttr<uint32_t>(
         task, deployment_attrs::kGlobalTaskIdAttrName);
     auto localIndex = getRequiredUnsignedAttr<uint32_t>(
-        task, runtime_attrs::kTaskIndexAttrName);
+        task, tile_runtime_attrs::kTaskIndexAttrName);
     auto coreId = getRequiredUnsignedAttr<uint32_t>(
-        task, runtime_attrs::kTaskCoreIdAttrName);
+        task, tile_runtime_attrs::kTaskCoreIdAttrName);
     auto localArrayId = getOptionalUnsignedAttr<uint32_t>(
-        task, runtime_attrs::kTaskLocalArrayIdAttrName);
+        task, tile_runtime_attrs::kTaskLocalArrayIdAttrName);
     auto physicalArrayId = getOptionalUnsignedAttr<uint32_t>(
-        task, runtime_attrs::kTaskPhysicalArrayIdAttrName);
+        task, tile_runtime_attrs::kTaskPhysicalArrayIdAttrName);
     auto inputSlots =
-        getRequiredU32ArrayAttr(task, runtime_attrs::kTaskInputSlotsAttrName);
+        getRequiredU32ArrayAttr(task, tile_runtime_attrs::kTaskInputSlotsAttrName);
     auto outputSlots =
-        getRequiredU32ArrayAttr(task, runtime_attrs::kTaskOutputSlotsAttrName);
+        getRequiredU32ArrayAttr(task, tile_runtime_attrs::kTaskOutputSlotsAttrName);
     if (failed(globalId) || failed(localIndex) || failed(coreId) ||
         failed(localArrayId) || failed(physicalArrayId) || failed(inputSlots) ||
         failed(outputSlots))
@@ -566,7 +573,7 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
     taskModel.coreId = *coreId;
     taskModel.localArrayId = *localArrayId;
     taskModel.physicalArrayId = *physicalArrayId;
-    taskModel.isBoot = task_graph::isMatrixSetupTask(task);
+    taskModel.isBoot = tile_runtime::isMatrixSetupTask(task);
     taskModel.inputSlots.assign(inputSlots->begin(), inputSlots->end());
     taskModel.outputSlots.assign(outputSlots->begin(), outputSlots->end());
 
@@ -674,7 +681,7 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
 
 LogicalResult collectWorkspaceMetadata(TileModel &model) {
   auto workspaceSize = getRequiredUnsignedAttr<uint64_t>(
-      model.taskGraphFunc, runtime_attrs::kTaskGraphWorkspaceSizeAttrName);
+      model.taskGraphFunc, tile_runtime_attrs::kTaskGraphWorkspaceSizeAttrName);
   if (failed(workspaceSize))
     return failure();
   model.workspaceSize = *workspaceSize;
@@ -1011,28 +1018,33 @@ findNonRouteResourceByGlobalId(TileModel &model, uint32_t globalId,
   return &resource;
 }
 
-FailureOr<ResourceModel *> findRouteResourceById(TileModel &model,
-                                                 uint32_t routeId,
-                                                 ResourceKind expectedKind,
-                                                 Operation *diagnosticOp) {
-  const DenseMap<uint32_t, unsigned> *resourcesByRouteId = nullptr;
+FailureOr<ResourceModel *> findRouteResource(TileModel &model, uint32_t routeId,
+                                             uint32_t globalResourceId,
+                                             ResourceKind expectedKind,
+                                             Operation *diagnosticOp) {
   if (expectedKind == ResourceKind::RouteInput) {
-    resourcesByRouteId = &model.routeInputResourceIndexByRouteId;
-  } else if (expectedKind == ResourceKind::RouteOutput) {
-    resourcesByRouteId = &model.routeOutputResourceIndexByRouteId;
-  } else {
-    diagnosticOp->emitError(
-        "internal error: route lookup requested for a non-route resource");
-    return failure();
+    auto resourceIt = model.routeInputResourceIndexByRouteId.find(routeId);
+    if (resourceIt == model.routeInputResourceIndexByRouteId.end()) {
+      diagnosticOp->emitError("cannot match incoming deployment route ")
+          << routeId << " to a local route boundary resource";
+      return failure();
+    }
+    return &model.resources[resourceIt->second];
   }
-
-  auto resourceIt = resourcesByRouteId->find(routeId);
-  if (resourceIt == resourcesByRouteId->end()) {
-    diagnosticOp->emitError("cannot match deployment route ")
-        << routeId << " to a local route boundary resource";
-    return failure();
+  if (expectedKind == ResourceKind::RouteOutput) {
+    auto resourceIt =
+        model.routeOutputResourceIndexByGlobalId.find(globalResourceId);
+    if (resourceIt == model.routeOutputResourceIndexByGlobalId.end()) {
+      diagnosticOp->emitError("cannot match outgoing deployment route ")
+          << routeId << " to a local route boundary resource with global ID "
+          << globalResourceId;
+      return failure();
+    }
+    return &model.resources[resourceIt->second];
   }
-  return &model.resources[resourceIt->second];
+  diagnosticOp->emitError(
+      "internal error: route lookup requested for a non-route resource");
+  return failure();
 }
 
 LogicalResult collectRoutes(ModuleOp module, TileModel &model,
@@ -1044,6 +1056,18 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
     return failure();
 
   DenseSet<uint32_t> routeIds;
+  DenseSet<unsigned> matchedResourceIndices;
+  std::map<uint32_t, std::tuple<uint32_t, uint32_t, uint64_t>>
+      outgoingSourceByResource;
+  std::map<uint32_t, uint32_t> minimumOutgoingRouteByResource;
+
+  auto findTask = [&](uint32_t globalId) -> TaskModel * {
+    for (TaskModel &task : model.tasks)
+      if (task.globalId == globalId)
+        return &task;
+    return nullptr;
+  };
+
   for (Attribute entry : *manifest) {
     auto route = dyn_cast<DeploymentRouteAttr>(entry);
     if (!route) {
@@ -1084,15 +1108,73 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
       return failure();
     }
 
-    auto resource = findRouteResourceById(model, routeId, resourceKind, module);
+    uint32_t resourceId = static_cast<uint32_t>(resourceIdValue);
+    auto resource =
+        findRouteResource(model, routeId, resourceId, resourceKind, module);
     if (failed(resource))
       return failure();
-    if ((*resource)->globalId != static_cast<uint32_t>(resourceIdValue) ||
+    if ((*resource)->globalId != resourceId ||
         (*resource)->byteSize != static_cast<uint64_t>(byteSizeValue)) {
       module.emitError("route metadata does not match local route resource "
                        "slot metadata for route ")
           << routeId;
       return failure();
+    }
+
+    unsigned resourceIndex =
+        model.resourceIndexByValue.lookup((*resource)->value);
+    matchedResourceIndices.insert(resourceIndex);
+
+    if (incoming) {
+      if ((*resource)->routeId != std::optional<uint32_t>(routeId)) {
+        module.emitError("incoming route resource does not preserve route ID ")
+            << routeId;
+        return failure();
+      }
+      TaskModel *destination =
+          findTask(static_cast<uint32_t>(destinationTaskValue));
+      uint32_t destinationInput = static_cast<uint32_t>(destinationInputValue);
+      if (!destination || destinationInput >= destination->inputSlots.size() ||
+          destination->inputSlots[destinationInput] != (*resource)->slot) {
+        module.emitError("incoming route ")
+            << routeId << " does not match its destination task input binding";
+        return failure();
+      }
+    } else {
+      uint32_t sourceTask = static_cast<uint32_t>(sourceTaskValue);
+      uint32_t sourceOutput = static_cast<uint32_t>(sourceOutputValue);
+      auto sourceMetadata = std::make_tuple(
+          sourceTask, sourceOutput, static_cast<uint64_t>(byteSizeValue));
+      auto [sourceIt, inserted] =
+          outgoingSourceByResource.emplace(resourceId, sourceMetadata);
+      if (!inserted && sourceIt->second != sourceMetadata) {
+        module.emitError("outgoing routes for global resource ")
+            << resourceId
+            << " do not share the same producer result and byte size";
+        return failure();
+      }
+      auto minimum = minimumOutgoingRouteByResource.find(resourceId);
+      if (minimum == minimumOutgoingRouteByResource.end())
+        minimumOutgoingRouteByResource.emplace(resourceId, routeId);
+      else
+        minimum->second = std::min(minimum->second, routeId);
+
+      TaskModel *source = findTask(sourceTask);
+      bool matchesOutput = false;
+      if (source) {
+        for (auto indexedSlot : llvm::enumerate(source->outputSlots)) {
+          if (indexedSlot.value() == (*resource)->slot &&
+              source->resultIndices[indexedSlot.index()] == sourceOutput) {
+            matchesOutput = true;
+            break;
+          }
+        }
+      }
+      if (!matchesOutput) {
+        module.emitError("outgoing route ")
+            << routeId << " does not match its source task result binding";
+        return failure();
+      }
     }
     routes.push_back(RouteModel{route, (*resource)->slot});
   }
@@ -1101,10 +1183,28 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
       llvm::count_if(model.resources, [&](const ResourceModel &resource) {
         return resource.kind == resourceKind;
       });
-  if (localRouteCount != routes.size()) {
+  unsigned expectedResourceCount =
+      incoming ? routes.size() : matchedResourceIndices.size();
+  if (localRouteCount != expectedResourceCount ||
+      matchedResourceIndices.size() != expectedResourceCount) {
     module.emitError("route manifest does not account for every local route "
                      "resource in the isolated core");
     return failure();
+  }
+
+  if (!incoming) {
+    for (const auto &[resourceId, minimumRouteId] :
+         minimumOutgoingRouteByResource) {
+      ResourceModel &resource =
+          model.resources[model.routeOutputResourceIndexByGlobalId.lookup(
+              resourceId)];
+      if (resource.routeId != std::optional<uint32_t>(minimumRouteId)) {
+        resource.op->emitError(
+            "coalesced route output must use the minimum route ID as its "
+            "canonical route ID");
+        return failure();
+      }
+    }
   }
 
   llvm::sort(routes, [](const RouteModel &lhs, const RouteModel &rhs) {
@@ -1245,7 +1345,7 @@ FailureOr<TileModel> collectTileModel(ModuleOp module) {
   }
 
   auto coreId = getRequiredUnsignedAttr<uint32_t>(
-      module, runtime_attrs::kTaskCoreIdAttrName);
+      module, tile_runtime_attrs::kTaskCoreIdAttrName);
   auto taskGraphFunc = findTaskGraphFunction(module);
   if (failed(coreId) || failed(taskGraphFunc))
     return failure();

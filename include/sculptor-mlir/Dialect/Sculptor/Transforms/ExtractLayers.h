@@ -34,8 +34,7 @@ public:
 // Owns extractors in the order they should visit forward.
 using LayerExtractors = std::vector<std::unique_ptr<LayerExtractor>>;
 
-// Scans the module for forward and delegates pattern outlining to the
-// registered layer extractors.
+// Preserves canonical layers inline as a stable pivot checkpoint.
 struct ExtractLayersPass
     : public mlir::PassWrapper<ExtractLayersPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -46,7 +45,7 @@ struct ExtractLayersPass
 
   // Summarizes the pass behavior for MLIR pass registration and help text.
   mlir::StringRef getDescription() const final {
-    return "Extract analog layers";
+    return "Preserve canonical layers inline";
   }
 
   // Ensures canonical analog layer operations can be materialized by
@@ -55,7 +54,7 @@ struct ExtractLayersPass
     registry.insert<mlir::sculptor::SculptorDialect, mlir::tensor::TensorDialect>();
   }
 
-  // Builds the extractor pipeline and applies it to the module's forward.
+  // Performs no rewriting in the pivot pipeline.
   void runOnOperation() override;
 };
 

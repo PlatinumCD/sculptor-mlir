@@ -1,5 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTilingAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/GolemTilingAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -11,10 +11,10 @@ namespace {
 mlir::FailureOr<int64_t>
 getPhysicalArrayRows(mlir::sculptor::ArrayStoreOp op) {
   auto shape = op->getAttrOfType<mlir::ArrayAttr>(
-      mlir::sculptor::tiling_attrs::kTilePhysicalShapeAttrName);
+      mlir::sculptor::golem_tiling_attrs::kTilePhysicalShapeAttrName);
   if (!shape) {
     return op.emitOpError("expected physical array shape attribute '")
-               << mlir::sculptor::tiling_attrs::kTilePhysicalShapeAttrName
+               << mlir::sculptor::golem_tiling_attrs::kTilePhysicalShapeAttrName
                << "'",
            mlir::failure();
   }

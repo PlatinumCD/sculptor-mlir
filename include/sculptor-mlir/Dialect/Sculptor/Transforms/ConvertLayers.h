@@ -45,10 +45,10 @@ using LayerToMVMConverters = std::vector<std::unique_ptr<LayerToMVMConverter>>;
 // Maps layer_type strings to the converter that can lower them to sculptor.mvm.
 using LayerToMVMConverterMap = llvm::StringMap<const LayerToMVMConverter *>;
 
-// Scans forward's layer calls and delegates extracted sculptor.nn layer
-// functions to converters that lower them to sculptor.mvm. The public pass name
-// stays sculptor-convert-layers for compatibility even though the internal
-// boundary is now sculptor.nn layer-to-MVM lowering.
+// Decomposes supported inline sculptor.nn operations into backend-neutral
+// sculptor.mvm operations plus sequence-preserving tensor/linalg/math/scf
+// glue. Task, physical-resource, and placement decisions remain outside this
+// pass.
 struct ConvertLayersPass
     : public mlir::PassWrapper<ConvertLayersPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -67,7 +67,7 @@ struct ConvertLayersPass
 
   // Summarizes the pass behavior for MLIR pass registration and help text.
   mlir::StringRef getDescription() const final {
-    return "Lower extracted sculptor.nn layers to sculptor.mvm";
+    return "Decompose inline sculptor.nn layers into sculptor.mvm and logical glue";
   }
 
   // Ensures sculptor.mvm and standard glue operations introduced by converters
@@ -83,7 +83,7 @@ struct ConvertLayersPass
     registry.insert<mlir::tensor::TensorDialect>();
   }
 
-  // Lowers known extracted sculptor.nn layer functions called by forward.
+  // Decomposes known inline sculptor.nn operations.
   void runOnOperation() override;
 };
 
@@ -158,6 +158,27 @@ void registerRNNConverter(LayerToMVMConverters &converters,
 void registerTransformerBlockConverter(LayerToMVMConverters &converters,
                                        LayerToMVMConverterMap &converterMap,
                                        MLIRContext *context);
+
+// Decomposes inline Transformer blocks into sculptor.mvm operations and
+// sequence-preserving logical glue. This operation creates no function, task,
+// physical-resource, or placement boundaries.
+LogicalResult decomposeInlineTransformerBlocks(func::FuncOp func);
+LogicalResult decomposeInlineTransformerStacks(func::FuncOp func);
+
+// Decomposes inline linear layers into sculptor.mvm operations and ordinary
+// tensor/linalg bias glue without introducing an outlining boundary.
+LogicalResult decomposeInlineLinearLayers(func::FuncOp func);
+
+LogicalResult decomposeInlineConv1DLayers(func::FuncOp func);
+LogicalResult decomposeInlineConv2DLayers(func::FuncOp func);
+LogicalResult decomposeInlineGroupedConv2DLayers(func::FuncOp func);
+LogicalResult decomposeInlineConv3DLayers(func::FuncOp func);
+LogicalResult decomposeInlineRNNCellLayers(func::FuncOp func);
+LogicalResult decomposeInlineRNNLayers(func::FuncOp func);
+LogicalResult decomposeInlineGRUCellLayers(func::FuncOp func);
+LogicalResult decomposeInlineGRULayers(func::FuncOp func);
+LogicalResult decomposeInlineLSTMCellLayers(func::FuncOp func);
+LogicalResult decomposeInlineLSTMLayers(func::FuncOp func);
 
 // Registers the sculptor.nn-to-MVM lowering pass with MLIR's global pass
 // registry.

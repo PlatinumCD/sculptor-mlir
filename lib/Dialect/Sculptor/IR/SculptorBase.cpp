@@ -72,6 +72,9 @@ Type SculptorDialect::parseType(DialectAsmParser &parser) const {
   if (mnemonic == LogicalArrayType::getMnemonic())
     return LogicalArrayType::get(parser.getContext());
 
+  if (mnemonic == ArrayLoadedType::getMnemonic())
+    return ArrayLoadedType::get(parser.getContext());
+
   if (mnemonic == ArrayResultType::getMnemonic())
     return ArrayResultType::get(parser.getContext());
 
@@ -132,6 +135,11 @@ void SculptorDialect::printType(Type type,
 
   if (llvm::isa<LogicalArrayType>(type)) {
     printer << LogicalArrayType::getMnemonic();
+    return;
+  }
+
+  if (llvm::isa<ArrayLoadedType>(type)) {
+    printer << ArrayLoadedType::getMnemonic();
     return;
   }
 

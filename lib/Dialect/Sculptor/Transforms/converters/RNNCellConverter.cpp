@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentGateUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentLayerConversionUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -67,22 +68,10 @@ buildFusedBiasType(mlir::RankedTensorType resultTy) {
 }
 
 static mlir::FailureOr<RNNCellLowering>
-matchExtractedRNNCellLayer(mlir::func::FuncOp func) {
-  auto rnnCellOp = nn_layer_match::matchSingleNNLayerOp<NNRNNCellOp>(func);
-  if (mlir::failed(rnnCellOp))
-    return mlir::failure();
-
+matchRNNCellLayer(NNRNNCellOp op) {
+  mlir::FailureOr<NNRNNCellOp> rnnCellOp = op;
   bool hasBias = (*rnnCellOp).getHasBias();
-  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "rnn_cell",
-                                                "rnn_cell_w_bias", hasBias))
-    return mlir::failure();
-
   if ((*rnnCellOp).getActivationAttr().getValue() != "tanh")
-    return mlir::failure();
-
-  if (func.getNumArguments() != 2 ||
-      (*rnnCellOp).getInput() != func.getArgument(0) ||
-      (*rnnCellOp).getHPrev() != func.getArgument(1))
     return mlir::failure();
 
   auto inputTy = tensor_type::getPositiveStaticRank2F32Tensor(
@@ -161,6 +150,22 @@ matchExtractedRNNCellLayer(mlir::func::FuncOp func) {
   return lowering;
 }
 
+static mlir::FailureOr<RNNCellLowering>
+matchExtractedRNNCellLayer(mlir::func::FuncOp func) {
+  auto rnnCellOp = nn_layer_match::matchSingleNNLayerOp<NNRNNCellOp>(func);
+  if (mlir::failed(rnnCellOp))
+    return mlir::failure();
+
+  bool hasBias = (*rnnCellOp).getHasBias();
+  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "rnn_cell",
+                                                "rnn_cell_w_bias", hasBias) ||
+      func.getNumArguments() != 2 ||
+      (*rnnCellOp).getInput() != func.getArgument(0) ||
+      (*rnnCellOp).getHPrev() != func.getArgument(1))
+    return mlir::failure();
+  return matchRNNCellLayer(*rnnCellOp);
+}
+
 // Fuses RNNCell input and hidden weights for one sculptor.mvm.
 static mlir::TypedAttr buildFusedWeightAttr(RNNCellLowering &match) {
   auto maybeInputWeights =
@@ -232,57 +237,32 @@ static mlir::TypedAttr buildFusedBiasAttr(RNNCellLowering &match) {
       match.fusedBiasTy, fusedBias, "analog_rnn_cell_fused_bias_", useResource);
 }
 
-static mlir::Value buildInputRecombineRegion(RNNCellLowering &match,
+static mlir::Value buildInputRecombineStage(RNNCellLowering &match,
                                              mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.rnnCellOp.getLoc();
   rewriter.setInsertionPoint(match.rnnCellOp);
-  auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.fusedInputTy},
-      mlir::ValueRange{match.rnnCellOp.getInput(), match.rnnCellOp.getHPrev()},
-      "digital.input_recombine",
-      rewriter.getStringAttr("rnn_cell_input_recombine"));
-
-  mlir::Block *body = new mlir::Block();
-  recombineRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      match.rnnCellOp.getInput().getType(),
-      match.rnnCellOp.getHPrev().getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      match.rnnCellOp.getInput().getLoc(), match.rnnCellOp.getHPrev().getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.input_recombine", "rnn_cell_input_recombine");
   mlir::Value fusedInput = recurrent_gate::buildFusedInput(
-      loc, match.fusedInputTy, body->getArgument(0), body->getArgument(1),
-      rewriter);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, fusedInput);
-  return recombineRegion.getResult(0);
+      loc, match.fusedInputTy, match.rnnCellOp.getInput(),
+      match.rnnCellOp.getHPrev(), rewriter);
+  scope.annotate();
+  return fusedInput;
 }
 
 static mlir::FailureOr<mlir::Value>
-buildBiasAddRegion(RNNCellLowering &match, mlir::TypedAttr fusedBiasAttr,
+buildBiasAddStage(RNNCellLowering &match, mlir::TypedAttr fusedBiasAttr,
                    mlir::Value mvmResult, mlir::RewriterBase &rewriter) {
   if (match.hasBias && !fusedBiasAttr)
     return mlir::failure();
 
   mlir::Location loc = match.rnnCellOp.getLoc();
   rewriter.setInsertionPoint(match.rnnCellOp);
-  auto biasRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy}, mlir::ValueRange{mvmResult},
-      "digital.bias_add", rewriter.getStringAttr("rnn_cell_bias_add"));
-
-  mlir::Block *body = new mlir::Block();
-  biasRegion.getBody().push_back(body);
-  body->addArgument(mvmResult.getType(), mvmResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-  mlir::Value biasResult = body->getArgument(0);
-  if (!match.hasBias) {
-    rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-    return biasRegion.getResult(0);
-  }
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.bias_add", "rnn_cell_bias_add");
+  mlir::Value biasResult = mvmResult;
+  if (!match.hasBias)
+    return biasResult;
 
   auto fusedBias =
       rewriter.create<ConstantOp>(loc, match.fusedBiasTy, fusedBiasAttr);
@@ -295,37 +275,29 @@ buildBiasAddRegion(RNNCellLowering &match, mlir::TypedAttr fusedBiasAttr,
   biasResult =
       rewriter
           .create<mlir::linalg::AddOp>(
-              loc, mlir::ValueRange{body->getArgument(0), expandedBias},
+              loc, mlir::ValueRange{mvmResult, expandedBias},
               mlir::ValueRange{biasedInit})
           .getResult(0);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-  return biasRegion.getResult(0);
+  scope.annotate();
+  return biasResult;
 }
 
-static mlir::Value buildActivationRegion(RNNCellLowering &match,
+static mlir::Value buildActivationStage(RNNCellLowering &match,
                                          mlir::Value activationInput,
                                          mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.rnnCellOp.getLoc();
   rewriter.setInsertionPoint(match.rnnCellOp);
-  auto activationRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy}, mlir::ValueRange{activationInput},
-      "digital.activation", rewriter.getStringAttr("rnn_cell_tanh"));
-
-  mlir::Block *body = new mlir::Block();
-  activationRegion.getBody().push_back(body);
-  body->addArgument(activationInput.getType(), activationInput.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.activation", "rnn_cell_tanh");
   mlir::Value result = converter_recurrent_elementwise::buildTanh(
-      loc, match.resultTy, body->getArgument(0), rewriter);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, result);
-  return activationRegion.getResult(0);
+      loc, match.resultTy, activationInput, rewriter);
+  scope.annotate();
+  return result;
 }
 
 static mlir::LogicalResult
-lowerRNNCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedRNNCellLayer(func);
+lowerRNNCellOp(NNRNNCellOp op, mlir::RewriterBase &rewriter) {
+  auto match = matchRNNCellLayer(op);
   if (mlir::failed(match))
     return mlir::failure();
 
@@ -344,16 +316,16 @@ lowerRNNCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
   rewriter.setInsertionPoint((*match).rnnCellOp);
   auto fusedWeight =
       rewriter.create<ConstantOp>(loc, (*match).fusedWeightTy, fusedWeightAttr);
-  mlir::Value fusedInput = buildInputRecombineRegion(*match, rewriter);
+  mlir::Value fusedInput = buildInputRecombineStage(*match, rewriter);
   mlir::Value mvmResult = mvm_build::buildMVM(
       loc, (*match).resultTy, fusedInput, fusedWeight.getResult(), rewriter);
 
   auto tanhInput =
-      buildBiasAddRegion(*match, fusedBiasAttr, mvmResult, rewriter);
+      buildBiasAddStage(*match, fusedBiasAttr, mvmResult, rewriter);
   if (mlir::failed(tanhInput))
     return mlir::failure();
 
-  mlir::Value result = buildActivationRegion(*match, *tanhInput, rewriter);
+  mlir::Value result = buildActivationStage(*match, *tanhInput, rewriter);
   (*match).rnnCellOp.getH().replaceAllUsesWith(result);
   rewriter.eraseOp((*match).rnnCellOp);
   converter_recurrent_layer::eraseUnusedConstants(
@@ -361,6 +333,15 @@ lowerRNNCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
        match->biasHHConstant},
       rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult
+lowerRNNCellLayerToMVM(mlir::func::FuncOp func,
+                       mlir::RewriterBase &rewriter) {
+  auto match = matchExtractedRNNCellLayer(func);
+  if (mlir::failed(match))
+    return mlir::failure();
+  return lowerRNNCellOp(match->rnnCellOp, rewriter);
 }
 
 // Converts extracted sculptor.nn.rnn_cell layer bodies to fused sculptor.mvm plus
@@ -379,6 +360,20 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineRNNCellLayers(func::FuncOp func) {
+  SmallVector<NNRNNCellOp> ops;
+  func.walk([&](NNRNNCellOp op) { ops.push_back(op); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNRNNCellOp op : ops) {
+    if (failed(lowerRNNCellOp(op, rewriter))) {
+      op.emitOpError("cannot decompose supported inline RNNCell");
+      return failure();
+    }
+  }
+  return success();
+}
 
 void registerRNNCellConverter(LayerToMVMConverters &converters,
                               LayerToMVMConverterMap &converterMap,

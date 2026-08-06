@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentGateUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentLayerConversionUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -76,21 +77,9 @@ buildFusedBiasType(mlir::RankedTensorType hiddenTy) {
 }
 
 static mlir::FailureOr<LSTMCellLowering>
-matchExtractedLSTMCellLayer(mlir::func::FuncOp func) {
-  auto lstmCellOp = nn_layer_match::matchSingleNNLayerOp<NNLSTMCellOp>(func);
-  if (mlir::failed(lstmCellOp))
-    return mlir::failure();
-
+matchLSTMCellLayer(NNLSTMCellOp op) {
+  mlir::FailureOr<NNLSTMCellOp> lstmCellOp = op;
   bool hasBias = (*lstmCellOp).getHasBias();
-  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "lstm_cell",
-                                                "lstm_cell_w_bias", hasBias))
-    return mlir::failure();
-
-  if (func.getNumArguments() != 3 ||
-      (*lstmCellOp).getInput() != func.getArgument(0) ||
-      (*lstmCellOp).getHPrev() != func.getArgument(1) ||
-      (*lstmCellOp).getCPrev() != func.getArgument(2))
-    return mlir::failure();
 
   auto inputTy = tensor_type::getPositiveStaticRank2F32Tensor(
       (*lstmCellOp).getInput().getType());
@@ -179,6 +168,23 @@ matchExtractedLSTMCellLayer(mlir::func::FuncOp func) {
   return lowering;
 }
 
+static mlir::FailureOr<LSTMCellLowering>
+matchExtractedLSTMCellLayer(mlir::func::FuncOp func) {
+  auto lstmCellOp = nn_layer_match::matchSingleNNLayerOp<NNLSTMCellOp>(func);
+  if (mlir::failed(lstmCellOp))
+    return mlir::failure();
+
+  bool hasBias = (*lstmCellOp).getHasBias();
+  if (!nn_layer_match::hasLayerTypeMatchingBias(
+          func, "lstm_cell", "lstm_cell_w_bias", hasBias) ||
+      func.getNumArguments() != 3 ||
+      (*lstmCellOp).getInput() != func.getArgument(0) ||
+      (*lstmCellOp).getHPrev() != func.getArgument(1) ||
+      (*lstmCellOp).getCPrev() != func.getArgument(2))
+    return mlir::failure();
+  return matchLSTMCellLayer(*lstmCellOp);
+}
+
 // Fuses LSTMCell i, f, g, o weights for one sculptor.mvm.
 static mlir::TypedAttr buildFusedWeightAttr(LSTMCellLowering &match) {
   auto maybeInputWeights =
@@ -252,59 +258,32 @@ static mlir::TypedAttr buildFusedBiasAttr(LSTMCellLowering &match) {
       useResource);
 }
 
-static mlir::Value buildInputRecombineRegion(LSTMCellLowering &match,
+static mlir::Value buildInputRecombineStage(LSTMCellLowering &match,
                                              mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.fusedInputTy},
-      mlir::ValueRange{match.lstmCellOp.getInput(),
-                       match.lstmCellOp.getHPrev()},
-      "digital.input_recombine",
-      rewriter.getStringAttr("lstm_cell_input_recombine"));
-
-  mlir::Block *body = new mlir::Block();
-  recombineRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      match.lstmCellOp.getInput().getType(),
-      match.lstmCellOp.getHPrev().getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      match.lstmCellOp.getInput().getLoc(),
-      match.lstmCellOp.getHPrev().getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.input_recombine", "lstm_cell_input_recombine");
   mlir::Value fusedInput = recurrent_gate::buildFusedInput(
-      loc, match.fusedInputTy, body->getArgument(0), body->getArgument(1),
-      rewriter);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, fusedInput);
-  return recombineRegion.getResult(0);
+      loc, match.fusedInputTy, match.lstmCellOp.getInput(),
+      match.lstmCellOp.getHPrev(), rewriter);
+  scope.annotate();
+  return fusedInput;
 }
 
 static mlir::FailureOr<mlir::Value>
-buildBiasAddRegion(LSTMCellLowering &match, mlir::TypedAttr fusedBiasAttr,
+buildBiasAddStage(LSTMCellLowering &match, mlir::TypedAttr fusedBiasAttr,
                    mlir::Value mvmResult, mlir::RewriterBase &rewriter) {
   if (match.hasBias && !fusedBiasAttr)
     return mlir::failure();
 
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto biasRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.preActivationTy}, mlir::ValueRange{mvmResult},
-      "digital.bias_add", rewriter.getStringAttr("lstm_cell_bias_add"));
-
-  mlir::Block *body = new mlir::Block();
-  biasRegion.getBody().push_back(body);
-  body->addArgument(mvmResult.getType(), mvmResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-  mlir::Value biasResult = body->getArgument(0);
-  if (!match.hasBias) {
-    rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-    return biasRegion.getResult(0);
-  }
+  mlir::Value biasResult = mvmResult;
+  if (!match.hasBias)
+    return biasResult;
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.bias_add", "lstm_cell_bias_add");
 
   auto fusedBias =
       rewriter.create<ConstantOp>(loc, match.fusedBiasTy, fusedBiasAttr);
@@ -318,11 +297,11 @@ buildBiasAddRegion(LSTMCellLowering &match, mlir::TypedAttr fusedBiasAttr,
   biasResult =
       rewriter
           .create<mlir::linalg::AddOp>(
-              loc, mlir::ValueRange{body->getArgument(0), expandedBias},
+              loc, mlir::ValueRange{mvmResult, expandedBias},
               mlir::ValueRange{biasedInit})
           .getResult(0);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-  return biasRegion.getResult(0);
+  scope.annotate();
+  return biasResult;
 }
 
 struct LSTMGateSlices {
@@ -332,42 +311,26 @@ struct LSTMGateSlices {
   mlir::Value o;
 };
 
-static LSTMGateSlices buildGateSplitRegion(LSTMCellLowering &match,
+static LSTMGateSlices buildGateSplitStage(LSTMCellLowering &match,
                                            mlir::Value preActivation,
                                            mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto gateSplitRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc,
-      mlir::TypeRange{match.resultHTy, match.resultHTy, match.resultHTy,
-                      match.resultHTy},
-      mlir::ValueRange{preActivation}, "digital.gate_split",
-      rewriter.getStringAttr("lstm_cell_gate_split"));
-
-  mlir::Block *body = new mlir::Block();
-  gateSplitRegion.getBody().push_back(body);
-  body->addArgument(preActivation.getType(), preActivation.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.gate_split", "lstm_cell_gate_split");
   int64_t hiddenSize = match.hiddenTy.getShape()[1];
   mlir::RankedTensorType resultTy = match.resultHTy;
-  mlir::Value regionPreActivation = body->getArgument(0);
   mlir::Value iSlice =
-      recurrent_gate::buildGateSlice(loc, resultTy, regionPreActivation,
+      recurrent_gate::buildGateSlice(loc, resultTy, preActivation,
                                      /*gateOffset=*/0, hiddenSize, rewriter);
   mlir::Value fSlice = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize, hiddenSize, rewriter);
+      loc, resultTy, preActivation, hiddenSize, hiddenSize, rewriter);
   mlir::Value gSlice = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize * 2, hiddenSize, rewriter);
+      loc, resultTy, preActivation, hiddenSize * 2, hiddenSize, rewriter);
   mlir::Value oSlice = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize * 3, hiddenSize, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{iSlice, fSlice, gSlice, oSlice});
-  return LSTMGateSlices{
-      gateSplitRegion.getResult(0), gateSplitRegion.getResult(1),
-      gateSplitRegion.getResult(2), gateSplitRegion.getResult(3)};
+      loc, resultTy, preActivation, hiddenSize * 3, hiddenSize, rewriter);
+  scope.annotate();
+  return LSTMGateSlices{iSlice, fSlice, gSlice, oSlice};
 }
 
 struct LSTMGateActivations {
@@ -378,110 +341,58 @@ struct LSTMGateActivations {
 };
 
 static LSTMGateActivations
-buildGateActivationRegion(LSTMCellLowering &match, LSTMGateSlices gates,
+buildGateActivationStage(LSTMCellLowering &match, LSTMGateSlices gates,
                           mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto activationRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc,
-      mlir::TypeRange{match.resultHTy, match.resultHTy, match.resultHTy,
-                      match.resultHTy},
-      mlir::ValueRange{gates.i, gates.f, gates.g, gates.o},
-      "digital.activation",
-      rewriter.getStringAttr("lstm_cell_gate_activation"));
-
-  mlir::Block *body = new mlir::Block();
-  activationRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      gates.i.getType(), gates.f.getType(), gates.g.getType(),
-      gates.o.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      gates.i.getLoc(), gates.f.getLoc(), gates.g.getLoc(), gates.o.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.activation", "lstm_cell_gate_activation");
   mlir::RankedTensorType resultTy = match.resultHTy;
   mlir::Value inputGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, resultTy, body->getArgument(0), rewriter);
+      loc, resultTy, gates.i, rewriter);
   mlir::Value forgetGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, resultTy, body->getArgument(1), rewriter);
+      loc, resultTy, gates.f, rewriter);
   mlir::Value candidateGate = converter_recurrent_elementwise::buildTanh(
-      loc, resultTy, body->getArgument(2), rewriter);
+      loc, resultTy, gates.g, rewriter);
   mlir::Value outputGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, resultTy, body->getArgument(3), rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{inputGate, forgetGate, candidateGate, outputGate});
-  return LSTMGateActivations{
-      activationRegion.getResult(0), activationRegion.getResult(1),
-      activationRegion.getResult(2), activationRegion.getResult(3)};
+      loc, resultTy, gates.o, rewriter);
+  scope.annotate();
+  return LSTMGateActivations{inputGate, forgetGate, candidateGate, outputGate};
 }
 
-static mlir::Value buildCellUpdateRegion(LSTMCellLowering &match,
+static mlir::Value buildCellUpdateStage(LSTMCellLowering &match,
                                          LSTMGateActivations gates,
                                          mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto cellUpdateRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultCTy},
-      mlir::ValueRange{gates.forget, match.lstmCellOp.getCPrev(), gates.input,
-                       gates.candidate},
-      "digital.cell_update", rewriter.getStringAttr("lstm_cell_cell_update"));
-
-  mlir::Block *body = new mlir::Block();
-  cellUpdateRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      gates.forget.getType(), match.lstmCellOp.getCPrev().getType(),
-      gates.input.getType(), gates.candidate.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      gates.forget.getLoc(), match.lstmCellOp.getCPrev().getLoc(),
-      gates.input.getLoc(), gates.candidate.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.cell_update", "lstm_cell_cell_update");
   mlir::RankedTensorType resultTy = match.resultCTy;
   mlir::Value forgetCell = converter_recurrent_elementwise::buildMul(
-      loc, resultTy, body->getArgument(0), body->getArgument(1), rewriter);
+      loc, resultTy, gates.forget, match.lstmCellOp.getCPrev(), rewriter);
   mlir::Value inputCandidate = converter_recurrent_elementwise::buildMul(
-      loc, resultTy, body->getArgument(2), body->getArgument(3), rewriter);
+      loc, resultTy, gates.input, gates.candidate, rewriter);
   mlir::Value nextCell = converter_recurrent_elementwise::buildAdd(
       loc, resultTy, forgetCell, inputCandidate, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(loc, nextCell);
-  return cellUpdateRegion.getResult(0);
+  scope.annotate();
+  return nextCell;
 }
 
-static mlir::Value buildHiddenUpdateRegion(LSTMCellLowering &match,
+static mlir::Value buildHiddenUpdateStage(LSTMCellLowering &match,
                                            mlir::Value outputGate,
                                            mlir::Value nextCell,
                                            mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.lstmCellOp.getLoc();
   rewriter.setInsertionPoint(match.lstmCellOp);
-  auto hiddenUpdateRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultHTy},
-      mlir::ValueRange{outputGate, nextCell}, "digital.hidden_update",
-      rewriter.getStringAttr("lstm_cell_hidden_update"));
-
-  mlir::Block *body = new mlir::Block();
-  hiddenUpdateRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {outputGate.getType(),
-                                              nextCell.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {outputGate.getLoc(),
-                                                 nextCell.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.hidden_update", "lstm_cell_hidden_update");
   mlir::RankedTensorType resultTy = match.resultHTy;
   mlir::Value tanhCell = converter_recurrent_elementwise::buildTanh(
-      loc, resultTy, body->getArgument(1), rewriter);
+      loc, resultTy, nextCell, rewriter);
   mlir::Value nextHidden = converter_recurrent_elementwise::buildMul(
-      loc, resultTy, body->getArgument(0), tanhCell, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(loc, nextHidden);
-  return hiddenUpdateRegion.getResult(0);
+      loc, resultTy, outputGate, tanhCell, rewriter);
+  scope.annotate();
+  return nextHidden;
 }
 
 struct LSTMCellResults {
@@ -493,18 +404,18 @@ struct LSTMCellResults {
 static LSTMCellResults buildGateMath(LSTMCellLowering &match,
                                      mlir::Value preActivation,
                                      mlir::RewriterBase &rewriter) {
-  LSTMGateSlices slices = buildGateSplitRegion(match, preActivation, rewriter);
+  LSTMGateSlices slices = buildGateSplitStage(match, preActivation, rewriter);
   LSTMGateActivations gates =
-      buildGateActivationRegion(match, slices, rewriter);
-  mlir::Value nextCell = buildCellUpdateRegion(match, gates, rewriter);
+      buildGateActivationStage(match, slices, rewriter);
+  mlir::Value nextCell = buildCellUpdateStage(match, gates, rewriter);
   mlir::Value nextHidden =
-      buildHiddenUpdateRegion(match, gates.output, nextCell, rewriter);
+      buildHiddenUpdateStage(match, gates.output, nextCell, rewriter);
   return LSTMCellResults{nextHidden, nextCell};
 }
 
 static mlir::LogicalResult
-lowerLSTMCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedLSTMCellLayer(func);
+lowerLSTMCellOp(NNLSTMCellOp op, mlir::RewriterBase &rewriter) {
+  auto match = matchLSTMCellLayer(op);
   if (mlir::failed(match))
     return mlir::failure();
 
@@ -523,13 +434,13 @@ lowerLSTMCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
   rewriter.setInsertionPoint((*match).lstmCellOp);
   auto fusedWeight =
       rewriter.create<ConstantOp>(loc, (*match).fusedWeightTy, fusedWeightAttr);
-  mlir::Value fusedInput = buildInputRecombineRegion(*match, rewriter);
+  mlir::Value fusedInput = buildInputRecombineStage(*match, rewriter);
   mlir::Value mvmResult =
       mvm_build::buildMVM(loc, (*match).preActivationTy, fusedInput,
                           fusedWeight.getResult(), rewriter);
 
   auto preActivation =
-      buildBiasAddRegion(*match, fusedBiasAttr, mvmResult, rewriter);
+      buildBiasAddStage(*match, fusedBiasAttr, mvmResult, rewriter);
   if (mlir::failed(preActivation))
     return mlir::failure();
 
@@ -542,6 +453,15 @@ lowerLSTMCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
        match->biasHHConstant},
       rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult
+lowerLSTMCellLayerToMVM(mlir::func::FuncOp func,
+                        mlir::RewriterBase &rewriter) {
+  auto match = matchExtractedLSTMCellLayer(func);
+  if (mlir::failed(match))
+    return mlir::failure();
+  return lowerLSTMCellOp(match->lstmCellOp, rewriter);
 }
 
 // Converts extracted sculptor.nn.lstm_cell layer bodies to fused sculptor.mvm plus
@@ -560,6 +480,20 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineLSTMCellLayers(func::FuncOp func) {
+  SmallVector<NNLSTMCellOp> ops;
+  func.walk([&](NNLSTMCellOp op) { ops.push_back(op); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNLSTMCellOp op : ops) {
+    if (failed(lowerLSTMCellOp(op, rewriter))) {
+      op.emitOpError("cannot decompose supported inline LSTMCell");
+      return failure();
+    }
+  }
+  return success();
+}
 
 void registerLSTMCellConverter(LayerToMVMConverters &converters,
                                LayerToMVMConverterMap &converterMap,

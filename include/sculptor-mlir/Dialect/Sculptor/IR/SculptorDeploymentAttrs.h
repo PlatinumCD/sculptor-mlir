@@ -20,8 +20,6 @@ inline constexpr llvm::StringLiteral
 inline constexpr llvm::StringLiteral
     kOutgoingRoutesAttrName("sculptor.deployment.outgoing_routes");
 inline constexpr llvm::StringLiteral
-    kActiveCoreIdsAttrName("sculptor.deployment.active_core_ids");
-inline constexpr llvm::StringLiteral
     kModelInputsAttrName("sculptor.deployment.model_inputs");
 inline constexpr llvm::StringLiteral
     kModelOutputsAttrName("sculptor.deployment.model_outputs");

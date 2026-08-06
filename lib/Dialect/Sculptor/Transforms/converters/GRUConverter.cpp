@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentGateUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentLayerConversionUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -36,6 +37,7 @@ namespace recurrent_gate = mlir::sculptor::recurrent_gate;
 namespace {
 
 using mlir::sculptor::NNGRULayerOp;
+using mlir::sculptor::NNGRUOp;
 using mlir::arith::ConstantOp;
 using mlir::tensor::ConcatOp;
 using mlir::tensor::EmptyOp;
@@ -78,32 +80,11 @@ struct GRUTimestepResult {
   mlir::Value output;
 };
 
-static mlir::Block *addTaskRegionBody(mlir::sculptor::TaskRegionOp region,
-                                      mlir::ValueRange inputs) {
-  mlir::Block *body = new mlir::Block();
-  region.getBody().push_back(body);
-  for (mlir::Value input : inputs)
-    body->addArgument(input.getType(), input.getLoc());
-  return body;
-}
-
 static mlir::FailureOr<GRULayerLowering>
-matchExtractedGRULayer(mlir::func::FuncOp func) {
-  auto gruLayerOp = nn_layer_match::matchSingleNNLayerOp<NNGRULayerOp>(func);
-  if (mlir::failed(gruLayerOp))
-    return mlir::failure();
-
+matchGRULayer(NNGRULayerOp op) {
+  mlir::FailureOr<NNGRULayerOp> gruLayerOp = op;
   bool hasBias = (*gruLayerOp).getHasBias();
-  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "gru", "gru_w_bias",
-                                                hasBias))
-    return mlir::failure();
-
   if (!(*gruLayerOp).getBatchFirst())
-    return mlir::failure();
-
-  if (func.getNumArguments() != 2 || func.getNumResults() != 2 ||
-      (*gruLayerOp).getInput() != func.getArgument(0) ||
-      (*gruLayerOp).getH0() != func.getArgument(1))
     return mlir::failure();
 
   auto inputTy = tensor_type::getStaticF32Tensor(
@@ -223,6 +204,78 @@ matchExtractedGRULayer(mlir::func::FuncOp func) {
   lowering.hiddenSize = hiddenSize;
   lowering.hasBias = hasBias;
   return lowering;
+}
+
+static mlir::FailureOr<GRULayerLowering>
+matchExtractedGRULayer(mlir::func::FuncOp func) {
+  auto gruLayerOp = nn_layer_match::matchSingleNNLayerOp<NNGRULayerOp>(func);
+  if (mlir::failed(gruLayerOp))
+    return mlir::failure();
+
+  bool hasBias = (*gruLayerOp).getHasBias();
+  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "gru", "gru_w_bias",
+                                                hasBias) ||
+      func.getNumArguments() != 2 || func.getNumResults() != 2 ||
+      (*gruLayerOp).getInput() != func.getArgument(0) ||
+      (*gruLayerOp).getH0() != func.getArgument(1))
+    return mlir::failure();
+  return matchGRULayer(*gruLayerOp);
+}
+
+static mlir::LogicalResult splitGRUStack(NNGRUOp op,
+                                         mlir::RewriterBase &rewriter) {
+  auto inputTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getInput().getType());
+  auto outputTy =
+      llvm::dyn_cast<mlir::RankedTensorType>(op.getOutput().getType());
+  auto hiddenTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getHn().getType());
+  if (!op.getBatchFirst() || !inputTy || !outputTy || !hiddenTy ||
+      !inputTy.hasStaticShape() || !outputTy.hasStaticShape() ||
+      !hiddenTy.hasStaticShape() || inputTy.getRank() != 3 ||
+      outputTy.getRank() != 3 || hiddenTy.getRank() != 3)
+    return mlir::failure();
+
+  int64_t layerCount = op.getNumLayers();
+  int64_t operandsPerLayer = op.getHasBias() ? 4 : 2;
+  if (layerCount < 1 || static_cast<int64_t>(op.getRecurrentOperands().size()) !=
+                            layerCount * operandsPerLayer)
+    return mlir::failure();
+
+  auto hiddenSliceTy = mlir::RankedTensorType::get(
+      {1, hiddenTy.getDimSize(1), hiddenTy.getDimSize(2)},
+      hiddenTy.getElementType());
+  mlir::Value currentSequence = op.getInput();
+  llvm::SmallVector<mlir::Value> finalHiddenStates;
+  rewriter.setInsertionPoint(op);
+
+  for (int64_t layer = 0; layer < layerCount; ++layer) {
+    int64_t base = layer * operandsPerLayer;
+    mlir::Value bIh;
+    mlir::Value bHh;
+    if (op.getHasBias()) {
+      bIh = op.getRecurrentOperands()[base + 2];
+      bHh = op.getRecurrentOperands()[base + 3];
+    }
+    auto layerOp = rewriter.create<NNGRULayerOp>(
+        op.getLoc(), mlir::TypeRange{outputTy, hiddenSliceTy}, currentSequence,
+        op.getH0(), op.getRecurrentOperands()[base],
+        op.getRecurrentOperands()[base + 1], bIh, bHh,
+        op.getBatchFirstAttr(), op.getHasBiasAttr(), op.getHiddenSizeAttr(),
+        rewriter.getI64IntegerAttr(layer), op.getNumLayersAttr());
+    currentSequence = layerOp.getOutput();
+    finalHiddenStates.push_back(layerOp.getHn());
+  }
+
+  mlir::Value finalHidden = finalHiddenStates.front();
+  if (finalHiddenStates.size() > 1)
+    finalHidden =
+        rewriter
+            .create<ConcatOp>(op.getLoc(), hiddenTy, /*dim=*/0,
+                              mlir::ValueRange(finalHiddenStates))
+            .getResult();
+  op.getOutput().replaceAllUsesWith(currentSequence);
+  op.getHn().replaceAllUsesWith(finalHidden);
+  rewriter.eraseOp(op);
+  return mlir::success();
 }
 
 // Packs reset, update, input-new, and hidden-new projections.
@@ -390,76 +443,54 @@ static mlir::Value buildGRUGateMath(GRULayerLowering &match,
                             builder);
 }
 
-static mlir::Value buildInitialHiddenRegion(GRULayerLowering &match,
+static mlir::Value buildInitialHiddenStage(GRULayerLowering &match,
                                             mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
   mlir::Value h0 = match.gruLayerOp.getH0();
-  auto hiddenRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange{h0},
-      "digital.hidden_extract",
-      builder.getStringAttr("gru_layer_initial_hidden_extract"));
-
-  mlir::Block *body = addTaskRegionBody(hiddenRegion, mlir::ValueRange{h0});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.hidden_extract", "gru_layer_initial_hidden_extract");
   mlir::Value initialHidden = converter_recurrent_layer::extractLayerState(
-      loc, body->getArgument(0), match.layerIndex, match.batchSize,
-      match.hiddenSize, match.hiddenSliceTy, match.hidden2DTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, initialHidden);
-  return hiddenRegion.getResult(0);
+      loc, h0, match.layerIndex, match.batchSize, match.hiddenSize,
+      match.hiddenSliceTy, match.hidden2DTy, builder);
+  scope.annotate();
+  return initialHidden;
 }
 
-static mlir::Value buildTimestepExtractRegion(GRULayerLowering &match,
+static mlir::Value buildTimestepExtractStage(GRULayerLowering &match,
                                               int64_t timestep,
                                               mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
   mlir::Value input = match.gruLayerOp.getInput();
-  auto extractRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.input2DTy}, mlir::ValueRange{input},
-      "digital.timestep_extract",
-      builder.getStringAttr("gru_layer_timestep_extract"));
-
-  mlir::Block *body = addTaskRegionBody(extractRegion, mlir::ValueRange{input});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.timestep_extract", "gru_layer_timestep_extract");
   mlir::Value timestepIndex =
       builder.create<mlir::arith::ConstantIndexOp>(loc, timestep);
   mlir::Value timestepInput =
       converter_recurrent_layer::extractBatchFirstTimestep(
-          loc, body->getArgument(0), timestepIndex, match.batchSize,
-          match.inputSize, match.inputSliceTy, match.input2DTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, timestepInput);
-  return extractRegion.getResult(0);
+          loc, input, timestepIndex, match.batchSize, match.inputSize,
+          match.inputSliceTy, match.input2DTy, builder);
+  scope.annotate();
+  return timestepInput;
 }
 
-static mlir::Value buildInputRecombineRegion(GRULayerLowering &match,
+static mlir::Value buildInputRecombineStage(GRULayerLowering &match,
                                              mlir::Value timestepInput,
                                              mlir::Value recurrentHidden,
                                              mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {timestepInput, recurrentHidden};
-  auto recombineRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.rowFusedInputTy}, mlir::ValueRange(inputs),
-      "digital.input_recombine",
-      builder.getStringAttr("gru_layer_input_recombine"));
-
-  mlir::Block *body = addTaskRegionBody(recombineRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.input_recombine", "gru_layer_input_recombine");
   mlir::Value fusedInput =
       builder
           .create<ConcatOp>(
               loc, match.rowFusedInputTy, /*dim=*/1,
-              mlir::ValueRange{body->getArgument(0), body->getArgument(1)})
+              mlir::ValueRange{timestepInput, recurrentHidden})
           .getResult();
-  builder.create<mlir::sculptor::YieldOp>(loc, fusedInput);
-  return recombineRegion.getResult(0);
+  scope.annotate();
+  return fusedInput;
 }
 
-static mlir::Value buildBiasAddRegion(GRULayerLowering &match,
+static mlir::Value buildBiasAddStage(GRULayerLowering &match,
                                       mlir::TypedAttr fusedBiasAttr,
                                       mlir::Value preActivation,
                                       mlir::OpBuilder &builder) {
@@ -467,28 +498,19 @@ static mlir::Value buildBiasAddRegion(GRULayerLowering &match,
          "expected fused bias attr for biased GRU layer");
   mlir::Location loc = match.gruLayerOp.getLoc();
 
-  auto biasRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.rowPreActivationTy},
-      mlir::ValueRange{preActivation}, "digital.bias_add",
-      builder.getStringAttr("gru_layer_bias_add"));
-
-  mlir::Block *body =
-      addTaskRegionBody(biasRegion, mlir::ValueRange{preActivation});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value biasResult = body->getArgument(0);
+  mlir::Value biasResult = preActivation;
   if (match.hasBias) {
+    mlir::sculptor::SemanticOperationScope scope(
+        builder, "digital.bias_add", "gru_layer_bias_add");
     auto fusedBias =
         builder.create<ConstantOp>(loc, match.fusedBiasTy, fusedBiasAttr);
     mlir::Value expandedBias = converter_recurrent_layer::expandRowBias(
         loc, fusedBias.getResult(), match.rowPreActivationTy, builder);
     biasResult = converter_recurrent_layer::addBroadcastRowBias(
-        loc, body->getArgument(0), expandedBias, match.rowPreActivationTy,
-        builder);
+        loc, preActivation, expandedBias, match.rowPreActivationTy, builder);
+    scope.annotate();
   }
-  builder.create<mlir::sculptor::YieldOp>(loc, biasResult);
-  return biasRegion.getResult(0);
+  return biasResult;
 }
 
 struct GRUGateSlices {
@@ -498,41 +520,26 @@ struct GRUGateSlices {
   mlir::Value hiddenNew;
 };
 
-static GRUGateSlices buildGateSplitRegion(GRULayerLowering &match,
+static GRUGateSlices buildGateSplitStage(GRULayerLowering &match,
                                           mlir::Value preActivation,
                                           mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  auto gateSplitRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc,
-      mlir::TypeRange{match.hidden2DTy, match.hidden2DTy, match.hidden2DTy,
-                      match.hidden2DTy},
-      mlir::ValueRange{preActivation}, "digital.gate_split",
-      builder.getStringAttr("gru_layer_gate_split"));
-
-  mlir::Block *body =
-      addTaskRegionBody(gateSplitRegion, mlir::ValueRange{preActivation});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value regionPreActivation = body->getArgument(0);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.gate_split", "gru_layer_gate_split");
   mlir::Value resetPre = recurrent_gate::extractBatchGate(
-      loc, regionPreActivation, /*gateOffset=*/0, match.batchSize,
+      loc, preActivation, /*gateOffset=*/0, match.batchSize,
       match.hiddenSize, match.hidden2DTy, builder);
   mlir::Value updatePre = recurrent_gate::extractBatchGate(
-      loc, regionPreActivation, match.hiddenSize, match.batchSize,
+      loc, preActivation, match.hiddenSize, match.batchSize,
       match.hiddenSize, match.hidden2DTy, builder);
   mlir::Value inputNew = recurrent_gate::extractBatchGate(
-      loc, regionPreActivation, match.hiddenSize * 2, match.batchSize,
+      loc, preActivation, match.hiddenSize * 2, match.batchSize,
       match.hiddenSize, match.hidden2DTy, builder);
   mlir::Value hiddenNew = recurrent_gate::extractBatchGate(
-      loc, regionPreActivation, match.hiddenSize * 3, match.batchSize,
+      loc, preActivation, match.hiddenSize * 3, match.batchSize,
       match.hiddenSize, match.hidden2DTy, builder);
-
-  builder.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{resetPre, updatePre, inputNew, hiddenNew});
-  return GRUGateSlices{
-      gateSplitRegion.getResult(0), gateSplitRegion.getResult(1),
-      gateSplitRegion.getResult(2), gateSplitRegion.getResult(3)};
+  scope.annotate();
+  return GRUGateSlices{resetPre, updatePre, inputNew, hiddenNew};
 }
 
 struct GRUGateActivations {
@@ -540,134 +547,85 @@ struct GRUGateActivations {
   mlir::Value update;
 };
 
-static GRUGateActivations buildGateActivationRegion(GRULayerLowering &match,
+static GRUGateActivations buildGateActivationStage(GRULayerLowering &match,
                                                     GRUGateSlices gates,
                                                     mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {gates.reset, gates.update};
-  auto activationRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy, match.hidden2DTy},
-      mlir::ValueRange(inputs), "digital.activation",
-      builder.getStringAttr("gru_layer_gate_activation"));
-
-  mlir::Block *body = addTaskRegionBody(activationRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.activation", "gru_layer_gate_activation");
   mlir::Value resetGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, match.hidden2DTy, body->getArgument(0), builder);
+      loc, match.hidden2DTy, gates.reset, builder);
   mlir::Value updateGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, match.hidden2DTy, body->getArgument(1), builder);
-
-  builder.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{resetGate, updateGate});
-  return GRUGateActivations{activationRegion.getResult(0),
-                            activationRegion.getResult(1)};
+      loc, match.hidden2DTy, gates.update, builder);
+  scope.annotate();
+  return GRUGateActivations{resetGate, updateGate};
 }
 
-static mlir::Value buildCandidateUpdateRegion(GRULayerLowering &match,
+static mlir::Value buildCandidateUpdateStage(GRULayerLowering &match,
                                               mlir::Value resetGate,
                                               mlir::Value inputNew,
                                               mlir::Value hiddenNew,
                                               mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {resetGate, inputNew, hiddenNew};
-  auto candidateRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange(inputs),
-      "digital.candidate_update",
-      builder.getStringAttr("gru_layer_candidate_update"));
-
-  mlir::Block *body = addTaskRegionBody(candidateRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.candidate_update", "gru_layer_candidate_update");
   mlir::Value resetHiddenNew = converter_recurrent_elementwise::buildMul(
-      loc, match.hidden2DTy, body->getArgument(0), body->getArgument(2),
-      builder);
+      loc, match.hidden2DTy, resetGate, hiddenNew, builder);
   mlir::Value candidateInput = converter_recurrent_elementwise::buildAdd(
-      loc, match.hidden2DTy, body->getArgument(1), resetHiddenNew, builder);
+      loc, match.hidden2DTy, inputNew, resetHiddenNew, builder);
   mlir::Value candidate = converter_recurrent_elementwise::buildTanh(
       loc, match.hidden2DTy, candidateInput, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, candidate);
-  return candidateRegion.getResult(0);
+  scope.annotate();
+  return candidate;
 }
 
-static mlir::Value buildHiddenUpdateRegion(GRULayerLowering &match,
+static mlir::Value buildHiddenUpdateStage(GRULayerLowering &match,
                                            mlir::Value candidate,
                                            mlir::Value updateGate,
                                            mlir::Value previousHidden,
                                            mlir::OpBuilder &builder) {
-  mlir::Location loc = match.gruLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {candidate, updateGate,
-                                           previousHidden};
-  auto hiddenUpdateRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange(inputs),
-      "digital.hidden_update",
-      builder.getStringAttr("gru_layer_hidden_update"));
-
-  mlir::Block *body = addTaskRegionBody(hiddenUpdateRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value nextHidden =
-      buildGRUNextHidden(match, body->getArgument(0), body->getArgument(1),
-                         body->getArgument(2), builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, nextHidden);
-  return hiddenUpdateRegion.getResult(0);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.hidden_update", "gru_layer_hidden_update");
+  mlir::Value nextHidden = buildGRUNextHidden(
+      match, candidate, updateGate, previousHidden, builder);
+  scope.annotate();
+  return nextHidden;
 }
 
-static mlir::Value buildOutputUpdateRegion(GRULayerLowering &match,
+static mlir::Value buildOutputUpdateStage(GRULayerLowering &match,
                                            mlir::Value timestepHidden,
                                            mlir::Value sequenceOutput,
                                            int64_t timestep,
                                            mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {timestepHidden};
-  if (sequenceOutput)
-    inputs.push_back(sequenceOutput);
-  auto outputRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.outputTy}, mlir::ValueRange(inputs),
-      "digital.output_update",
-      builder.getStringAttr("gru_layer_output_update"));
-
-  mlir::Block *body = addTaskRegionBody(outputRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.output_update", "gru_layer_output_update");
   mlir::Value timestepIndex =
       builder.create<mlir::arith::ConstantIndexOp>(loc, timestep);
-  mlir::Value outputBase = body->getArgument(0);
+  mlir::Value outputBase = timestepHidden;
   if (sequenceOutput) {
-    outputBase = body->getArgument(1);
+    outputBase = sequenceOutput;
   } else {
     outputBase = builder.create<EmptyOp>(loc, match.outputTy.getShape(),
                                          match.outputTy.getElementType());
   }
   mlir::Value nextOutput = converter_recurrent_layer::insertBatchFirstTimestep(
-      loc, body->getArgument(0), outputBase, timestepIndex, match.batchSize,
+      loc, timestepHidden, outputBase, timestepIndex, match.batchSize,
       match.hiddenSize, match.timestepResultTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, nextOutput);
-  return outputRegion.getResult(0);
+  scope.annotate();
+  return nextOutput;
 }
 
-static mlir::Value buildFinalHiddenRegion(GRULayerLowering &match,
+static mlir::Value buildFinalHiddenStage(GRULayerLowering &match,
                                           mlir::Value finalHidden,
                                           mlir::OpBuilder &builder) {
   mlir::Location loc = match.gruLayerOp.getLoc();
-  auto hiddenRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hiddenResultTy}, mlir::ValueRange{finalHidden},
-      "digital.hidden_output",
-      builder.getStringAttr("gru_layer_hidden_output"));
-
-  mlir::Block *body =
-      addTaskRegionBody(hiddenRegion, mlir::ValueRange{finalHidden});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.hidden_output", "gru_layer_hidden_output");
   mlir::Value hiddenOutput = converter_recurrent_layer::expandFinalLayerState(
-      loc, body->getArgument(0), match.hiddenResultTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, hiddenOutput);
-  return hiddenRegion.getResult(0);
+      loc, finalHidden, match.hiddenResultTy, builder);
+  scope.annotate();
+  return hiddenOutput;
 }
 
 static GRUTimestepResult buildSectionedGRUTimestep(
@@ -677,21 +635,21 @@ static GRUTimestepResult buildSectionedGRUTimestep(
   assert(match.batchSize == 1 && "sectioned GRU lowering expects batch size 1");
   mlir::Location loc = match.gruLayerOp.getLoc();
   mlir::Value timestepInput =
-      buildTimestepExtractRegion(match, timestep, builder);
+      buildTimestepExtractStage(match, timestep, builder);
   mlir::Value fusedInput =
-      buildInputRecombineRegion(match, timestepInput, recurrentHidden, builder);
+      buildInputRecombineStage(match, timestepInput, recurrentHidden, builder);
   mlir::Value preActivation = mvm_build::buildMVM(
       loc, match.rowPreActivationTy, fusedInput, fusedWeight, builder);
   mlir::Value biasedPreActivation =
-      buildBiasAddRegion(match, fusedBiasAttr, preActivation, builder);
+      buildBiasAddStage(match, fusedBiasAttr, preActivation, builder);
   GRUGateSlices slices =
-      buildGateSplitRegion(match, biasedPreActivation, builder);
-  GRUGateActivations gates = buildGateActivationRegion(match, slices, builder);
-  mlir::Value candidate = buildCandidateUpdateRegion(
+      buildGateSplitStage(match, biasedPreActivation, builder);
+  GRUGateActivations gates = buildGateActivationStage(match, slices, builder);
+  mlir::Value candidate = buildCandidateUpdateStage(
       match, gates.reset, slices.inputNew, slices.hiddenNew, builder);
-  mlir::Value nextHidden = buildHiddenUpdateRegion(
+  mlir::Value nextHidden = buildHiddenUpdateStage(
       match, candidate, gates.update, recurrentHidden, builder);
-  mlir::Value nextOutput = buildOutputUpdateRegion(
+  mlir::Value nextOutput = buildOutputUpdateStage(
       match, nextHidden, sequenceOutput, timestep, builder);
   return GRUTimestepResult{nextHidden, nextOutput};
 }
@@ -738,9 +696,9 @@ buildGRUBatchPreActivation(GRULayerLowering &match, mlir::Value timestepInput,
       loc, preActivation, expandedBias, match.preActivationTy, builder);
 }
 
-static mlir::LogicalResult lowerGRULayerToMVM(mlir::func::FuncOp func,
-                                              mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedGRULayer(func);
+static mlir::LogicalResult lowerGRULayerOp(NNGRULayerOp op,
+                                           mlir::RewriterBase &rewriter) {
+  auto match = matchGRULayer(op);
   if (mlir::failed(match))
     return mlir::failure();
 
@@ -773,7 +731,7 @@ static mlir::LogicalResult lowerGRULayerToMVM(mlir::func::FuncOp func,
   mlir::Value currentHidden;
   mlir::Value sequenceOutputInit;
   if (match->batchSize == 1) {
-    currentHidden = buildInitialHiddenRegion(*match, rewriter);
+    currentHidden = buildInitialHiddenStage(*match, rewriter);
   } else {
     currentHidden = converter_recurrent_layer::extractLayerState(
         loc, match->gruLayerOp.getH0(), match->layerIndex, match->batchSize,
@@ -833,7 +791,7 @@ static mlir::LogicalResult lowerGRULayerToMVM(mlir::func::FuncOp func,
 
   mlir::Value hiddenOutput =
       match->batchSize == 1
-          ? buildFinalHiddenRegion(*match, finalHidden, rewriter)
+          ? buildFinalHiddenStage(*match, finalHidden, rewriter)
           : converter_recurrent_layer::expandFinalLayerState(
                 match->gruLayerOp.getLoc(), finalHidden, match->hiddenResultTy,
                 rewriter);
@@ -846,6 +804,14 @@ static mlir::LogicalResult lowerGRULayerToMVM(mlir::func::FuncOp func,
        match->biasHHConstant},
       rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult lowerGRULayerToMVM(mlir::func::FuncOp func,
+                                              mlir::RewriterBase &rewriter) {
+  auto match = matchExtractedGRULayer(func);
+  if (mlir::failed(match))
+    return mlir::failure();
+  return lowerGRULayerOp(match->gruLayerOp, rewriter);
 }
 
 // Converts extracted sculptor.nn.gru_layer bodies to sculptor.mvm timestep loops.
@@ -863,6 +829,29 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineGRULayers(func::FuncOp func) {
+  SmallVector<NNGRUOp> stacks;
+  func.walk([&](NNGRUOp op) { stacks.push_back(op); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNGRUOp op : stacks) {
+    if (failed(splitGRUStack(op, rewriter))) {
+      op.emitOpError("cannot split supported inline GRU stack");
+      return failure();
+    }
+  }
+
+  SmallVector<NNGRULayerOp> layers;
+  func.walk([&](NNGRULayerOp op) { layers.push_back(op); });
+  for (NNGRULayerOp op : layers) {
+    if (failed(lowerGRULayerOp(op, rewriter))) {
+      op.emitOpError("cannot decompose supported inline GRU layer");
+      return failure();
+    }
+  }
+  return success();
+}
 
 void registerGRUConverter(LayerToMVMConverters &converters,
                           LayerToMVMConverterMap &converterMap,

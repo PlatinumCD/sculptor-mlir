@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/I64ArrayAttrUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RewriteUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -417,46 +418,28 @@ static mlir::StringAttr buildOutputPositionName(mlir::OpBuilder &builder,
   return builder.getStringAttr(name);
 }
 
-static mlir::Value buildPatchPreparationRegion(
+static mlir::Value buildPatchPreparationStage(
     mlir::OpBuilder &builder, const Conv2DGroupedMatch &match,
     const Conv2DGroupedLoweringState &state, int64_t outputH, int64_t outputW) {
-  auto prepRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.patchTy},
-      mlir::ValueRange{match.sourceActivation}, "digital.conv_patch",
-      buildOutputPositionName(builder, outputH, outputW));
-
-  mlir::Block *body = new mlir::Block();
-  prepRegion.getBody().push_back(body);
-  body->addArgument(match.sourceActivation.getType(),
-                    match.sourceActivation.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.conv_patch",
+      buildOutputPositionName(builder, outputH, outputW).getValue());
   mlir::Value patch = buildGroupedFlattenedPatch(
-      builder, state, body->getArgument(0), outputH, outputW);
-  builder.create<mlir::sculptor::YieldOp>(state.loc, patch);
-  return prepRegion.getResult(0);
+      builder, state, match.sourceActivation, outputH, outputW);
+  scope.annotate();
+  return patch;
 }
 
-static mlir::Value buildBiasAddRegion(mlir::OpBuilder &builder,
+static mlir::Value buildBiasAddStage(mlir::OpBuilder &builder,
                                       PreparedGroupedBias &preparedBias,
                                       const Conv2DGroupedLoweringState &state,
                                       mlir::Value channelResult,
                                       int64_t outputH, int64_t outputW) {
   std::string name = "conv2d_grouped_oh_" + std::to_string(outputH) + "_ow_" +
                      std::to_string(outputW) + "_bias_add";
-  auto biasAdd = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.matmulResultTy},
-      mlir::ValueRange{channelResult}, "digital.bias_add",
-      builder.getStringAttr(name));
-
-  mlir::Block *body = new mlir::Block();
-  biasAdd.getBody().push_back(body);
-  body->addArgument(channelResult.getType(), channelResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value biasAddResult = body->getArgument(0);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.bias_add",
+                                                name);
+  mlir::Value biasAddResult = channelResult;
   if (preparedBias.bias) {
     auto biasConstant = builder.create<ConstantOp>(
         preparedBias.biasConstant.getLoc(), preparedBias.biasConstant.getType(),
@@ -466,8 +449,8 @@ static mlir::Value buildBiasAddRegion(mlir::OpBuilder &builder,
         biasConstant.getResult(), builder);
   }
 
-  builder.create<mlir::sculptor::YieldOp>(state.loc, biasAddResult);
-  return biasAdd.getResult(0);
+  scope.annotate();
+  return biasAddResult;
 }
 
 static mlir::Value
@@ -477,11 +460,11 @@ buildOutputPosition(mlir::OpBuilder &builder, const Conv2DGroupedMatch &match,
                     const Conv2DGroupedLoweringState &state, int64_t outputH,
                     int64_t outputW) {
   mlir::Value patch =
-      buildPatchPreparationRegion(builder, match, state, outputH, outputW);
+      buildPatchPreparationStage(builder, match, state, outputH, outputW);
   mlir::Value channelResult =
       converter_conv::buildPatchMVM(state.loc, state.matmulResultTy, patch,
                                     preparedFilter.filterMatrix, builder);
-  return buildBiasAddRegion(builder, preparedBias, state, channelResult,
+  return buildBiasAddStage(builder, preparedBias, state, channelResult,
                             outputH, outputW);
 }
 
@@ -492,18 +475,9 @@ assembleOutputTensor(mlir::OpBuilder &builder,
   if (positionResults.empty())
     return mlir::failure();
 
-  auto outputAssembly = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.outputTy},
-      mlir::ValueRange(positionResults), "digital.output_recombine",
-      builder.getStringAttr("conv2d_grouped_output_recombine"));
-
-  mlir::Block *body = new mlir::Block();
-  outputAssembly.getBody().push_back(body);
-  for (mlir::Value positionResult : positionResults)
-    body->addArgument(positionResult.getType(), positionResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.output_recombine",
+      "conv2d_grouped_output_recombine");
 
   mlir::RankedTensorType positionExpandedTy = mlir::RankedTensorType::get(
       {state.shape.n, state.shape.fTotal, 1, 1}, state.elementType);
@@ -520,7 +494,7 @@ assembleOutputTensor(mlir::OpBuilder &builder,
     llvm::SmallVector<mlir::Value> expandedPositions;
     expandedPositions.reserve(state.shape.ow);
     for (int64_t outputW = 0; outputW < state.shape.ow; ++outputW) {
-      mlir::Value positionResult = body->getArgument(positionIndex++);
+      mlir::Value positionResult = positionResults[positionIndex++];
       expandedPositions.push_back(
           builder
               .create<mlir::tensor::ExpandShapeOp>(
@@ -548,8 +522,8 @@ assembleOutputTensor(mlir::OpBuilder &builder,
                  .getResult();
   }
 
-  builder.create<mlir::sculptor::YieldOp>(state.loc, output);
-  return outputAssembly.getResult(0);
+  scope.annotate();
+  return output;
 }
 
 static mlir::FailureOr<mlir::Value>
@@ -583,6 +557,27 @@ static void eraseUnusedGroupedConv2DOps(Conv2DGroupedMatch &match,
         match.biasConstant.getOperation(), rewriter);
 }
 
+static mlir::LogicalResult
+lowerGroupedConv2DOp(NNGroupedConv2DOp layerOp,
+                     mlir::RewriterBase &rewriter) {
+  auto match = matchSupportedGroupedConv2D(layerOp, rewriter);
+  if (failed(match))
+    return mlir::failure();
+
+  Conv2DGroupedLoweringState state = buildGroupedLoweringState(*match);
+  PreparedGroupedFilter preparedFilter = prepareGroupedFilter(*match);
+  PreparedGroupedBias preparedBias =
+      prepareGroupedBias(*match, state, rewriter);
+  auto rewrittenOutput = emitUnrolledGroupedOutputPositions(
+      rewriter, *match, preparedFilter, preparedBias, state);
+  if (failed(rewrittenOutput))
+    return mlir::failure();
+
+  match->result.replaceAllUsesWith(*rewrittenOutput);
+  eraseUnusedGroupedConv2DOps(*match, rewriter);
+  return mlir::success();
+}
+
 // Converts extracted sculptor.nn.grouped_conv2d layer bodies into per-position
 // sculptor.mvm execution.
 class Conv2DGroupedConverter : public mlir::sculptor::LayerToMVMConverter {
@@ -600,22 +595,7 @@ public:
                                                   (*layerOp).getHasBias()))
       return;
 
-    auto match = matchSupportedGroupedConv2D(*layerOp, rewriter);
-    if (failed(match))
-      return;
-
-    Conv2DGroupedLoweringState state = buildGroupedLoweringState(*match);
-    PreparedGroupedFilter preparedFilter = prepareGroupedFilter(*match);
-    PreparedGroupedBias preparedBias =
-        prepareGroupedBias(*match, state, rewriter);
-
-    auto rewrittenOutput = emitUnrolledGroupedOutputPositions(
-        rewriter, *match, preparedFilter, preparedBias, state);
-    if (failed(rewrittenOutput))
-      return;
-
-    match->result.replaceAllUsesWith(*rewrittenOutput);
-    eraseUnusedGroupedConv2DOps(*match, rewriter);
+    (void)lowerGroupedConv2DOp(*layerOp, rewriter);
   }
 };
 
@@ -623,6 +603,23 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineGroupedConv2DLayers(func::FuncOp func) {
+  SmallVector<NNGroupedConv2DOp> layerOps;
+  func.walk(
+      [&](NNGroupedConv2DOp layerOp) { layerOps.push_back(layerOp); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNGroupedConv2DOp layerOp : layerOps) {
+    if (!layerOp || !layerOp->getBlock())
+      continue;
+    if (failed(lowerGroupedConv2DOp(layerOp, rewriter))) {
+      layerOp.emitOpError("failed to decompose inline grouped Conv2D layer");
+      return failure();
+    }
+  }
+  return success();
+}
 
 // Registers the grouped Conv2D converter for both bias forms outlined by the
 // extractor.

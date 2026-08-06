@@ -1,90 +1,26 @@
-add_compile_definitions(
-  SCULPTOR_COMPILER_REVISION="${SCULPTOR_COMPILER_REVISION}"
-)
+add_subdirectory(mapping)
+add_subdirectory(planners)
 
 add_mlir_library(MLIRSculptorTransforms
   Passes.cpp
-  AnalyzeTaskGraphTiming.cpp
-  AssembleTaskGraph.cpp
-  BalanceTaskGraphReductions.cpp
-  BuildTaskGraphIslands.cpp
+  ApplyMappingPlan.cpp
+  BuildRATree.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
-  DistributeDigitalMatmul.cpp
-  ExportTaskGraphIslandMap.cpp
-  ExportTaskGraphSimModel.cpp
-  ExportTaskGraphVis.cpp
-  ExtractCoreModule.cpp
+  ExpandDigitalWork.cpp
+  ExtractTileModule.cpp
   ExtractLayers.cpp
-  FinalizeTaskGraphResources.cpp
-  FuseTaskGraph.cpp
-  LowerScheduledMVMToDigital.cpp
-  MaterializeTasks.cpp
-  OptimizeTaskGraph.cpp
-  PartitionTaskGraphByCore.cpp
-  PlanCoreScratchpad.cpp
-  ScheduleTaskGraph.cpp
-  TaskGraphTaskMetadata.cpp
-  VectorizeMarkedElementwise.cpp
-  assemblers/TaskGraphExecutionPlanAssembler.cpp
-  assemblers/TaskGraphGeneratorAssembler.cpp
-  assemblers/TaskGraphResourceAssembler.cpp
-  assemblers/TaskGraphTaskAssembler.cpp
-  task_graph/TaskGraphIslandBuilder.cpp
-  task_graph/TaskGraphIslandCommunication.cpp
-  task_graph/TaskGraphIslandDigitalAssignment.cpp
-  task_graph/TaskGraphMatmulDistributor.cpp
-  task_schedulers/TaskGraphPlacementUtils.cpp
-  task_schedulers/TaskGraphPlacementPlan.cpp
-  task_schedulers/TaskGraphDigitalShardPlacement.cpp
-  task_schedulers/TaskGraphReductionPlacement.cpp
-  task_schedulers/TaskGraphPlacementConstraints.cpp
-  task_schedulers/TaskGraphHardwareConfig.cpp
-  task_schedulers/TaskGraphPlacementObjective.cpp
-  task_schedulers/TaskGraphScheduleConfig.cpp
-  task_schedulers/TaskGraphScheduleReport.cpp
-  task_schedulers/TaskGraphPhysicalArrayOrders.cpp
-  task_graph/TaskGraphResources.cpp
-  task_graph/TaskGraphReductionBalancer.cpp
-  task_schedulers/TaskGraphScheduler.cpp
-  task_graph/TaskGraphDAG.cpp
-  task_graph/TaskGraphExecutionGraph.cpp
-  task_graph/TaskGraphDigitalOps.cpp
-  task_graph/TaskGraphIslandMultiTerminalAssignment.cpp
-  task_graph/TaskGraphCleanup.cpp
-  task_graph/TaskGraphResourceUtils.cpp
-  task_graph/TaskGraphRuntimeOrder.cpp
-  task_schedulers/TaskGraphScorer.cpp
-  task_schedulers/TaskGraphScheduleMetadata.cpp
-  task_schedulers/MeshGeometry.cpp
-  task_graph/TaskGraphDeploymentPartitioner.cpp
-  task_graph/TaskGraphRoutineFuser.cpp
-  task_graph/TaskGraphOptimizer.cpp
-  task_graph/ElementwiseFusionOptimizer.cpp
-  task_graph/ElementwiseSlicesOptimizer.cpp
-  task_graph/SegmentedConcatConsumerOptimizer.cpp
-  task_graph/SeparableRegionOptimizer.cpp
-  task_graph/StreamingConvolutionOptimizer.cpp
-  task_graph/VectorizedElementwiseOptimizer.cpp
-  task_timing/TaskGraphTimingAnalysis.cpp
-  task_timing/TaskGraphTimingIRCodec.cpp
-  task_timing/TaskGraphNetworkTiming.cpp
-  task_timing/TaskGraphTimingProfileBuilder.cpp
-  task_timing/TaskCostAnalysis.cpp
-  task_timing/TaskLatencyModel.cpp
-  task_timing/TimingCostModel.cpp
-  task_schedulers/greedy/GreedyHeuristic.cpp
-  task_schedulers/greedy/GreedyCandidates.cpp
-  task_schedulers/greedy/GreedyBoundaryRepair.cpp
-  task_schedulers/greedy/GreedySearch.cpp
-  task_schedulers/greedy/GreedyTimingSearch.cpp
-  task_schedulers/GreedyTaskScheduler.cpp
-  task_schedulers/GreedyTimingTaskScheduler.cpp
-  task_schedulers/RandomTaskScheduler.cpp
-  task_schedulers/annealing/AnnealingMoves.cpp
-  task_schedulers/annealing/AnnealingSearch.cpp
-  task_schedulers/SimulatedAnnealingTaskScheduler.cpp
-  task_schedulers/SnakeTaskScheduler.cpp
+  FinalizeTileRuntimeGraph.cpp
+  MaterializeTileRuntimeGraph.cpp
+  ${SCULPTOR_MAPPING_SOURCES}
+  ${SCULPTOR_MAPPING_PLANNER_SOURCES}
+  OutlineTileRoutines.cpp
+  PlaceLogicalTiles.cpp
+  PlanTileScratchpad.cpp
+  PlanMapping.cpp
+  tile_runtime/TileRuntimeResourceUtils.cpp
+  tile_runtime/TileRuntimeOrder.cpp
+  tile_runtime/TileRuntimeLayout.cpp
   canonicalizers/Conv1DCanonicalizer.cpp
   canonicalizers/Conv2DCanonicalizer.cpp
   canonicalizers/Conv2DGroupedCanonicalizer.cpp
@@ -97,8 +33,10 @@ add_mlir_library(MLIRSculptorTransforms
   canonicalizers/GRUCellCanonicalizer.cpp
   canonicalizers/LSTMCellCanonicalizer.cpp
   canonicalizers/RNNCellCanonicalizer.cpp
+  Golem/DuplicateMatrices.cpp
   Golem/ExpandMVMToGolem.cpp
   Support/Conversion/NNLayerMatchUtils.cpp
+  Support/Layers/TransformerStackStructure.cpp
   converters/Conv1DConverter.cpp
   converters/Conv2DConverter.cpp
   converters/Conv2DGroupedConverter.cpp
@@ -128,7 +66,9 @@ add_mlir_library(MLIRSculptorTransforms
   SculptorIR
   MLIRIR
   MLIRPass
+  MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRTensorTransforms
+  MLIRTilingInterface
   MLIRVectorDialect
 )

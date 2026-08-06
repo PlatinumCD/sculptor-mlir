@@ -6,6 +6,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentElementwiseUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentLayerConversionUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -34,6 +35,7 @@ namespace tensor_type = mlir::sculptor::tensor_type;
 namespace {
 
 using mlir::sculptor::NNRNNLayerOp;
+using mlir::sculptor::NNRNNOp;
 using mlir::arith::ConstantOp;
 using mlir::tensor::ConcatOp;
 using mlir::tensor::EmptyOp;
@@ -75,32 +77,11 @@ struct RNNTimestepResult {
   mlir::Value output;
 };
 
-static mlir::Block *addTaskRegionBody(mlir::sculptor::TaskRegionOp region,
-                                      mlir::ValueRange inputs) {
-  mlir::Block *body = new mlir::Block();
-  region.getBody().push_back(body);
-  for (mlir::Value input : inputs)
-    body->addArgument(input.getType(), input.getLoc());
-  return body;
-}
-
 static mlir::FailureOr<RNNLayerLowering>
-matchExtractedRNNLayer(mlir::func::FuncOp func) {
-  auto rnnLayerOp = nn_layer_match::matchSingleNNLayerOp<NNRNNLayerOp>(func);
-  if (failed(rnnLayerOp))
-    return mlir::failure();
-
+matchRNNLayer(NNRNNLayerOp op) {
+  mlir::FailureOr<NNRNNLayerOp> rnnLayerOp = op;
   bool hasBias = (*rnnLayerOp).getHasBias();
-  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "rnn", "rnn_w_bias",
-                                                hasBias))
-    return mlir::failure();
-
   if (!(*rnnLayerOp).getBatchFirst())
-    return mlir::failure();
-
-  if (func.getNumArguments() != 2 || func.getNumResults() != 2 ||
-      (*rnnLayerOp).getInput() != func.getArgument(0) ||
-      (*rnnLayerOp).getH0() != func.getArgument(1))
     return mlir::failure();
 
   auto inputTy = tensor_type::getStaticF32Tensor(
@@ -219,6 +200,78 @@ matchExtractedRNNLayer(mlir::func::FuncOp func) {
   return lowering;
 }
 
+static mlir::FailureOr<RNNLayerLowering>
+matchExtractedRNNLayer(mlir::func::FuncOp func) {
+  auto rnnLayerOp = nn_layer_match::matchSingleNNLayerOp<NNRNNLayerOp>(func);
+  if (failed(rnnLayerOp))
+    return mlir::failure();
+
+  bool hasBias = (*rnnLayerOp).getHasBias();
+  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "rnn", "rnn_w_bias",
+                                                hasBias) ||
+      func.getNumArguments() != 2 || func.getNumResults() != 2 ||
+      (*rnnLayerOp).getInput() != func.getArgument(0) ||
+      (*rnnLayerOp).getH0() != func.getArgument(1))
+    return mlir::failure();
+  return matchRNNLayer(*rnnLayerOp);
+}
+
+static mlir::LogicalResult splitRNNStack(NNRNNOp op,
+                                         mlir::RewriterBase &rewriter) {
+  auto inputTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getInput().getType());
+  auto outputTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getOutput().getType());
+  auto hiddenTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getHn().getType());
+  if (!op.getBatchFirst() || !inputTy || !outputTy || !hiddenTy ||
+      !inputTy.hasStaticShape() || !outputTy.hasStaticShape() ||
+      !hiddenTy.hasStaticShape() || inputTy.getRank() != 3 ||
+      outputTy.getRank() != 3 || hiddenTy.getRank() != 3)
+    return mlir::failure();
+
+  int64_t layerCount = op.getNumLayers();
+  int64_t operandsPerLayer = op.getHasBias() ? 4 : 2;
+  if (layerCount < 1 || static_cast<int64_t>(op.getRecurrentOperands().size()) !=
+                            layerCount * operandsPerLayer)
+    return mlir::failure();
+
+  auto hiddenSliceTy = mlir::RankedTensorType::get(
+      {1, hiddenTy.getDimSize(1), hiddenTy.getDimSize(2)},
+      hiddenTy.getElementType());
+  mlir::Value currentSequence = op.getInput();
+  llvm::SmallVector<mlir::Value> finalHiddenStates;
+  rewriter.setInsertionPoint(op);
+
+  for (int64_t layer = 0; layer < layerCount; ++layer) {
+    int64_t base = layer * operandsPerLayer;
+    mlir::Value bIh;
+    mlir::Value bHh;
+    if (op.getHasBias()) {
+      bIh = op.getRecurrentOperands()[base + 2];
+      bHh = op.getRecurrentOperands()[base + 3];
+    }
+    auto layerOp = rewriter.create<NNRNNLayerOp>(
+        op.getLoc(), mlir::TypeRange{outputTy, hiddenSliceTy}, currentSequence,
+        op.getH0(), op.getRecurrentOperands()[base],
+        op.getRecurrentOperands()[base + 1], bIh, bHh,
+        op.getBatchFirstAttr(), op.getHasBiasAttr(), op.getHiddenSizeAttr(),
+        rewriter.getI64IntegerAttr(layer), op.getNumLayersAttr());
+    currentSequence = layerOp.getOutput();
+    finalHiddenStates.push_back(layerOp.getHn());
+  }
+
+  mlir::Value finalHidden = finalHiddenStates.front();
+  if (finalHiddenStates.size() > 1)
+    finalHidden =
+        rewriter
+            .create<ConcatOp>(op.getLoc(), hiddenTy, /*dim=*/0,
+                              mlir::ValueRange(finalHiddenStates))
+            .getResult();
+  op.getOutput().replaceAllUsesWith(currentSequence);
+  op.getHn().replaceAllUsesWith(finalHidden);
+  rewriter.eraseOp(op);
+  return mlir::success();
+}
+
 static mlir::TypedAttr buildRNNFusedWeightAttr(RNNLayerLowering &match) {
   auto maybeInputWeights =
       converter_constant::getF32ConstantValues(match.weightIHConstant);
@@ -302,76 +355,54 @@ static mlir::Value buildRNNHiddenActivation(RNNLayerLowering &match,
       loc, activationInput, recurrentHidden, match.hidden2DTy, builder);
 }
 
-static mlir::Value buildInitialHiddenRegion(RNNLayerLowering &match,
+static mlir::Value buildInitialHiddenStage(RNNLayerLowering &match,
                                             mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
   mlir::Value h0 = match.rnnLayerOp.getH0();
-  auto hiddenRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange{h0},
-      "digital.hidden_extract",
-      builder.getStringAttr("rnn_layer_initial_hidden_extract"));
-
-  mlir::Block *body = addTaskRegionBody(hiddenRegion, mlir::ValueRange{h0});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.hidden_extract", "rnn_layer_initial_hidden_extract");
   mlir::Value initialHidden = converter_recurrent_layer::extractLayerState(
-      loc, body->getArgument(0), match.layerIndex, match.batchSize,
-      match.hiddenSize, match.hiddenSliceTy, match.hidden2DTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, initialHidden);
-  return hiddenRegion.getResult(0);
+      loc, h0, match.layerIndex, match.batchSize, match.hiddenSize,
+      match.hiddenSliceTy, match.hidden2DTy, builder);
+  scope.annotate();
+  return initialHidden;
 }
 
-static mlir::Value buildTimestepExtractRegion(RNNLayerLowering &match,
+static mlir::Value buildTimestepExtractStage(RNNLayerLowering &match,
                                               int64_t timestep,
                                               mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
   mlir::Value input = match.rnnLayerOp.getInput();
-  auto extractRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.input2DTy}, mlir::ValueRange{input},
-      "digital.timestep_extract",
-      builder.getStringAttr("rnn_layer_timestep_extract"));
-
-  mlir::Block *body = addTaskRegionBody(extractRegion, mlir::ValueRange{input});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.timestep_extract", "rnn_layer_timestep_extract");
   mlir::Value timestepIndex =
       builder.create<mlir::arith::ConstantIndexOp>(loc, timestep);
   mlir::Value timestepInput =
       converter_recurrent_layer::extractBatchFirstTimestep(
-          loc, body->getArgument(0), timestepIndex, match.batchSize,
-          match.inputSize, match.inputSliceTy, match.input2DTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, timestepInput);
-  return extractRegion.getResult(0);
+          loc, input, timestepIndex, match.batchSize, match.inputSize,
+          match.inputSliceTy, match.input2DTy, builder);
+  scope.annotate();
+  return timestepInput;
 }
 
-static mlir::Value buildInputRecombineRegion(RNNLayerLowering &match,
+static mlir::Value buildInputRecombineStage(RNNLayerLowering &match,
                                              mlir::Value timestepInput,
                                              mlir::Value recurrentHidden,
                                              mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {timestepInput, recurrentHidden};
-  auto recombineRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.rowFusedInputTy}, mlir::ValueRange(inputs),
-      "digital.input_recombine",
-      builder.getStringAttr("rnn_layer_input_recombine"));
-
-  mlir::Block *body = addTaskRegionBody(recombineRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.input_recombine", "rnn_layer_input_recombine");
   mlir::Value fusedInput =
       builder
           .create<ConcatOp>(
               loc, match.rowFusedInputTy, /*dim=*/1,
-              mlir::ValueRange{body->getArgument(0), body->getArgument(1)})
+              mlir::ValueRange{timestepInput, recurrentHidden})
           .getResult();
-  builder.create<mlir::sculptor::YieldOp>(loc, fusedInput);
-  return recombineRegion.getResult(0);
+  scope.annotate();
+  return fusedInput;
 }
 
-static mlir::Value buildBiasAddRegion(RNNLayerLowering &match,
+static mlir::Value buildBiasAddStage(RNNLayerLowering &match,
                                       mlir::TypedAttr fusedBiasAttr,
                                       mlir::Value preActivation,
                                       mlir::OpBuilder &builder) {
@@ -379,101 +410,68 @@ static mlir::Value buildBiasAddRegion(RNNLayerLowering &match,
          "expected fused bias attr for biased RNN layer");
   mlir::Location loc = match.rnnLayerOp.getLoc();
 
-  auto biasRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange{preActivation},
-      "digital.bias_add", builder.getStringAttr("rnn_layer_bias_add"));
-
-  mlir::Block *body =
-      addTaskRegionBody(biasRegion, mlir::ValueRange{preActivation});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  mlir::Value biasResult = body->getArgument(0);
+  mlir::Value biasResult = preActivation;
   if (match.hasBias) {
+    mlir::sculptor::SemanticOperationScope scope(
+        builder, "digital.bias_add", "rnn_layer_bias_add");
     auto fusedBias =
         builder.create<ConstantOp>(loc, match.fusedBiasTy, fusedBiasAttr);
     mlir::Value expandedBias = converter_recurrent_layer::expandRowBias(
         loc, fusedBias.getResult(), match.rowResultTy, builder);
     biasResult = converter_recurrent_layer::addBroadcastRowBias(
-        loc, body->getArgument(0), expandedBias, match.hidden2DTy, builder);
+        loc, preActivation, expandedBias, match.hidden2DTy, builder);
+    scope.annotate();
   }
-  builder.create<mlir::sculptor::YieldOp>(loc, biasResult);
-  return biasRegion.getResult(0);
+  return biasResult;
 }
 
-static mlir::Value buildActivationRegion(RNNLayerLowering &match,
+static mlir::Value buildActivationStage(RNNLayerLowering &match,
                                          mlir::Value activationInput,
                                          mlir::Value recurrentHidden,
                                          mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {activationInput, recurrentHidden};
-  auto activationRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hidden2DTy}, mlir::ValueRange(inputs),
-      "digital.activation", builder.getStringAttr("rnn_layer_tanh"));
-
-  mlir::Block *body = addTaskRegionBody(activationRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.activation", "rnn_layer_tanh");
   mlir::Value result = converter_recurrent_elementwise::buildTanh(
-      loc, body->getArgument(0), body->getArgument(1), match.hidden2DTy,
-      builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, result);
-  return activationRegion.getResult(0);
+      loc, activationInput, recurrentHidden, match.hidden2DTy, builder);
+  scope.annotate();
+  return result;
 }
 
-static mlir::Value buildOutputUpdateRegion(RNNLayerLowering &match,
+static mlir::Value buildOutputUpdateStage(RNNLayerLowering &match,
                                            mlir::Value timestepHidden,
                                            mlir::Value sequenceOutput,
                                            int64_t timestep,
                                            mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
-  llvm::SmallVector<mlir::Value> inputs = {timestepHidden};
-  if (sequenceOutput)
-    inputs.push_back(sequenceOutput);
-  auto outputRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.outputTy}, mlir::ValueRange(inputs),
-      "digital.output_update",
-      builder.getStringAttr("rnn_layer_output_update"));
-
-  mlir::Block *body = addTaskRegionBody(outputRegion, inputs);
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.output_update", "rnn_layer_output_update");
   mlir::Value timestepIndex =
       builder.create<mlir::arith::ConstantIndexOp>(loc, timestep);
-  mlir::Value outputBase = body->getArgument(0);
+  mlir::Value outputBase = timestepHidden;
   if (sequenceOutput) {
-    outputBase = body->getArgument(1);
+    outputBase = sequenceOutput;
   } else {
     outputBase = builder.create<EmptyOp>(loc, match.outputTy.getShape(),
                                          match.outputTy.getElementType());
   }
   mlir::Value nextOutput = converter_recurrent_layer::insertBatchFirstTimestep(
-      loc, body->getArgument(0), outputBase, timestepIndex, match.batchSize,
+      loc, timestepHidden, outputBase, timestepIndex, match.batchSize,
       match.hiddenSize, match.timestepResultTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, nextOutput);
-  return outputRegion.getResult(0);
+  scope.annotate();
+  return nextOutput;
 }
 
-static mlir::Value buildFinalHiddenRegion(RNNLayerLowering &match,
+static mlir::Value buildFinalHiddenStage(RNNLayerLowering &match,
                                           mlir::Value finalHidden,
                                           mlir::OpBuilder &builder) {
   mlir::Location loc = match.rnnLayerOp.getLoc();
-  auto hiddenRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.hiddenResultTy}, mlir::ValueRange{finalHidden},
-      "digital.hidden_output",
-      builder.getStringAttr("rnn_layer_hidden_output"));
-
-  mlir::Block *body =
-      addTaskRegionBody(hiddenRegion, mlir::ValueRange{finalHidden});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.hidden_output", "rnn_layer_hidden_output");
   mlir::Value hiddenOutput = converter_recurrent_layer::expandFinalLayerState(
-      loc, body->getArgument(0), match.hiddenResultTy, builder);
-  builder.create<mlir::sculptor::YieldOp>(loc, hiddenOutput);
-  return hiddenRegion.getResult(0);
+      loc, finalHidden, match.hiddenResultTy, builder);
+  scope.annotate();
+  return hiddenOutput;
 }
 
 static RNNTimestepResult buildSectionedRNNTimestep(
@@ -483,16 +481,16 @@ static RNNTimestepResult buildSectionedRNNTimestep(
   assert(match.batchSize == 1 && "sectioned RNN lowering expects batch size 1");
   mlir::Location loc = match.rnnLayerOp.getLoc();
   mlir::Value timestepInput =
-      buildTimestepExtractRegion(match, timestep, builder);
+      buildTimestepExtractStage(match, timestep, builder);
   mlir::Value fusedInput =
-      buildInputRecombineRegion(match, timestepInput, recurrentHidden, builder);
+      buildInputRecombineStage(match, timestepInput, recurrentHidden, builder);
   mlir::Value preActivation = mvm_build::buildMVM(
       loc, match.rowResultTy, fusedInput, fusedWeight, builder);
   mlir::Value activationInput =
-      buildBiasAddRegion(match, fusedBiasAttr, preActivation, builder);
+      buildBiasAddStage(match, fusedBiasAttr, preActivation, builder);
   mlir::Value timestepHidden =
-      buildActivationRegion(match, activationInput, recurrentHidden, builder);
-  mlir::Value nextOutput = buildOutputUpdateRegion(
+      buildActivationStage(match, activationInput, recurrentHidden, builder);
+  mlir::Value nextOutput = buildOutputUpdateStage(
       match, timestepHidden, sequenceOutput, timestep, builder);
   return RNNTimestepResult{timestepHidden, nextOutput};
 }
@@ -538,9 +536,9 @@ buildRNNBatchStep(RNNLayerLowering &match, mlir::Value timestepInput,
 }
 
 // Lowers one extracted RNN layer into an sculptor.mvm timestep loop.
-static mlir::LogicalResult lowerRNNLayerToMVM(mlir::func::FuncOp func,
-                                              mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedRNNLayer(func);
+static mlir::LogicalResult lowerRNNLayerOp(NNRNNLayerOp op,
+                                           mlir::RewriterBase &rewriter) {
+  auto match = matchRNNLayer(op);
   if (failed(match))
     return mlir::failure();
 
@@ -572,7 +570,7 @@ static mlir::LogicalResult lowerRNNLayerToMVM(mlir::func::FuncOp func,
   mlir::Value currentHidden;
   mlir::Value sequenceOutputInit;
   if (match->batchSize == 1) {
-    currentHidden = buildInitialHiddenRegion(*match, rewriter);
+    currentHidden = buildInitialHiddenStage(*match, rewriter);
   } else {
     currentHidden = converter_recurrent_layer::extractLayerState(
         loc, match->rnnLayerOp.getH0(), match->layerIndex, match->batchSize,
@@ -630,7 +628,7 @@ static mlir::LogicalResult lowerRNNLayerToMVM(mlir::func::FuncOp func,
 
   mlir::Value hiddenOutput =
       match->batchSize == 1
-          ? buildFinalHiddenRegion(*match, finalHidden, rewriter)
+          ? buildFinalHiddenStage(*match, finalHidden, rewriter)
           : converter_recurrent_layer::expandFinalLayerState(
                 match->rnnLayerOp.getLoc(), finalHidden, match->hiddenResultTy,
                 rewriter);
@@ -643,6 +641,14 @@ static mlir::LogicalResult lowerRNNLayerToMVM(mlir::func::FuncOp func,
        match->biasHHConstant},
       rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult lowerRNNLayerToMVM(mlir::func::FuncOp func,
+                                              mlir::RewriterBase &rewriter) {
+  auto match = matchExtractedRNNLayer(func);
+  if (failed(match))
+    return mlir::failure();
+  return lowerRNNLayerOp(match->rnnLayerOp, rewriter);
 }
 
 // Converts extracted sculptor.nn.rnn_layer bodies to sculptor.mvm timestep loops.
@@ -660,6 +666,29 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineRNNLayers(func::FuncOp func) {
+  SmallVector<NNRNNOp> stacks;
+  func.walk([&](NNRNNOp op) { stacks.push_back(op); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNRNNOp op : stacks) {
+    if (failed(splitRNNStack(op, rewriter))) {
+      op.emitOpError("cannot split supported inline RNN stack");
+      return failure();
+    }
+  }
+
+  SmallVector<NNRNNLayerOp> layers;
+  func.walk([&](NNRNNLayerOp op) { layers.push_back(op); });
+  for (NNRNNLayerOp op : layers) {
+    if (failed(lowerRNNLayerOp(op, rewriter))) {
+      op.emitOpError("cannot decompose supported inline RNN layer");
+      return failure();
+    }
+  }
+  return success();
+}
 
 void registerRNNConverter(LayerToMVMConverters &converters,
                           LayerToMVMConverterMap &converterMap,

@@ -632,6 +632,7 @@ def Sculptor_NNTransformerOp
     BoolAttr:$batch_first,
     BoolAttr:$has_projection_bias,
     BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_layer_norm_bias,
     BoolAttr:$has_final_norm,
     BoolAttr:$causal,
     StrAttr:$activation,
@@ -683,6 +684,7 @@ def Sculptor_NNTransformerEncoderOp
     BoolAttr:$batch_first,
     BoolAttr:$has_projection_bias,
     BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_layer_norm_bias,
     BoolAttr:$has_final_norm,
     BoolAttr:$causal,
     StrAttr:$activation,
@@ -731,6 +733,7 @@ def Sculptor_NNTransformerDecoderOp
     BoolAttr:$batch_first,
     BoolAttr:$has_projection_bias,
     BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_layer_norm_bias,
     BoolAttr:$has_final_norm,
     BoolAttr:$causal,
     BoolAttr:$has_cross_attention,
@@ -818,6 +821,7 @@ def Sculptor_NNTransformerBlockOp
     BoolAttr:$batch_first,
     BoolAttr:$has_projection_bias,
     BoolAttr:$has_layer_norm_affine,
+    BoolAttr:$has_layer_norm_bias,
     BoolAttr:$has_final_norm,
     BoolAttr:$causal,
     BoolAttr:$has_cross_attention,
@@ -844,15 +848,15 @@ def Sculptor_NNTransformerBlockOp
     `memory` `[` ($memory^)? `]` `,`
     `qkv` `[` $qkv_weight (`,` $qkv_bias^)? `]` `,`
     `attn_output` `[` $attn_output_weight (`,` $attn_output_bias^)? `]` `,`
-    `attn_norm` `[` ($attn_norm_weight^ `,` $attn_norm_bias)? `]`
+    `attn_norm` `[` ($attn_norm_weight^)? (`,` $attn_norm_bias^)? `]`
     `,` `cross_query` `[` ($cross_query_weight^)? (`,` $cross_query_bias^)? `]`
     `,` `cross_key_value` `[` ($cross_key_value_weight^)? (`,` $cross_key_value_bias^)? `]`
     `,` `cross_output` `[` ($cross_output_weight^)? (`,` $cross_output_bias^)? `]`
-    `,` `cross_norm` `[` ($cross_norm_weight^ `,` $cross_norm_bias)? `]`
+    `,` `cross_norm` `[` ($cross_norm_weight^)? (`,` $cross_norm_bias^)? `]`
     `,` `mlp_up` `[` $mlp_up_weight (`,` $mlp_up_bias^)? `]`
     `,` `mlp_down` `[` $mlp_down_weight (`,` $mlp_down_bias^)? `]`
-    `,` `mlp_norm` `[` ($mlp_norm_weight^ `,` $mlp_norm_bias)? `]`
-    `,` `final_norm` `[` ($final_norm_weight^ `,` $final_norm_bias)? `]`
+    `,` `mlp_norm` `[` ($mlp_norm_weight^)? (`,` $mlp_norm_bias^)? `]`
+    `,` `final_norm` `[` ($final_norm_weight^)? (`,` $final_norm_bias^)? `]`
     `block_kind` `=` $block_kind
     attr-dict `:` functional-type(operands, results)
   }];

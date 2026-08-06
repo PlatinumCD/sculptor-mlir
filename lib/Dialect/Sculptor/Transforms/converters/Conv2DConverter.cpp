@@ -4,9 +4,9 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/I64ArrayAttrUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RewriteUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphOptimizationAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphTaskNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/SemanticOperationNames.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -23,9 +23,8 @@ namespace nn_layer_match = mlir::sculptor::nn_layer_match;
 namespace converter_constant = mlir::sculptor::converter_constant;
 namespace converter_conv = mlir::sculptor::converter_conv;
 namespace i64_array_attr = mlir::sculptor::i64_array_attr;
-namespace optimization_attrs = mlir::sculptor::optimization_attrs;
-namespace runtime_attrs = mlir::sculptor::runtime_attrs;
-namespace task_graph_names = mlir::sculptor::task_graph_names;
+namespace tile_runtime_attrs = mlir::sculptor::tile_runtime_attrs;
+namespace semantic_operation_names = mlir::sculptor::semantic_operation_names;
 
 namespace {
 
@@ -379,55 +378,16 @@ static mlir::Value buildPatchSequence(mlir::OpBuilder &builder,
 }
 
 static mlir::Value
-buildPatchPreparationRegion(mlir::OpBuilder &builder, const Conv2DMatch &match,
+buildPatchPreparationStage(mlir::OpBuilder &builder, const Conv2DMatch &match,
                             const Conv2DLoweringState &state) {
-  auto prepRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.patchSequenceTy},
-      mlir::ValueRange{match.activation}, task_graph_names::kConvPatchTaskKind,
-      builder.getStringAttr("conv2d_patch_sequence"));
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, semantic_operation_names::kConvPatchTaskKind,
+      "conv2d_patch_sequence");
 
-  llvm::SmallVector<mlir::NamedAttribute, 8> descriptorFields{
-      builder.getNamedAttr(
-          optimization_attrs::kInputShapeFieldName,
-          builder.getI64ArrayAttr(
-              {state.shape.n, state.shape.c, state.shape.h, state.shape.w})),
-      builder.getNamedAttr(
-          optimization_attrs::kOutputShapeFieldName,
-          builder.getI64ArrayAttr(
-              {state.shape.n, state.shape.f, state.shape.oh, state.shape.ow})),
-      builder.getNamedAttr(
-          optimization_attrs::kKernelShapeFieldName,
-          builder.getI64ArrayAttr({state.shape.kh, state.shape.kw})),
-      builder.getNamedAttr(
-          optimization_attrs::kStrideFieldName,
-          builder.getI64ArrayAttr({state.attrs.strideH, state.attrs.strideW})),
-      builder.getNamedAttr(optimization_attrs::kPaddingFieldName,
-                           builder.getI64ArrayAttr(
-                               {state.attrs.paddingH, state.attrs.paddingW})),
-      builder.getNamedAttr(optimization_attrs::kDilationFieldName,
-                           builder.getI64ArrayAttr(
-                               {state.attrs.dilationH, state.attrs.dilationW})),
-      builder.getNamedAttr(optimization_attrs::kHasBiasFieldName,
-                           builder.getBoolAttr(state.hasBias)),
-  };
-  if (state.hasBias) {
-    ConstantOp biasConstant = match.biasConstant;
-    descriptorFields.push_back(builder.getNamedAttr(
-        optimization_attrs::kBiasFieldName, biasConstant.getValue()));
-  }
-  prepRegion->setAttr(optimization_attrs::kStreamingConvolutionAttrName,
-                      builder.getDictionaryAttr(descriptorFields));
-
-  mlir::Block *body = new mlir::Block();
-  prepRegion.getBody().push_back(body);
-  body->addArgument(match.activation.getType(), match.activation.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
   mlir::Value patches =
-      buildPatchSequence(builder, state, body->getArgument(0));
-  builder.create<mlir::sculptor::YieldOp>(state.loc, patches);
-  return prepRegion.getResult(0);
+      buildPatchSequence(builder, state, match.activation);
+  scope.annotate();
+  return patches;
 }
 
 static llvm::SmallVector<mlir::OpFoldResult>
@@ -445,24 +405,13 @@ buildUnitStrides(mlir::OpBuilder &builder) {
   return {builder.getIndexAttr(1), builder.getIndexAttr(1)};
 }
 
-static mlir::Value buildMVMSequenceRegion(mlir::OpBuilder &builder,
+static mlir::Value buildMVMSequenceStage(mlir::OpBuilder &builder,
                                           const PreparedFilter &preparedFilter,
                                           const Conv2DLoweringState &state,
                                           mlir::Value patchSequence) {
-  auto sequenceRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.mvmSequenceTy},
-      mlir::ValueRange{patchSequence, preparedFilter.filterMatrix},
-      task_graph_names::kMVMSequenceTaskKind,
-      builder.getStringAttr("conv2d_mvm_sequence"));
-
-  mlir::Block *body = new mlir::Block();
-  sequenceRegion.getBody().push_back(body);
-  body->addArgument(patchSequence.getType(), patchSequence.getLoc());
-  body->addArgument(preparedFilter.filterMatrix.getType(),
-                    preparedFilter.filterMatrix.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, semantic_operation_names::kMVMSequenceTaskKind,
+      "conv2d_mvm_sequence");
 
   int64_t outputPositions = state.shape.oh * state.shape.ow;
   mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
@@ -481,12 +430,13 @@ static mlir::Value buildMVMSequenceRegion(mlir::OpBuilder &builder,
         mlir::Value patch =
             loopBuilder
                 .create<mlir::tensor::ExtractSliceOp>(loopLoc, state.patchTy,
-                                                      body->getArgument(0),
+                                                      patchSequence,
                                                       offsets, sizes, strides)
                 .getResult();
         mlir::Value channelResult =
             converter_conv::buildPatchMVM(loopLoc, state.matmulResultTy, patch,
-                                          body->getArgument(1), loopBuilder);
+                                          preparedFilter.filterMatrix,
+                                          loopBuilder);
         mlir::Value updated =
             loopBuilder
                 .create<mlir::tensor::InsertSliceOp>(
@@ -497,28 +447,19 @@ static mlir::Value buildMVMSequenceRegion(mlir::OpBuilder &builder,
       });
 
   builder.setInsertionPointAfter(positionLoop);
-  builder.create<mlir::sculptor::YieldOp>(state.loc, positionLoop.getResult(0));
-  return sequenceRegion.getResult(0);
+  scope.annotate();
+  return positionLoop.getResult(0);
 }
 
-static mlir::Value buildOutputAssemblyRegion(mlir::OpBuilder &builder,
+static mlir::Value buildOutputAssemblyStage(mlir::OpBuilder &builder,
                                              PreparedBias &preparedBias,
                                              const Conv2DLoweringState &state,
                                              mlir::Value sequenceResult) {
   llvm::StringRef kind = "digital.output_recombine";
   if (preparedBias.bias)
-    kind = task_graph_names::kBiasAddTaskKind;
-  auto outputRegion = builder.create<mlir::sculptor::TaskRegionOp>(
-      state.loc, mlir::TypeRange{state.outputTy},
-      mlir::ValueRange{sequenceResult}, kind,
-      builder.getStringAttr("conv2d_output_assembly"));
-
-  mlir::Block *body = new mlir::Block();
-  outputRegion.getBody().push_back(body);
-  body->addArgument(sequenceResult.getType(), sequenceResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+    kind = semantic_operation_names::kBiasAddTaskKind;
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, kind, "conv2d_output_assembly");
 
   mlir::Value bias;
   if (preparedBias.bias) {
@@ -530,10 +471,6 @@ static mlir::Value buildOutputAssemblyRegion(mlir::OpBuilder &builder,
   }
 
   int64_t scalarResults = state.shape.oh * state.shape.ow * state.shape.f;
-  if (preparedBias.bias) {
-    outputRegion->setAttr(runtime_attrs::kTaskDigitalOpsAttrName,
-                          builder.getI64IntegerAttr(scalarResults));
-  }
   mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
   mlir::Value one = buildIndexConstant(builder, state.loc, 1);
   mlir::Value upper = buildIndexConstant(builder, state.loc, scalarResults);
@@ -557,7 +494,7 @@ static mlir::Value buildOutputAssemblyRegion(mlir::OpBuilder &builder,
         mlir::Value outputW = loopBuilder.create<mlir::arith::RemUIOp>(
             loopLoc, position, outputWidth);
         mlir::Value value = loopBuilder.create<mlir::tensor::ExtractOp>(
-            loopLoc, body->getArgument(0), mlir::ValueRange{position, channel});
+            loopLoc, sequenceResult, mlir::ValueRange{position, channel});
         if (bias) {
           mlir::Value biasValue = loopBuilder.create<mlir::tensor::ExtractOp>(
               loopLoc, bias, mlir::ValueRange{channel});
@@ -571,8 +508,8 @@ static mlir::Value buildOutputAssemblyRegion(mlir::OpBuilder &builder,
       });
 
   builder.setInsertionPointAfter(outputLoop);
-  builder.create<mlir::sculptor::YieldOp>(state.loc, outputLoop.getResult(0));
-  return outputRegion.getResult(0);
+  scope.annotate();
+  return outputLoop.getResult(0);
 }
 
 static mlir::Value emitLoopedConvolution(mlir::RewriterBase &rewriter,
@@ -582,10 +519,10 @@ static mlir::Value emitLoopedConvolution(mlir::RewriterBase &rewriter,
                                          const Conv2DLoweringState &state) {
   rewriter.setInsertionPointAfter(match.rootOp);
   mlir::Value patchSequence =
-      buildPatchPreparationRegion(rewriter, match, state);
+      buildPatchPreparationStage(rewriter, match, state);
   mlir::Value mvmSequence =
-      buildMVMSequenceRegion(rewriter, preparedFilter, state, patchSequence);
-  return buildOutputAssemblyRegion(rewriter, preparedBias, state, mvmSequence);
+      buildMVMSequenceStage(rewriter, preparedFilter, state, patchSequence);
+  return buildOutputAssemblyStage(rewriter, preparedBias, state, mvmSequence);
 }
 
 static void eraseUnusedConv2DOps(Conv2DMatch &match,
@@ -597,6 +534,22 @@ static void eraseUnusedConv2DOps(Conv2DMatch &match,
   if (match.hasBias)
     mlir::sculptor::converter_rewrite::eraseIfUnused(
         match.biasConstant.getOperation(), rewriter);
+}
+
+static mlir::LogicalResult lowerConv2DOp(NNConv2DOp layerOp,
+                                         mlir::RewriterBase &rewriter) {
+  auto match = matchSupportedConv2D(layerOp, rewriter);
+  if (failed(match))
+    return mlir::failure();
+
+  Conv2DLoweringState state = buildLoweringState(*match);
+  PreparedFilter preparedFilter = prepareFilter(*match);
+  PreparedBias preparedBias = prepareBias(*match, state, rewriter);
+  mlir::Value rewrittenOutput = emitLoopedConvolution(
+      rewriter, *match, preparedFilter, preparedBias, state);
+  match->result.replaceAllUsesWith(rewrittenOutput);
+  eraseUnusedConv2DOps(*match, rewriter);
+  return mlir::success();
 }
 
 // Converts extracted sculptor.nn.conv2d layer bodies into looped sculptor.mvm
@@ -615,19 +568,7 @@ public:
             func, "conv2d", "conv2d_w_bias", (*layerOp).getHasBias()))
       return;
 
-    mlir::FailureOr<Conv2DMatch> match =
-        matchSupportedConv2D(*layerOp, rewriter);
-    if (failed(match))
-      return;
-
-    Conv2DLoweringState state = buildLoweringState(*match);
-    PreparedFilter preparedFilter = prepareFilter(*match);
-    PreparedBias preparedBias = prepareBias(*match, state, rewriter);
-
-    mlir::Value rewrittenOutput = emitLoopedConvolution(
-        rewriter, *match, preparedFilter, preparedBias, state);
-    match->result.replaceAllUsesWith(rewrittenOutput);
-    eraseUnusedConv2DOps(*match, rewriter);
+    (void)lowerConv2DOp(*layerOp, rewriter);
   }
 };
 
@@ -635,6 +576,22 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineConv2DLayers(func::FuncOp func) {
+  SmallVector<NNConv2DOp> layerOps;
+  func.walk([&](NNConv2DOp layerOp) { layerOps.push_back(layerOp); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNConv2DOp layerOp : layerOps) {
+    if (!layerOp || !layerOp->getBlock())
+      continue;
+    if (failed(lowerConv2DOp(layerOp, rewriter))) {
+      layerOp.emitOpError("failed to decompose inline Conv2D layer");
+      return failure();
+    }
+  }
+  return success();
+}
 
 // Registers the Conv2D converter for both biased and bias-free layer slices.
 void registerConv2DConverter(LayerToMVMConverters &converters,

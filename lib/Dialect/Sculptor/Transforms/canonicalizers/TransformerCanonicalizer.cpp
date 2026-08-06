@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -30,12 +31,12 @@ using mlir::linalg::BatchMatmulOp;
 using mlir::linalg::GenericOp;
 using mlir::linalg::MatmulOp;
 using mlir::linalg::TransposeOp;
-using mlir::tensor::CollapseShapeOp;
-using mlir::tensor::ExpandShapeOp;
-using mlir::tensor::ExtractSliceOp;
 using mlir::sculptor::NNTransformerDecoderOp;
 using mlir::sculptor::NNTransformerEncoderOp;
 using mlir::sculptor::NNTransformerOp;
+using mlir::tensor::CollapseShapeOp;
+using mlir::tensor::ExpandShapeOp;
+using mlir::tensor::ExtractSliceOp;
 
 enum class TransformerBlockKind { Encoder, Decoder };
 
@@ -221,9 +222,9 @@ matchTransformerSignature(mlir::func::FuncOp func) {
   int64_t tgtBatchSize = tgtTy->getDimSize(0);
   int64_t tgtSequenceLength = tgtTy->getDimSize(1);
   int64_t tgtHiddenSize = tgtTy->getDimSize(2);
-  if (batchSize <= 0 || srcSequenceLength <= 0 ||
-      tgtSequenceLength <= 0 || hiddenSize <= 0 ||
-      batchSize != tgtBatchSize || hiddenSize != tgtHiddenSize)
+  if (batchSize <= 0 || srcSequenceLength <= 0 || tgtSequenceLength <= 0 ||
+      hiddenSize <= 0 || batchSize != tgtBatchSize ||
+      hiddenSize != tgtHiddenSize)
     return mlir::failure();
 
   if (outputTy->getShape() !=
@@ -275,9 +276,9 @@ static void appendIfPresent(llvm::SmallVectorImpl<mlir::Operation *> &ops,
 
 static void appendProjectionOps(ProjectionMatch &projection) {
   appendIfPresent(projection.ops, projection.weightConstant.getOperation());
-  appendIfPresent(projection.ops,
-                  projection.weight ? projection.weight.getDefiningOp()
-                                    : nullptr);
+  appendIfPresent(projection.ops, projection.weight
+                                      ? projection.weight.getDefiningOp()
+                                      : nullptr);
   appendIfPresent(projection.ops, projection.weightTranspose.getOperation());
   appendIfPresent(projection.ops, projection.matmulOp.getOperation());
   appendIfPresent(projection.ops, projection.biasConstant.getOperation());
@@ -305,9 +306,9 @@ static ProjectionKind classifyProjectionKind(const TransformerTypes &types,
   return ProjectionKind::Unknown;
 }
 
-static void
-classifyProjectionCandidates(llvm::SmallVectorImpl<ProjectionMatch> &projections,
-                             TransformerTypes &types) {
+static void classifyProjectionCandidates(
+    llvm::SmallVectorImpl<ProjectionMatch> &projections,
+    TransformerTypes &types) {
   int64_t feedForwardSize = 0;
   for (const ProjectionMatch &projection : projections) {
     if (projection.outputWidth == types.hiddenSize &&
@@ -344,13 +345,12 @@ matchProjectionCandidate(MatmulOp matmul, const TransformerTypes &types) {
     if (activationTy->getDimSize(0) != rowCount || inputWidth <= 0)
       continue;
 
-    mlir::Value maybeTransposedWeight =
-        maybeActivation == matmul.getInputs()[0] ? matmul.getInputs()[1]
-                                                 : matmul.getInputs()[0];
+    mlir::Value maybeTransposedWeight = maybeActivation == matmul.getInputs()[0]
+                                            ? matmul.getInputs()[1]
+                                            : matmul.getInputs()[0];
     auto transpose =
         layer_utils::producerOfType<TransposeOp>(maybeTransposedWeight);
-    if (!transpose ||
-        !linalg_match::hasPermutation(transpose, {1, 0}) ||
+    if (!transpose || !linalg_match::hasPermutation(transpose, {1, 0}) ||
         !tensor_type::hasStaticF32Shape(maybeTransposedWeight,
                                         {inputWidth, outputWidth}) ||
         !tensor_type::hasStaticF32Shape(transpose.getInput(),
@@ -388,8 +388,7 @@ matchProjectionCandidate(MatmulOp matmul, const TransformerTypes &types) {
 
     if (!layer_patterns::isProjectionAddfGeneric(biasAdd) ||
         !tensor_type::hasStaticF32Shape(biasAdd.getResult(0), outputShape) ||
-        !tensor_type::hasStaticF32Shape(biasAdd.getOutputs()[0],
-                                        outputShape))
+        !tensor_type::hasStaticF32Shape(biasAdd.getOutputs()[0], outputShape))
       continue;
 
     mlir::Value first = biasAdd.getInputs()[0];
@@ -417,14 +416,15 @@ matchProjectionCandidate(MatmulOp matmul, const TransformerTypes &types) {
 
     projection.output = biasAdd.getResult(0);
     projection.bias = biasValue;
-    projection.biasConstant = layer_utils::producerOfType<ConstantOp>(biasValue);
+    projection.biasConstant =
+        layer_utils::producerOfType<ConstantOp>(biasValue);
     projection.biasAddOp = biasAdd;
     projection.root = biasAdd.getOperation();
     break;
   }
 
-  projection.kind =
-      classifyProjectionKind(types, projection.inputWidth, projection.outputWidth);
+  projection.kind = classifyProjectionKind(types, projection.inputWidth,
+                                           projection.outputWidth);
   appendProjectionOps(projection);
   return projection;
 }
@@ -442,9 +442,9 @@ collectProjectionCandidates(mlir::func::FuncOp func, TransformerTypes &types) {
   return projections;
 }
 
-static bool valueTransitivelyDependsOn(mlir::Value value, mlir::Value target,
-                                       llvm::SmallPtrSetImpl<mlir::Operation *>
-                                           &visitedOps) {
+static bool valueTransitivelyDependsOn(
+    mlir::Value value, mlir::Value target,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &visitedOps) {
   if (value == target)
     return true;
 
@@ -525,19 +525,18 @@ matchAttentionCore(BatchMatmulOp qkMatmul, BatchMatmulOp pvMatmul,
       keySequenceLength <= 0 || headDim <= 0)
     return mlir::failure();
 
-  if (qkKeyTy->getShape() !=
-          llvm::ArrayRef<int64_t>({flattenedHeads, headDim,
-                                   keySequenceLength}) ||
+  if (qkKeyTy->getShape() != llvm::ArrayRef<int64_t>({flattenedHeads, headDim,
+                                                      keySequenceLength}) ||
       qkOutputTy->getShape() !=
-          llvm::ArrayRef<int64_t>({flattenedHeads, querySequenceLength,
-                                   keySequenceLength}) ||
+          llvm::ArrayRef<int64_t>(
+              {flattenedHeads, querySequenceLength, keySequenceLength}) ||
       pvProbabilityTy->getShape() != qkOutputTy->getShape() ||
       pvValueTy->getShape() !=
-          llvm::ArrayRef<int64_t>({flattenedHeads, keySequenceLength,
-                                   headDim}) ||
+          llvm::ArrayRef<int64_t>(
+              {flattenedHeads, keySequenceLength, headDim}) ||
       pvOutputTy->getShape() !=
-          llvm::ArrayRef<int64_t>({flattenedHeads, querySequenceLength,
-                                   headDim}))
+          llvm::ArrayRef<int64_t>(
+              {flattenedHeads, querySequenceLength, headDim}))
     return mlir::failure();
 
   if (flattenedHeads % types.batchSize != 0)
@@ -586,9 +585,8 @@ static llvm::SmallVector<AttentionCoreMatch, 8>
 collectAttentionCoreCandidates(mlir::func::FuncOp func,
                                TransformerTypes &types) {
   llvm::SmallVector<BatchMatmulOp, 16> batchMatmuls;
-  func.walk([&](BatchMatmulOp batchMatmul) {
-    batchMatmuls.push_back(batchMatmul);
-  });
+  func.walk(
+      [&](BatchMatmulOp batchMatmul) { batchMatmuls.push_back(batchMatmul); });
 
   llvm::SmallVector<AttentionCoreMatch, 8> cores;
   llvm::SmallPtrSet<mlir::Operation *, 16> pairedQKMatmuls;
@@ -597,8 +595,7 @@ collectAttentionCoreCandidates(mlir::func::FuncOp func,
     if (pairedQKMatmuls.contains(qkMatmul.getOperation()))
       continue;
 
-    for (BatchMatmulOp pvMatmul :
-         llvm::drop_begin(batchMatmuls, qkIndex + 1)) {
+    for (BatchMatmulOp pvMatmul : llvm::drop_begin(batchMatmuls, qkIndex + 1)) {
       if (pairedPVMatmuls.contains(pvMatmul.getOperation()))
         continue;
 
@@ -679,7 +676,7 @@ static bool valueTransitivelyHasNegativeInfinitySelect(
 static bool attentionCoreUsesCausalMask(const AttentionCoreMatch &core) {
   llvm::SmallPtrSet<mlir::Operation *, 32> visitedOps;
   return valueTransitivelyHasNegativeInfinitySelect(core.probabilities,
-                                                   visitedOps);
+                                                    visitedOps);
 }
 
 static bool isRsqrtGeneric(GenericOp genericOp) {
@@ -711,8 +708,7 @@ static bool hasReductionIterator(GenericOp genericOp) {
 }
 
 static GenericOp findFirstReductionGeneric(
-    mlir::Value value,
-    llvm::SmallPtrSetImpl<mlir::Operation *> &visitedOps) {
+    mlir::Value value, llvm::SmallPtrSetImpl<mlir::Operation *> &visitedOps) {
   mlir::Operation *producer = value.getDefiningOp();
   if (!producer || !visitedOps.insert(producer).second)
     return {};
@@ -742,10 +738,10 @@ matchTailAffineMul(GenericOp genericOp, llvm::ArrayRef<int64_t> outputShape,
       !tensor_type::hasStaticF32Shape(genericOp.getOutputs()[0], outputShape))
     return mlir::failure();
 
-  auto firstWeight = layer_utils::producerOfType<ConstantOp>(
-      genericOp.getInputs()[0]);
-  auto secondWeight = layer_utils::producerOfType<ConstantOp>(
-      genericOp.getInputs()[1]);
+  auto firstWeight =
+      layer_utils::producerOfType<ConstantOp>(genericOp.getInputs()[0]);
+  auto secondWeight =
+      layer_utils::producerOfType<ConstantOp>(genericOp.getInputs()[1]);
   if (static_cast<bool>(firstWeight) == static_cast<bool>(secondWeight))
     return mlir::failure();
 
@@ -776,22 +772,26 @@ static mlir::Value findInputWithShape(GenericOp genericOp,
 }
 
 static mlir::FailureOr<LayerNormMatch>
-matchLayerNormCandidate(GenericOp affineAddOp, const TransformerTypes &types) {
+matchLayerNormCandidate(GenericOp affineRootOp, const TransformerTypes &types) {
   auto outputTy = tensor_type::getStaticF32Tensor(
-      affineAddOp.getResult(0).getType(), /*expectedRank=*/3);
-  if (mlir::failed(outputTy) ||
-      outputTy->getDimSize(0) != types.batchSize ||
+      affineRootOp.getResult(0).getType(), /*expectedRank=*/3);
+  if (mlir::failed(outputTy) || outputTy->getDimSize(0) != types.batchSize ||
       outputTy->getDimSize(2) != types.hiddenSize)
     return mlir::failure();
 
   llvm::SmallVector<int64_t, 3> outputShape(outputTy->getShape().begin(),
                                             outputTy->getShape().end());
+  GenericOp affineMulOp = affineRootOp;
+  ConstantOp biasConstant;
+  mlir::Operation *affineAddOp = nullptr;
   auto biasMatch = layer_patterns::matchProjectionBiasAdd(
-      affineAddOp.getResult(0), outputShape, types.hiddenSize);
-  if (mlir::failed(biasMatch))
-    return mlir::failure();
+      affineRootOp.getResult(0), outputShape, types.hiddenSize);
+  if (mlir::succeeded(biasMatch)) {
+    affineMulOp = layer_utils::producerOfType<GenericOp>(biasMatch->first);
+    biasConstant = biasMatch->second;
+    affineAddOp = affineRootOp.getOperation();
+  }
 
-  auto affineMulOp = layer_utils::producerOfType<GenericOp>(biasMatch->first);
   auto weightMatch =
       matchTailAffineMul(affineMulOp, outputShape, types.hiddenSize);
   if (mlir::failed(weightMatch))
@@ -818,9 +818,9 @@ matchLayerNormCandidate(GenericOp affineAddOp, const TransformerTypes &types) {
 
   LayerNormMatch match;
   match.input = findInputWithShape(centerOp, outputShape);
-  match.output = affineAddOp.getResult(0);
+  match.output = affineRootOp.getResult(0);
   match.weightConstant = weightMatch->second;
-  match.biasConstant = biasMatch->second;
+  match.biasConstant = biasConstant;
   match.centerOp = centerOp.getOperation();
   match.meanReduction = findFirstReductionGeneric(centerOp.getInputs()[1]);
   match.rsqrtOp = rsqrtOp.getOperation();
@@ -830,8 +830,8 @@ matchLayerNormCandidate(GenericOp affineAddOp, const TransformerTypes &types) {
         findFirstReductionGeneric(match.epsilonAddOp->getOperand(0))
             .getOperation();
   match.affineMulOp = affineMulOp.getOperation();
-  match.affineAddOp = affineAddOp.getOperation();
-  match.root = affineAddOp.getOperation();
+  match.affineAddOp = affineAddOp;
+  match.root = affineRootOp.getOperation();
   appendIfPresent(match.ops, match.meanReduction);
   appendIfPresent(match.ops, match.centerOp);
   appendIfPresent(match.ops, match.varianceReduction);
@@ -851,8 +851,17 @@ collectLayerNormCandidates(mlir::func::FuncOp func,
   llvm::SmallVector<LayerNormMatch, 16> layerNorms;
   func.walk([&](GenericOp genericOp) {
     auto layerNorm = matchLayerNormCandidate(genericOp, types);
-    if (mlir::succeeded(layerNorm))
+    if (mlir::failed(layerNorm))
+      return;
+
+    auto existing = llvm::find_if(layerNorms, [&](const LayerNormMatch &other) {
+      return other.affineMulOp == layerNorm->affineMulOp;
+    });
+    if (existing == layerNorms.end()) {
       layerNorms.push_back(*layerNorm);
+    } else if (layerNorm->biasConstant) {
+      *existing = *layerNorm;
+    }
   });
   return layerNorms;
 }
@@ -924,20 +933,20 @@ static bool genericResultHasShape(GenericOp genericOp,
 }
 
 static mlir::FailureOr<std::pair<GenericOp, mlir::Value>>
-findResidualAddFromProjection(mlir::Value value, mlir::Value projectedValue,
-                              mlir::Value expectedResidual,
-                              llvm::ArrayRef<int64_t> shape,
-                              llvm::SmallPtrSetImpl<mlir::Operation *> &visited) {
+findResidualAddFromProjection(
+    mlir::Value value, mlir::Value projectedValue, mlir::Value expectedResidual,
+    llvm::ArrayRef<int64_t> shape,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &visited) {
   for (mlir::Operation *user : value.getUsers()) {
     if (!visited.insert(user).second)
       continue;
 
     if (auto generic = llvm::dyn_cast<GenericOp>(user);
-        layer_utils::isAddfGeneric(user) && genericResultHasShape(generic, shape)) {
+        layer_utils::isAddfGeneric(user) &&
+        genericResultHasShape(generic, shape)) {
       mlir::Value residual = getResidualInput(generic, projectedValue, shape);
-      if (residual &&
-          (residual == expectedResidual ||
-           valueTransitivelyDependsOn(residual, expectedResidual)))
+      if (residual && (residual == expectedResidual ||
+                       valueTransitivelyDependsOn(residual, expectedResidual)))
         return std::make_pair(generic, residual);
     }
 
@@ -965,11 +974,9 @@ findResidualAddFromProjection(mlir::Value projectedValue,
                                        expectedResidual, shape, visited);
 }
 
-static mlir::FailureOr<FeedForwardMatch>
-matchFeedForwardCandidate(const ProjectionMatch &upProjection,
-                          const ProjectionMatch &downProjection,
-                          const LayerNormMatch &norm,
-                          const TransformerTypes &types) {
+static mlir::FailureOr<FeedForwardMatch> matchFeedForwardCandidate(
+    const ProjectionMatch &upProjection, const ProjectionMatch &downProjection,
+    const LayerNormMatch &norm, const TransformerTypes &types) {
   if (types.feedForwardSize <= 0 ||
       upProjection.inputWidth != types.hiddenSize ||
       upProjection.outputWidth != types.feedForwardSize ||
@@ -988,8 +995,8 @@ matchFeedForwardCandidate(const ProjectionMatch &upProjection,
   if (!activationOp)
     return mlir::failure();
 
-  auto residualAddOp = llvm::dyn_cast_or_null<GenericOp>(
-      norm.input.getDefiningOp());
+  auto residualAddOp =
+      llvm::dyn_cast_or_null<GenericOp>(norm.input.getDefiningOp());
   auto normInputTy = tensor_type::getStaticF32Tensor(norm.input.getType(),
                                                      /*expectedRank=*/3);
   if (!residualAddOp || mlir::failed(normInputTy))
@@ -1039,8 +1046,8 @@ collectFeedForwardCandidates(llvm::ArrayRef<ProjectionMatch> projections,
         if (usedNorms.contains(norm.root))
           continue;
 
-        auto feedForward =
-            matchFeedForwardCandidate(upProjection, downProjection, norm, types);
+        auto feedForward = matchFeedForwardCandidate(
+            upProjection, downProjection, norm, types);
         if (mlir::failed(feedForward))
           continue;
 
@@ -1058,11 +1065,9 @@ collectFeedForwardCandidates(llvm::ArrayRef<ProjectionMatch> projections,
   return feedForwards;
 }
 
-static mlir::FailureOr<FeedForwardMatch>
-matchPreNormFeedForwardCandidate(const ProjectionMatch &upProjection,
-                                 const ProjectionMatch &downProjection,
-                                 const LayerNormMatch &norm,
-                                 const TransformerTypes &types) {
+static mlir::FailureOr<FeedForwardMatch> matchPreNormFeedForwardCandidate(
+    const ProjectionMatch &upProjection, const ProjectionMatch &downProjection,
+    const LayerNormMatch &norm, const TransformerTypes &types) {
   if (types.feedForwardSize <= 0 ||
       upProjection.inputWidth != types.hiddenSize ||
       upProjection.outputWidth != types.feedForwardSize ||
@@ -1088,9 +1093,8 @@ matchPreNormFeedForwardCandidate(const ProjectionMatch &upProjection,
 
   llvm::SmallVector<int64_t, 3> residualShape(normInputTy->getShape().begin(),
                                               normInputTy->getShape().end());
-  auto residualAdd =
-      findResidualAddFromProjection(downProjection.output, norm.input,
-                                    residualShape);
+  auto residualAdd = findResidualAddFromProjection(downProjection.output,
+                                                   norm.input, residualShape);
   if (mlir::failed(residualAdd))
     return mlir::failure();
 
@@ -1111,10 +1115,9 @@ matchPreNormFeedForwardCandidate(const ProjectionMatch &upProjection,
 }
 
 static llvm::SmallVector<FeedForwardMatch, 8>
-collectPreNormFeedForwardCandidates(
-    llvm::ArrayRef<ProjectionMatch> projections,
-    llvm::ArrayRef<LayerNormMatch> layerNorms,
-    const TransformerTypes &types) {
+collectPreNormFeedForwardCandidates(llvm::ArrayRef<ProjectionMatch> projections,
+                                    llvm::ArrayRef<LayerNormMatch> layerNorms,
+                                    const TransformerTypes &types) {
   llvm::SmallVector<FeedForwardMatch, 8> feedForwards;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedDownProjections;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedNorms;
@@ -1151,12 +1154,10 @@ collectPreNormFeedForwardCandidates(
   return feedForwards;
 }
 
-static mlir::FailureOr<SelfAttentionMatch>
-matchSelfAttentionCandidate(const ProjectionMatch &qkvProjection,
-                            const AttentionCoreMatch &core,
-                            const ProjectionMatch &outputProjection,
-                            const LayerNormMatch &norm,
-                            const TransformerTypes &types) {
+static mlir::FailureOr<SelfAttentionMatch> matchSelfAttentionCandidate(
+    const ProjectionMatch &qkvProjection, const AttentionCoreMatch &core,
+    const ProjectionMatch &outputProjection, const LayerNormMatch &norm,
+    const TransformerTypes &types) {
   if (qkvProjection.inputWidth != types.hiddenSize ||
       qkvProjection.outputWidth != 3 * types.hiddenSize ||
       outputProjection.inputWidth != types.hiddenSize ||
@@ -1204,11 +1205,10 @@ matchSelfAttentionCandidate(const ProjectionMatch &qkvProjection,
   return match;
 }
 
-static llvm::SmallVector<SelfAttentionMatch, 8>
-collectSelfAttentionCandidates(llvm::ArrayRef<ProjectionMatch> projections,
-                               llvm::ArrayRef<AttentionCoreMatch> attentionCores,
-                               llvm::ArrayRef<LayerNormMatch> layerNorms,
-                               const TransformerTypes &types) {
+static llvm::SmallVector<SelfAttentionMatch, 8> collectSelfAttentionCandidates(
+    llvm::ArrayRef<ProjectionMatch> projections,
+    llvm::ArrayRef<AttentionCoreMatch> attentionCores,
+    llvm::ArrayRef<LayerNormMatch> layerNorms, const TransformerTypes &types) {
   llvm::SmallVector<SelfAttentionMatch, 8> selfAttentions;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedCores;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedOutputProjections;
@@ -1255,12 +1255,10 @@ collectSelfAttentionCandidates(llvm::ArrayRef<ProjectionMatch> projections,
   return selfAttentions;
 }
 
-static mlir::FailureOr<SelfAttentionMatch>
-matchPreNormSelfAttentionCandidate(const ProjectionMatch &qkvProjection,
-                                   const AttentionCoreMatch &core,
-                                   const ProjectionMatch &outputProjection,
-                                   const LayerNormMatch &norm,
-                                   const TransformerTypes &types) {
+static mlir::FailureOr<SelfAttentionMatch> matchPreNormSelfAttentionCandidate(
+    const ProjectionMatch &qkvProjection, const AttentionCoreMatch &core,
+    const ProjectionMatch &outputProjection, const LayerNormMatch &norm,
+    const TransformerTypes &types) {
   if (qkvProjection.inputWidth != types.hiddenSize ||
       qkvProjection.outputWidth != 3 * types.hiddenSize ||
       outputProjection.inputWidth != types.hiddenSize ||
@@ -1284,9 +1282,8 @@ matchPreNormSelfAttentionCandidate(const ProjectionMatch &qkvProjection,
 
   llvm::SmallVector<int64_t, 3> residualShape(normInputTy->getShape().begin(),
                                               normInputTy->getShape().end());
-  auto residualAdd =
-      findResidualAddFromProjection(outputProjection.output, norm.input,
-                                    residualShape);
+  auto residualAdd = findResidualAddFromProjection(outputProjection.output,
+                                                   norm.input, residualShape);
   if (mlir::failed(residualAdd))
     return mlir::failure();
 
@@ -1310,8 +1307,7 @@ static llvm::SmallVector<SelfAttentionMatch, 8>
 collectPreNormSelfAttentionCandidates(
     llvm::ArrayRef<ProjectionMatch> projections,
     llvm::ArrayRef<AttentionCoreMatch> attentionCores,
-    llvm::ArrayRef<LayerNormMatch> layerNorms,
-    const TransformerTypes &types) {
+    llvm::ArrayRef<LayerNormMatch> layerNorms, const TransformerTypes &types) {
   llvm::SmallVector<SelfAttentionMatch, 8> selfAttentions;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedCores;
   llvm::SmallPtrSet<mlir::Operation *, 8> usedOutputProjections;
@@ -1358,13 +1354,11 @@ collectPreNormSelfAttentionCandidates(
   return selfAttentions;
 }
 
-static mlir::FailureOr<CrossAttentionMatch>
-matchCrossAttentionCandidate(const ProjectionMatch &queryProjection,
-                             const ProjectionMatch &keyValueProjection,
-                             const AttentionCoreMatch &core,
-                             const ProjectionMatch &outputProjection,
-                             const LayerNormMatch &norm,
-                             const TransformerTypes &types) {
+static mlir::FailureOr<CrossAttentionMatch> matchCrossAttentionCandidate(
+    const ProjectionMatch &queryProjection,
+    const ProjectionMatch &keyValueProjection, const AttentionCoreMatch &core,
+    const ProjectionMatch &outputProjection, const LayerNormMatch &norm,
+    const TransformerTypes &types) {
   if (queryProjection.inputWidth != types.hiddenSize ||
       queryProjection.outputWidth != types.hiddenSize ||
       keyValueProjection.inputWidth != types.hiddenSize ||
@@ -1412,7 +1406,8 @@ matchCrossAttentionCandidate(const ProjectionMatch &queryProjection,
   match.memoryInput = keyValueProjection.input;
   match.output = norm.output;
   match.ops.append(queryProjection.ops.begin(), queryProjection.ops.end());
-  match.ops.append(keyValueProjection.ops.begin(), keyValueProjection.ops.end());
+  match.ops.append(keyValueProjection.ops.begin(),
+                   keyValueProjection.ops.end());
   match.ops.append(core.ops.begin(), core.ops.end());
   match.ops.append(outputProjection.ops.begin(), outputProjection.ops.end());
   appendIfPresent(match.ops, match.residualAddOp);
@@ -1490,7 +1485,8 @@ collectEncoderLayerCandidates(llvm::ArrayRef<SelfAttentionMatch> selfAttentions,
     for (const FeedForwardMatch &feedForward : feedForwards) {
       if (usedFeedForwards.contains(feedForward.residualAddOp) ||
           feedForward.input != selfAttention.output ||
-          !isBeforeInBlock(selfAttention.residualAddOp, feedForward.residualAddOp))
+          !isBeforeInBlock(selfAttention.residualAddOp,
+                           feedForward.residualAddOp))
         continue;
 
       EncoderLayerMatch layer;
@@ -1507,11 +1503,11 @@ collectEncoderLayerCandidates(llvm::ArrayRef<SelfAttentionMatch> selfAttentions,
     }
   }
 
-  llvm::sort(layers, [](const EncoderLayerMatch &lhs,
-                        const EncoderLayerMatch &rhs) {
-    return isBeforeInBlock(lhs.selfAttention.residualAddOp,
-                           rhs.selfAttention.residualAddOp);
-  });
+  llvm::sort(layers,
+             [](const EncoderLayerMatch &lhs, const EncoderLayerMatch &rhs) {
+               return isBeforeInBlock(lhs.selfAttention.residualAddOp,
+                                      rhs.selfAttention.residualAddOp);
+             });
 
   for (auto [index, layer] : llvm::enumerate(layers))
     layer.layerIndex = static_cast<int64_t>(index);
@@ -1565,11 +1561,11 @@ static llvm::SmallVector<DecoderLayerMatch, 2> collectDecoderLayerCandidates(
     }
   }
 
-  llvm::sort(layers, [](const DecoderLayerMatch &lhs,
-                        const DecoderLayerMatch &rhs) {
-    return isBeforeInBlock(lhs.selfAttention.residualAddOp,
-                           rhs.selfAttention.residualAddOp);
-  });
+  llvm::sort(layers,
+             [](const DecoderLayerMatch &lhs, const DecoderLayerMatch &rhs) {
+               return isBeforeInBlock(lhs.selfAttention.residualAddOp,
+                                      rhs.selfAttention.residualAddOp);
+             });
 
   for (auto [index, layer] : llvm::enumerate(layers))
     layer.layerIndex = static_cast<int64_t>(index);
@@ -1625,8 +1621,7 @@ matchSupportedTransformer(mlir::func::FuncOp func) {
 
   TransformerTypes transformerTypes = *types;
   auto projections = collectProjectionCandidates(func, transformerTypes);
-  auto attentionCores =
-      collectAttentionCoreCandidates(func, transformerTypes);
+  auto attentionCores = collectAttentionCoreCandidates(func, transformerTypes);
   auto layerNorms = collectLayerNormCandidates(func, transformerTypes);
   auto feedForwards =
       collectFeedForwardCandidates(projections, layerNorms, transformerTypes);
@@ -1634,21 +1629,20 @@ matchSupportedTransformer(mlir::func::FuncOp func) {
       projections, attentionCores, layerNorms, transformerTypes);
   auto crossAttentions = collectCrossAttentionCandidates(
       projections, attentionCores, layerNorms, transformerTypes);
-  auto encoderLayers =
-      collectEncoderLayerCandidates(selfAttentions, feedForwards,
-                                    transformerTypes);
+  auto encoderLayers = collectEncoderLayerCandidates(
+      selfAttentions, feedForwards, transformerTypes);
   auto decoderLayers = collectDecoderLayerCandidates(
       selfAttentions, crossAttentions, feedForwards, transformerTypes);
 
   if (encoderLayers.empty() || decoderLayers.empty())
     return mlir::failure();
 
-  if (mlir::failed(validateEncoderLayerChain(encoderLayers,
-                                             func.getArgument(0))))
+  if (mlir::failed(
+          validateEncoderLayerChain(encoderLayers, func.getArgument(0))))
     return mlir::failure();
 
-  if (mlir::failed(validateDecoderLayerChain(decoderLayers,
-                                             func.getArgument(1))))
+  if (mlir::failed(
+          validateDecoderLayerChain(decoderLayers, func.getArgument(1))))
     return mlir::failure();
 
   auto encoderFinalNorm =
@@ -1707,8 +1701,7 @@ matchSupportedSingleInputTransformerStack(mlir::func::FuncOp func) {
 
   TransformerTypes transformerTypes = *types;
   auto projections = collectProjectionCandidates(func, transformerTypes);
-  auto attentionCores =
-      collectAttentionCoreCandidates(func, transformerTypes);
+  auto attentionCores = collectAttentionCoreCandidates(func, transformerTypes);
   auto layerNorms = collectLayerNormCandidates(func, transformerTypes);
 
   mlir::StringRef normMode = "pre";
@@ -1716,9 +1709,8 @@ matchSupportedSingleInputTransformerStack(mlir::func::FuncOp func) {
       projections, layerNorms, transformerTypes);
   auto selfAttentions = collectPreNormSelfAttentionCandidates(
       projections, attentionCores, layerNorms, transformerTypes);
-  auto encoderLayers =
-      collectEncoderLayerCandidates(selfAttentions, feedForwards,
-                                    transformerTypes);
+  auto encoderLayers = collectEncoderLayerCandidates(
+      selfAttentions, feedForwards, transformerTypes);
 
   if (encoderLayers.empty()) {
     normMode = "post";
@@ -1726,9 +1718,8 @@ matchSupportedSingleInputTransformerStack(mlir::func::FuncOp func) {
         collectFeedForwardCandidates(projections, layerNorms, transformerTypes);
     selfAttentions = collectSelfAttentionCandidates(
         projections, attentionCores, layerNorms, transformerTypes);
-    encoderLayers =
-        collectEncoderLayerCandidates(selfAttentions, feedForwards,
-                                      transformerTypes);
+    encoderLayers = collectEncoderLayerCandidates(selfAttentions, feedForwards,
+                                                  transformerTypes);
   }
 
   if (encoderLayers.empty())
@@ -1800,9 +1791,10 @@ matchSupportedTransformerDecoder(mlir::func::FuncOp func) {
   return match;
 }
 
-static void appendProjectionParameters(
-    const ProjectionMatch &projection,
-    llvm::SmallVectorImpl<mlir::Value> &parameters, bool hasBias) {
+static void
+appendProjectionParameters(const ProjectionMatch &projection,
+                           llvm::SmallVectorImpl<mlir::Value> &parameters,
+                           bool hasBias) {
   parameters.push_back(projection.weight);
   if (hasBias)
     parameters.push_back(projection.bias);
@@ -1810,12 +1802,14 @@ static void appendProjectionParameters(
 
 static void appendNormParameters(const LayerNormMatch &norm,
                                  llvm::SmallVectorImpl<mlir::Value> &parameters,
-                                 bool hasLayerNormAffine) {
+                                 bool hasLayerNormAffine,
+                                 bool hasLayerNormBias) {
   if (!hasLayerNormAffine)
     return;
 
   parameters.push_back(norm.weightConstant->getResult(0));
-  parameters.push_back(norm.biasConstant->getResult(0));
+  if (hasLayerNormBias)
+    parameters.push_back(norm.biasConstant->getResult(0));
 }
 
 static bool hasProjectionBias(const ProjectionMatch &projection) {
@@ -1823,8 +1817,32 @@ static bool hasProjectionBias(const ProjectionMatch &projection) {
 }
 
 static bool hasLayerNormAffine(const LayerNormMatch &norm) {
-  return static_cast<bool>(norm.weightConstant) &&
-         static_cast<bool>(norm.biasConstant);
+  return static_cast<bool>(norm.weightConstant);
+}
+
+static bool hasLayerNormBias(const LayerNormMatch &norm) {
+  return static_cast<bool>(norm.biasConstant);
+}
+
+static bool hasAnyProjectionBias(const TransformerMatch &match) {
+  for (const EncoderLayerMatch &layer : match.encoderLayers) {
+    if (hasProjectionBias(layer.selfAttention.qkvProjection) ||
+        hasProjectionBias(layer.selfAttention.outputProjection) ||
+        hasProjectionBias(layer.feedForward.upProjection) ||
+        hasProjectionBias(layer.feedForward.downProjection))
+      return true;
+  }
+  for (const DecoderLayerMatch &layer : match.decoderLayers) {
+    if (hasProjectionBias(layer.selfAttention.qkvProjection) ||
+        hasProjectionBias(layer.selfAttention.outputProjection) ||
+        hasProjectionBias(layer.crossAttention.queryProjection) ||
+        hasProjectionBias(layer.crossAttention.keyValueProjection) ||
+        hasProjectionBias(layer.crossAttention.outputProjection) ||
+        hasProjectionBias(layer.feedForward.upProjection) ||
+        hasProjectionBias(layer.feedForward.downProjection))
+      return true;
+  }
+  return false;
 }
 
 static bool hasCompleteProjectionBias(const TransformerMatch &match) {
@@ -1871,6 +1889,53 @@ static bool hasCompleteLayerNormAffine(const TransformerMatch &match) {
   return true;
 }
 
+static bool hasAnyLayerNormBias(const TransformerMatch &match) {
+  if (hasLayerNormBias(match.encoderFinalNorm) ||
+      hasLayerNormBias(match.decoderFinalNorm))
+    return true;
+  for (const EncoderLayerMatch &layer : match.encoderLayers) {
+    if (hasLayerNormBias(layer.selfAttention.norm) ||
+        hasLayerNormBias(layer.feedForward.norm))
+      return true;
+  }
+  for (const DecoderLayerMatch &layer : match.decoderLayers) {
+    if (hasLayerNormBias(layer.selfAttention.norm) ||
+        hasLayerNormBias(layer.crossAttention.norm) ||
+        hasLayerNormBias(layer.feedForward.norm))
+      return true;
+  }
+  return false;
+}
+
+static bool hasCompleteLayerNormBias(const TransformerMatch &match) {
+  if (!hasLayerNormBias(match.encoderFinalNorm) ||
+      !hasLayerNormBias(match.decoderFinalNorm))
+    return false;
+  for (const EncoderLayerMatch &layer : match.encoderLayers) {
+    if (!hasLayerNormBias(layer.selfAttention.norm) ||
+        !hasLayerNormBias(layer.feedForward.norm))
+      return false;
+  }
+  for (const DecoderLayerMatch &layer : match.decoderLayers) {
+    if (!hasLayerNormBias(layer.selfAttention.norm) ||
+        !hasLayerNormBias(layer.crossAttention.norm) ||
+        !hasLayerNormBias(layer.feedForward.norm))
+      return false;
+  }
+  return true;
+}
+
+static bool hasAnyProjectionBias(const TransformerEncoderMatch &match) {
+  for (const EncoderLayerMatch &layer : match.layers) {
+    if (hasProjectionBias(layer.selfAttention.qkvProjection) ||
+        hasProjectionBias(layer.selfAttention.outputProjection) ||
+        hasProjectionBias(layer.feedForward.upProjection) ||
+        hasProjectionBias(layer.feedForward.downProjection))
+      return true;
+  }
+  return false;
+}
+
 static bool hasCompleteProjectionBias(const TransformerEncoderMatch &match) {
   for (const EncoderLayerMatch &layer : match.layers) {
     if (!hasProjectionBias(layer.selfAttention.qkvProjection) ||
@@ -1896,33 +1961,55 @@ static bool hasCompleteLayerNormAffine(const TransformerEncoderMatch &match) {
   return true;
 }
 
+static bool hasAnyLayerNormBias(const TransformerEncoderMatch &match) {
+  if (match.hasFinalNorm && hasLayerNormBias(match.finalNorm))
+    return true;
+  for (const EncoderLayerMatch &layer : match.layers) {
+    if (hasLayerNormBias(layer.selfAttention.norm) ||
+        hasLayerNormBias(layer.feedForward.norm))
+      return true;
+  }
+  return false;
+}
+
+static bool hasCompleteLayerNormBias(const TransformerEncoderMatch &match) {
+  if (match.hasFinalNorm && !hasLayerNormBias(match.finalNorm))
+    return false;
+  for (const EncoderLayerMatch &layer : match.layers) {
+    if (!hasLayerNormBias(layer.selfAttention.norm) ||
+        !hasLayerNormBias(layer.feedForward.norm))
+      return false;
+  }
+  return true;
+}
+
 static llvm::SmallVector<mlir::Value, 64>
 collectTransformerParameters(const TransformerMatch &match, bool hasBias,
-                             bool hasLayerNormAffine) {
+                             bool hasLayerNormAffine, bool hasLayerNormBias) {
   llvm::SmallVector<mlir::Value, 64> parameters;
 
   for (const EncoderLayerMatch &layer : match.encoderLayers) {
     appendProjectionParameters(layer.selfAttention.qkvProjection, parameters,
                                hasBias);
-    appendProjectionParameters(layer.selfAttention.outputProjection,
-                               parameters, hasBias);
+    appendProjectionParameters(layer.selfAttention.outputProjection, parameters,
+                               hasBias);
     appendNormParameters(layer.selfAttention.norm, parameters,
-                         hasLayerNormAffine);
+                         hasLayerNormAffine, hasLayerNormBias);
     appendProjectionParameters(layer.feedForward.upProjection, parameters,
                                hasBias);
     appendProjectionParameters(layer.feedForward.downProjection, parameters,
                                hasBias);
-    appendNormParameters(layer.feedForward.norm, parameters,
-                         hasLayerNormAffine);
+    appendNormParameters(layer.feedForward.norm, parameters, hasLayerNormAffine,
+                         hasLayerNormBias);
   }
 
   for (const DecoderLayerMatch &layer : match.decoderLayers) {
     appendProjectionParameters(layer.selfAttention.qkvProjection, parameters,
                                hasBias);
-    appendProjectionParameters(layer.selfAttention.outputProjection,
-                               parameters, hasBias);
+    appendProjectionParameters(layer.selfAttention.outputProjection, parameters,
+                               hasBias);
     appendNormParameters(layer.selfAttention.norm, parameters,
-                         hasLayerNormAffine);
+                         hasLayerNormAffine, hasLayerNormBias);
     appendProjectionParameters(layer.crossAttention.queryProjection, parameters,
                                hasBias);
     appendProjectionParameters(layer.crossAttention.keyValueProjection,
@@ -1930,48 +2017,52 @@ collectTransformerParameters(const TransformerMatch &match, bool hasBias,
     appendProjectionParameters(layer.crossAttention.outputProjection,
                                parameters, hasBias);
     appendNormParameters(layer.crossAttention.norm, parameters,
-                         hasLayerNormAffine);
+                         hasLayerNormAffine, hasLayerNormBias);
     appendProjectionParameters(layer.feedForward.upProjection, parameters,
                                hasBias);
     appendProjectionParameters(layer.feedForward.downProjection, parameters,
                                hasBias);
-    appendNormParameters(layer.feedForward.norm, parameters,
-                         hasLayerNormAffine);
+    appendNormParameters(layer.feedForward.norm, parameters, hasLayerNormAffine,
+                         hasLayerNormBias);
   }
 
-  appendNormParameters(match.encoderFinalNorm, parameters, hasLayerNormAffine);
-  appendNormParameters(match.decoderFinalNorm, parameters, hasLayerNormAffine);
+  appendNormParameters(match.encoderFinalNorm, parameters, hasLayerNormAffine,
+                       hasLayerNormBias);
+  appendNormParameters(match.decoderFinalNorm, parameters, hasLayerNormAffine,
+                       hasLayerNormBias);
   return parameters;
 }
 
 static llvm::SmallVector<mlir::Value, 64>
 collectTransformerEncoderParameters(const TransformerEncoderMatch &match,
-                                    bool hasBias,
-                                    bool hasLayerNormAffine) {
+                                    bool hasBias, bool hasLayerNormAffine,
+                                    bool hasLayerNormBias) {
   llvm::SmallVector<mlir::Value, 64> parameters;
 
   for (const EncoderLayerMatch &layer : match.layers) {
     appendProjectionParameters(layer.selfAttention.qkvProjection, parameters,
                                hasBias);
-    appendProjectionParameters(layer.selfAttention.outputProjection,
-                               parameters, hasBias);
+    appendProjectionParameters(layer.selfAttention.outputProjection, parameters,
+                               hasBias);
     appendNormParameters(layer.selfAttention.norm, parameters,
-                         hasLayerNormAffine);
+                         hasLayerNormAffine, hasLayerNormBias);
     appendProjectionParameters(layer.feedForward.upProjection, parameters,
                                hasBias);
     appendProjectionParameters(layer.feedForward.downProjection, parameters,
                                hasBias);
-    appendNormParameters(layer.feedForward.norm, parameters,
-                         hasLayerNormAffine);
+    appendNormParameters(layer.feedForward.norm, parameters, hasLayerNormAffine,
+                         hasLayerNormBias);
   }
 
   if (match.hasFinalNorm)
-    appendNormParameters(match.finalNorm, parameters, hasLayerNormAffine);
+    appendNormParameters(match.finalNorm, parameters, hasLayerNormAffine,
+                         hasLayerNormBias);
   return parameters;
 }
 
-static void markProducerTree(mlir::Value value,
-                             llvm::SmallPtrSetImpl<mlir::Operation *> &keepOps) {
+static void
+markProducerTree(mlir::Value value,
+                 llvm::SmallPtrSetImpl<mlir::Operation *> &keepOps) {
   mlir::Operation *op = value.getDefiningOp();
   if (!op || !keepOps.insert(op).second)
     return;
@@ -2002,24 +2093,26 @@ static void eraseDeadTransformerBody(mlir::func::FuncOp func,
   }
 }
 
-static void rewriteTransformerMatchToSculptorOp(
-    const TransformerMatch &match, mlir::func::FuncOp func,
-    mlir::RewriterBase &rewriter) {
+static void rewriteTransformerMatchToSculptorOp(const TransformerMatch &match,
+                                                mlir::func::FuncOp func,
+                                                mlir::RewriterBase &rewriter) {
   bool hasBias = hasCompleteProjectionBias(match);
   bool hasLayerNormAffine = hasCompleteLayerNormAffine(match);
-  if (!hasBias || !hasLayerNormAffine)
+  bool hasLayerNormBias = hasCompleteLayerNormBias(match);
+  if (hasAnyProjectionBias(match) != hasBias ||
+      hasAnyLayerNormBias(match) != hasLayerNormBias || !hasLayerNormAffine)
     return;
 
-  auto parameters =
-      collectTransformerParameters(match, hasBias, hasLayerNormAffine);
+  auto parameters = collectTransformerParameters(
+      match, hasBias, hasLayerNormAffine, hasLayerNormBias);
 
   ReturnOp returnOp = match.returnOp;
   rewriter.setInsertionPoint(returnOp);
   auto transformerOp = rewriter.create<NNTransformerOp>(
       returnOp.getLoc(), match.types.outputTy, func.getArgument(0),
       func.getArgument(1), parameters, rewriter.getBoolAttr(true),
-      rewriter.getBoolAttr(hasBias),
-      rewriter.getBoolAttr(hasLayerNormAffine),
+      rewriter.getBoolAttr(hasBias), rewriter.getBoolAttr(hasLayerNormAffine),
+      rewriter.getBoolAttr(hasLayerNormBias),
       rewriter.getBoolAttr(/*has_final_norm=*/true),
       rewriter.getBoolAttr(/*causal=*/false), rewriter.getStringAttr("gelu"),
       rewriter.getStringAttr("post"),
@@ -2036,16 +2129,19 @@ static void rewriteTransformerMatchToSculptorOp(
                            rewriter);
 }
 
-static void rewriteTransformerEncoderMatchToSculptorOp(
-    const TransformerEncoderMatch &match, mlir::func::FuncOp func,
-    mlir::RewriterBase &rewriter) {
+static void
+rewriteTransformerEncoderMatchToSculptorOp(const TransformerEncoderMatch &match,
+                                           mlir::func::FuncOp func,
+                                           mlir::RewriterBase &rewriter) {
   bool hasBias = hasCompleteProjectionBias(match);
   bool hasLayerNormAffine = hasCompleteLayerNormAffine(match);
-  if (!hasBias || !hasLayerNormAffine)
+  bool hasLayerNormBias = hasCompleteLayerNormBias(match);
+  if (hasAnyProjectionBias(match) != hasBias ||
+      hasAnyLayerNormBias(match) != hasLayerNormBias || !hasLayerNormAffine)
     return;
 
-  auto parameters =
-      collectTransformerEncoderParameters(match, hasBias, hasLayerNormAffine);
+  auto parameters = collectTransformerEncoderParameters(
+      match, hasBias, hasLayerNormAffine, hasLayerNormBias);
 
   ReturnOp returnOp = match.returnOp;
   rewriter.setInsertionPoint(returnOp);
@@ -2053,6 +2149,7 @@ static void rewriteTransformerEncoderMatchToSculptorOp(
       returnOp.getLoc(), match.types.outputTy, match.input, parameters,
       rewriter.getBoolAttr(true), rewriter.getBoolAttr(hasBias),
       rewriter.getBoolAttr(hasLayerNormAffine),
+      rewriter.getBoolAttr(hasLayerNormBias),
       rewriter.getBoolAttr(match.hasFinalNorm),
       rewriter.getBoolAttr(match.causal), rewriter.getStringAttr("gelu"),
       rewriter.getStringAttr(match.normMode),
@@ -2068,16 +2165,19 @@ static void rewriteTransformerEncoderMatchToSculptorOp(
                            rewriter);
 }
 
-static void rewriteTransformerDecoderMatchToSculptorOp(
-    const TransformerEncoderMatch &match, mlir::func::FuncOp func,
-    mlir::RewriterBase &rewriter) {
+static void
+rewriteTransformerDecoderMatchToSculptorOp(const TransformerEncoderMatch &match,
+                                           mlir::func::FuncOp func,
+                                           mlir::RewriterBase &rewriter) {
   bool hasBias = hasCompleteProjectionBias(match);
   bool hasLayerNormAffine = hasCompleteLayerNormAffine(match);
-  if (!hasBias || !hasLayerNormAffine)
+  bool hasLayerNormBias = hasCompleteLayerNormBias(match);
+  if (hasAnyProjectionBias(match) != hasBias ||
+      hasAnyLayerNormBias(match) != hasLayerNormBias || !hasLayerNormAffine)
     return;
 
-  auto parameters =
-      collectTransformerEncoderParameters(match, hasBias, hasLayerNormAffine);
+  auto parameters = collectTransformerEncoderParameters(
+      match, hasBias, hasLayerNormAffine, hasLayerNormBias);
 
   ReturnOp returnOp = match.returnOp;
   rewriter.setInsertionPoint(returnOp);
@@ -2085,6 +2185,7 @@ static void rewriteTransformerDecoderMatchToSculptorOp(
       returnOp.getLoc(), match.types.outputTy, match.input, parameters,
       rewriter.getBoolAttr(true), rewriter.getBoolAttr(hasBias),
       rewriter.getBoolAttr(hasLayerNormAffine),
+      rewriter.getBoolAttr(hasLayerNormBias),
       rewriter.getBoolAttr(match.hasFinalNorm),
       rewriter.getBoolAttr(/*causal=*/true),
       rewriter.getBoolAttr(/*has_cross_attention=*/false),

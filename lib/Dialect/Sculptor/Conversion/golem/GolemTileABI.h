@@ -230,7 +230,7 @@ struct TileModel {
   DenseMap<Value, unsigned> resourceIndexByValue;
   DenseMap<uint32_t, unsigned> nonRouteResourceIndexByGlobalId;
   DenseMap<uint32_t, unsigned> routeInputResourceIndexByRouteId;
-  DenseMap<uint32_t, unsigned> routeOutputResourceIndexByRouteId;
+  DenseMap<uint32_t, unsigned> routeOutputResourceIndexByGlobalId;
   SmallVector<unsigned> resourceIndicesBySlot;
   SmallVector<int64_t> resourceDimensions;
   SmallVector<TaskModel, 0> tasks;

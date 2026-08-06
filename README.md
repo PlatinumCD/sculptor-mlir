@@ -1,134 +1,73 @@
 # sculptor-mlir
 
-**sculptor-mlir** is an experimental out-of-tree MLIR project for lowering a
-small set of neural-network-shaped tensor and `linalg` programs into a staged
-analog compute-in-memory execution model.
-
-The repository currently contains the Sculptor dialect, compiler passes,
-`sculptor-mlir-opt`, MLIR regression inputs, documentation, and the common
-runtime foundation used by backend runtimes.
+Sculptor is an out-of-tree MLIR compiler for tiled analog and digital
+accelerators. The pivot architecture maps explicit compute operations through a
+Resource Allocation tree before it creates tile routines.
 
 ## Build Requirements
 
-The project expects an existing LLVM/MLIR build tree. The important CMake
-package directories are:
+The build requires:
 
-```text
-<llvm-project-build>/lib/cmake/llvm
-<llvm-project-build>/lib/cmake/mlir
-```
+- CMake;
+- Ninja;
+- a C++20 compiler;
+- an LLVM and MLIR build tree.
 
-The host build also needs:
-
-- `cmake`
-- `ninja`
-- a C++20-capable compiler
-- LLVM/MLIR headers, libraries, and CMake package files
-
-Torch-MLIR is not required to build `sculptor-mlir`, but it is used by the
-walkthrough flow to export PyTorch examples into Torch/Linalg MLIR.
-
-## Build
-
-From the repository root:
+Configure and build the compiler:
 
 ```bash
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DLLVM_DIR=/path/to/llvm-project-build/lib/cmake/llvm \
-  -DMLIR_DIR=/path/to/llvm-project-build/lib/cmake/mlir \
-  -DSCULPTOR_MLIR_BUILD_RUNTIME=ON
+  -DLLVM_DIR=/path/to/llvm-build/lib/cmake/llvm \
+  -DMLIR_DIR=/path/to/llvm-build/lib/cmake/mlir
 
-cmake --build build
+cmake --build build --target sculptor-mlir-opt
 ```
 
-The main compiler driver is:
-
-```text
-build/tools/sculptor-mlir-opt/sculptor-mlir-opt
-```
+The compiler driver is `build/bin/sculptor-mlir-opt`.
 
 ## Compiler Flow
 
-The compiler is staged around explicit IR boundaries:
+| Stage | Pass |
+|---|---|
+| Normalize neural-network layers | `--sculptor-canonicalize-layers` |
+| Expose layer operations | `--sculptor-extract-layers` |
+| Decompose layers into tensor and MVM operations | `--sculptor-convert-layers` |
+| Expand MVM operations into Golem operations | `--sculptor-expand-mvm-to-golem` |
+| Expand independently mappable digital work | `--sculptor-expand-digital-work` |
+| Build the RA tree | `--sculptor-build-ra-tree` |
+| Select spatial and temporal cuts | `--sculptor-plan-mapping` |
+| Apply tiled work units | `--sculptor-apply-mapping-plan` |
+| Place logical tiles on the mesh | `--sculptor-place-logical-tiles` |
+| Create tile routines | `--sculptor-outline-tile-routines` |
+| Create tile-local runtime graphs | `--sculptor-materialize-tile-runtime-graph` |
+| Extract one tile module | `--sculptor-extract-tile-module` |
+| Plan tile-local scratchpad storage | `--sculptor-plan-tile-scratchpad` |
 
-| Stage | Boundary | Main pass |
-|---|---|---|
-| Canonicalize layers | tensor/`linalg` layer regions -> `sculptor.nn.*` ops | `sculptor-canonicalize-layers` |
-| Extract layers | inline `sculptor.nn.*` ops -> outlined layer functions | `sculptor-extract-layers` |
-| Convert layers | outlined `sculptor.nn.*` functions -> `sculptor.mvm` plus tensor/math glue | `sculptor-convert-layers` |
-| Expand MVMs | `sculptor.mvm` -> matrix/vector/logical-array operations | `sculptor-expand-mvm-to-golem` |
-| Materialize tasks | task regions -> callable task-stage functions | `sculptor-materialize-tasks` |
-| Assemble graph | outlined work and resources -> symbolic task graph | `sculptor-assemble-task-graph` |
-| Optional digital matmul distribution | eligible static digital matmuls -> partition, shard, and assembly tasks | `sculptor-distribute-digital-matmul` |
-| Build islands | symbolic tasks -> stable logical placement islands | `sculptor-build-task-graph-islands` |
-| Analyze timing | logical islands -> backend-costed task critical-path and island-work metadata | `sculptor-analyze-task-graph-timing` |
-| Schedule graph | island-annotated tasks -> placed/scheduled task graph metadata | `sculptor-schedule-task-graph` |
-| Optional digital baseline | scheduled analog tile bodies -> placement-preserving tiled digital matmuls | `sculptor-lower-scheduled-mvm-to-digital` |
-| Fuse graph | placed tasks -> same-island, same-core component tasks | `sculptor-fuse-task-graph` |
-| Lower shims and graph ABI | logical arrays -> physical array bindings, explicit setup dependencies, and backend-facing runtime shim calls | `sculptor-lower-golem-to-llvm-shims` |
-| Partition deployment | global scheduled graph -> isolated active-core modules plus typed routes | `sculptor-partition-task-graph-by-core` |
-| Extract deployment core | nested deployment core -> standalone core module plus filtered manifests | `sculptor-extract-core-module` |
-| Plan core scratchpad | extracted core -> optional resident region, local offsets, and DMA plan | `sculptor-plan-core-scratchpad` |
-| Finalize core resources | one extracted core graph -> private slots and offsets | `sculptor-finalize-task-graph-resources` |
-| Emit Golem tile ABI | finalized, LLVM-lowered core -> immutable task/route tables and Golem task adapters | `sculptor-emit-golem-tile-abi` |
-| Emit runtime graph | scheduled graph -> runtime graph image builders | `sculptor-emit-runtime-graph` |
+This flow does not use placement islands. The RA tree preserves spatial and
+temporal structure until logical-tile placement.
 
-Timing-aware placement and execution lowering are independent choices.
-`sculptor-analyze-task-graph-timing="mvm-cost-mode=analog|digital"` selects
-how MVM work is costed before scheduling without changing graph topology.
-After scheduling, leaving MVM tasks unchanged selects analog execution, while
-`sculptor-lower-scheduled-mvm-to-digital` selects the matched-topology digital
-baseline and preserves the chosen placement.
-
-`sculptor-distribute-digital-matmul` addresses a different case: a digital
-matmul that is already present in the assembled graph. It runs before island
-construction, divides eligible static rank-2 `f32` matmuls or typed transformer
-attention contractions into independently placeable shards, and records typed
-distribution metadata. Rank-2 tasks can shard output rows, output columns, or
-both; attention score/apply tasks shard by head. The pass is opt-in and does not
-change analog MVM expansion or the matched-topology digital baseline.
-
-## Repository Layout
+## Source Layout
 
 ```text
-include/                    Public headers and TableGen definitions
-lib/                        Dialect, pass, conversion, and scheduling code
-tools/sculptor-mlir-opt/    MLIR optimizer/pass driver
-runtime/common/             Shared runtime ABI and backend foundation
-tests/mlir/                 MLIR regression inputs
-docs/                       MkDocs documentation site
-```
-
-Device-specific runtimes and simulator tooling are intentionally not part of the
-first public tree. `runtime/common/` is the stable foundation intended for
-future backend runtimes.
-
-## Tests
-
-The files under `tests/mlir/` are MLIR regression inputs with `RUN:` comments.
-After building, they can be run manually with the built optimizer and LLVM's
-`FileCheck`.
-
-Example:
-
-```bash
-build/tools/sculptor-mlir-opt/sculptor-mlir-opt \
-  tests/mlir/verify_task_region.mlir \
-  --split-input-file \
-  --verify-diagnostics \
-  --allow-unregistered-dialect
+include/                                  Public headers and TableGen files
+lib/Dialect/Sculptor/Transforms/mapping/  RA-tree and logical-tile model
+lib/Dialect/Sculptor/Transforms/planners/ Mapping strategies
+lib/Dialect/Sculptor/Transforms/Golem/    MVM expansion
+tools/ra-tree-report/                     Interactive mapping report
+tools/sculptor-mlir-opt/                  Compiler driver
+tests/model_tests/                        Generated model lowering tests
+tests/python_tests/                       Model-family lowering tests
+docs/                                     MkDocs site
 ```
 
 ## Documentation
 
-The documentation is built with MkDocs from the `docs/` directory.
+Build the documentation:
 
 ```bash
 python3 -m pip install -r docs/requirements.txt
 mkdocs -f docs/mkdocs.yml build --strict
 ```
 
-The generated static site is written to `site/`, which is ignored by Git. The
-repository includes a GitHub Pages workflow that can build and deploy the docs
-from `master` once Pages is configured to use GitHub Actions.
+The generated site is in `site/`.

@@ -1,5 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/TaskGraphRuntimeAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -17,7 +17,7 @@ namespace mlir {
 namespace sculptor {
 namespace golem {
 
-namespace runtime_attrs = mlir::sculptor::runtime_attrs;
+namespace tile_runtime_attrs = mlir::sculptor::tile_runtime_attrs;
 
 namespace {
 
@@ -180,13 +180,13 @@ void emitShimCall(PatternRewriter &rewriter, Location loc,
 
 FailureOr<int64_t> getRequiredLocalArrayId(Operation *op) {
   auto localArrayAttr =
-      op->getAttrOfType<IntegerAttr>(runtime_attrs::kTaskLocalArrayIdAttrName);
+      op->getAttrOfType<IntegerAttr>(tile_runtime_attrs::kTaskLocalArrayIdAttrName);
   if (localArrayAttr) {
     int64_t localArrayId = localArrayAttr.getInt();
     if (localArrayId < 0 ||
         localArrayId > std::numeric_limits<int32_t>::max()) {
       return op->emitError("expected runtime attr '")
-             << runtime_attrs::kTaskLocalArrayIdAttrName
+             << tile_runtime_attrs::kTaskLocalArrayIdAttrName
              << "' to be a non-negative 32-bit integer";
     }
     return localArrayId;
@@ -197,17 +197,17 @@ FailureOr<int64_t> getRequiredLocalArrayId(Operation *op) {
     return op->emitError("expected analog array op to be inside a func.func");
 
   localArrayAttr = func->getAttrOfType<IntegerAttr>(
-      runtime_attrs::kTaskLocalArrayIdAttrName);
+      tile_runtime_attrs::kTaskLocalArrayIdAttrName);
   if (!localArrayAttr) {
     return op->emitError("expected enclosing task function '")
            << func.getSymName() << "' to carry runtime attr '"
-           << runtime_attrs::kTaskLocalArrayIdAttrName << "'";
+           << tile_runtime_attrs::kTaskLocalArrayIdAttrName << "'";
   }
 
   int64_t localArrayId = localArrayAttr.getInt();
   if (localArrayId < 0 || localArrayId > std::numeric_limits<int32_t>::max()) {
     return op->emitError("expected runtime attr '")
-           << runtime_attrs::kTaskLocalArrayIdAttrName
+           << tile_runtime_attrs::kTaskLocalArrayIdAttrName
            << "' to be a non-negative 32-bit integer";
   }
 
@@ -450,6 +450,10 @@ void populateSculptorTypeConversions(TypeConverter &typeConverter) {
   typeConverter.addConversion([](Type type) { return type; });
   typeConverter.addConversion(
       [](sculptor::LogicalArrayType, SmallVectorImpl<Type> &) {
+        return success();
+      });
+  typeConverter.addConversion(
+      [](sculptor::ArrayLoadedType, SmallVectorImpl<Type> &) {
         return success();
       });
   typeConverter.addConversion(

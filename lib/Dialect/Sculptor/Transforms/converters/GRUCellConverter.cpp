@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentGateUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RecurrentLayerConversionUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -74,20 +75,9 @@ buildFusedBiasType(mlir::RankedTensorType hiddenTy) {
 }
 
 static mlir::FailureOr<GRUCellLowering>
-matchExtractedGRUCellLayer(mlir::func::FuncOp func) {
-  auto gruCellOp = nn_layer_match::matchSingleNNLayerOp<NNGRUCellOp>(func);
-  if (mlir::failed(gruCellOp))
-    return mlir::failure();
-
+matchGRUCellLayer(NNGRUCellOp op) {
+  mlir::FailureOr<NNGRUCellOp> gruCellOp = op;
   bool hasBias = (*gruCellOp).getHasBias();
-  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "gru_cell",
-                                                "gru_cell_w_bias", hasBias))
-    return mlir::failure();
-
-  if (func.getNumArguments() != 2 ||
-      (*gruCellOp).getInput() != func.getArgument(0) ||
-      (*gruCellOp).getHPrev() != func.getArgument(1))
-    return mlir::failure();
 
   auto inputTy = tensor_type::getPositiveStaticRank2F32Tensor(
       (*gruCellOp).getInput().getType());
@@ -164,6 +154,22 @@ matchExtractedGRUCellLayer(mlir::func::FuncOp func) {
   lowering.biasHHConstant = biasHHConstant;
   lowering.hasBias = hasBias;
   return lowering;
+}
+
+static mlir::FailureOr<GRUCellLowering>
+matchExtractedGRUCellLayer(mlir::func::FuncOp func) {
+  auto gruCellOp = nn_layer_match::matchSingleNNLayerOp<NNGRUCellOp>(func);
+  if (mlir::failed(gruCellOp))
+    return mlir::failure();
+
+  bool hasBias = (*gruCellOp).getHasBias();
+  if (!nn_layer_match::hasLayerTypeMatchingBias(func, "gru_cell",
+                                                "gru_cell_w_bias", hasBias) ||
+      func.getNumArguments() != 2 ||
+      (*gruCellOp).getInput() != func.getArgument(0) ||
+      (*gruCellOp).getHPrev() != func.getArgument(1))
+    return mlir::failure();
+  return matchGRUCellLayer(*gruCellOp);
 }
 
 // Packs GRUCell reset, update, input-new, and hidden-new projections.
@@ -265,57 +271,32 @@ static mlir::TypedAttr buildFusedBiasAttr(GRUCellLowering &match) {
       match.fusedBiasTy, fusedBias, "analog_gru_cell_fused_bias_", useResource);
 }
 
-static mlir::Value buildInputRecombineRegion(GRUCellLowering &match,
+static mlir::Value buildInputRecombineStage(GRUCellLowering &match,
                                              mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto recombineRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.fusedInputTy},
-      mlir::ValueRange{match.gruCellOp.getInput(), match.gruCellOp.getHPrev()},
-      "digital.input_recombine",
-      rewriter.getStringAttr("gru_cell_input_recombine"));
-
-  mlir::Block *body = new mlir::Block();
-  recombineRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      match.gruCellOp.getInput().getType(),
-      match.gruCellOp.getHPrev().getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      match.gruCellOp.getInput().getLoc(), match.gruCellOp.getHPrev().getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.input_recombine", "gru_cell_input_recombine");
   mlir::Value fusedInput = recurrent_gate::buildFusedInput(
-      loc, match.fusedInputTy, body->getArgument(0), body->getArgument(1),
-      rewriter);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, fusedInput);
-  return recombineRegion.getResult(0);
+      loc, match.fusedInputTy, match.gruCellOp.getInput(),
+      match.gruCellOp.getHPrev(), rewriter);
+  scope.annotate();
+  return fusedInput;
 }
 
 static mlir::FailureOr<mlir::Value>
-buildBiasAddRegion(GRUCellLowering &match, mlir::TypedAttr fusedBiasAttr,
+buildBiasAddStage(GRUCellLowering &match, mlir::TypedAttr fusedBiasAttr,
                    mlir::Value mvmResult, mlir::RewriterBase &rewriter) {
   if (match.hasBias && !fusedBiasAttr)
     return mlir::failure();
 
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto biasRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.preActivationTy}, mlir::ValueRange{mvmResult},
-      "digital.bias_add", rewriter.getStringAttr("gru_cell_bias_add"));
-
-  mlir::Block *body = new mlir::Block();
-  biasRegion.getBody().push_back(body);
-  body->addArgument(mvmResult.getType(), mvmResult.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
-  mlir::Value biasResult = body->getArgument(0);
-  if (!match.hasBias) {
-    rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-    return biasRegion.getResult(0);
-  }
+  mlir::Value biasResult = mvmResult;
+  if (!match.hasBias)
+    return biasResult;
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.bias_add", "gru_cell_bias_add");
 
   auto fusedBias =
       rewriter.create<ConstantOp>(loc, match.fusedBiasTy, fusedBiasAttr);
@@ -329,11 +310,11 @@ buildBiasAddRegion(GRUCellLowering &match, mlir::TypedAttr fusedBiasAttr,
   biasResult =
       rewriter
           .create<mlir::linalg::AddOp>(
-              loc, mlir::ValueRange{body->getArgument(0), expandedBias},
+              loc, mlir::ValueRange{mvmResult, expandedBias},
               mlir::ValueRange{biasedInit})
           .getResult(0);
-  rewriter.create<mlir::sculptor::YieldOp>(loc, biasResult);
-  return biasRegion.getResult(0);
+  scope.annotate();
+  return biasResult;
 }
 
 struct GRUGateSlices {
@@ -343,42 +324,26 @@ struct GRUGateSlices {
   mlir::Value hiddenNew;
 };
 
-static GRUGateSlices buildGateSplitRegion(GRUCellLowering &match,
+static GRUGateSlices buildGateSplitStage(GRUCellLowering &match,
                                           mlir::Value preActivation,
                                           mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto gateSplitRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc,
-      mlir::TypeRange{match.resultTy, match.resultTy, match.resultTy,
-                      match.resultTy},
-      mlir::ValueRange{preActivation}, "digital.gate_split",
-      rewriter.getStringAttr("gru_cell_gate_split"));
-
-  mlir::Block *body = new mlir::Block();
-  gateSplitRegion.getBody().push_back(body);
-  body->addArgument(preActivation.getType(), preActivation.getLoc());
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.gate_split", "gru_cell_gate_split");
   int64_t hiddenSize = match.hiddenTy.getShape()[1];
   mlir::RankedTensorType resultTy = match.resultTy;
-  mlir::Value regionPreActivation = body->getArgument(0);
   mlir::Value resetPre =
-      recurrent_gate::buildGateSlice(loc, resultTy, regionPreActivation,
+      recurrent_gate::buildGateSlice(loc, resultTy, preActivation,
                                      /*gateOffset=*/0, hiddenSize, rewriter);
   mlir::Value updatePre = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize, hiddenSize, rewriter);
+      loc, resultTy, preActivation, hiddenSize, hiddenSize, rewriter);
   mlir::Value inputNew = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize * 2, hiddenSize, rewriter);
+      loc, resultTy, preActivation, hiddenSize * 2, hiddenSize, rewriter);
   mlir::Value hiddenNew = recurrent_gate::buildGateSlice(
-      loc, resultTy, regionPreActivation, hiddenSize * 3, hiddenSize, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{resetPre, updatePre, inputNew, hiddenNew});
-  return GRUGateSlices{
-      gateSplitRegion.getResult(0), gateSplitRegion.getResult(1),
-      gateSplitRegion.getResult(2), gateSplitRegion.getResult(3)};
+      loc, resultTy, preActivation, hiddenSize * 3, hiddenSize, rewriter);
+  scope.annotate();
+  return GRUGateSlices{resetPre, updatePre, inputNew, hiddenNew};
 }
 
 struct GRUGateActivations {
@@ -387,122 +352,74 @@ struct GRUGateActivations {
 };
 
 static GRUGateActivations
-buildGateActivationRegion(GRUCellLowering &match, GRUGateSlices gates,
+buildGateActivationStage(GRUCellLowering &match, GRUGateSlices gates,
                           mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto activationRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy, match.resultTy},
-      mlir::ValueRange{gates.reset, gates.update}, "digital.activation",
-      rewriter.getStringAttr("gru_cell_gate_activation"));
-
-  mlir::Block *body = new mlir::Block();
-  activationRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {gates.reset.getType(),
-                                              gates.update.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {gates.reset.getLoc(),
-                                                 gates.update.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.activation", "gru_cell_gate_activation");
   mlir::RankedTensorType resultTy = match.resultTy;
   mlir::Value resetGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, resultTy, body->getArgument(0), rewriter);
+      loc, resultTy, gates.reset, rewriter);
   mlir::Value updateGate = converter_recurrent_elementwise::buildSigmoid(
-      loc, resultTy, body->getArgument(1), rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(
-      loc, mlir::ValueRange{resetGate, updateGate});
-  return GRUGateActivations{activationRegion.getResult(0),
-                            activationRegion.getResult(1)};
+      loc, resultTy, gates.update, rewriter);
+  scope.annotate();
+  return GRUGateActivations{resetGate, updateGate};
 }
 
-static mlir::Value buildCandidateUpdateRegion(GRUCellLowering &match,
+static mlir::Value buildCandidateUpdateStage(GRUCellLowering &match,
                                               mlir::Value resetGate,
                                               mlir::Value inputNew,
                                               mlir::Value hiddenNew,
                                               mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto candidateRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy},
-      mlir::ValueRange{resetGate, inputNew, hiddenNew},
-      "digital.candidate_update",
-      rewriter.getStringAttr("gru_cell_candidate_update"));
-
-  mlir::Block *body = new mlir::Block();
-  candidateRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      resetGate.getType(), inputNew.getType(), hiddenNew.getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      resetGate.getLoc(), inputNew.getLoc(), hiddenNew.getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.candidate_update", "gru_cell_candidate_update");
   mlir::RankedTensorType resultTy = match.resultTy;
   mlir::Value resetHiddenNew = converter_recurrent_elementwise::buildMul(
-      loc, resultTy, body->getArgument(0), body->getArgument(2), rewriter);
+      loc, resultTy, resetGate, hiddenNew, rewriter);
   mlir::Value candidateInput = converter_recurrent_elementwise::buildAdd(
-      loc, resultTy, body->getArgument(1), resetHiddenNew, rewriter);
+      loc, resultTy, inputNew, resetHiddenNew, rewriter);
   mlir::Value candidate = converter_recurrent_elementwise::buildTanh(
       loc, resultTy, candidateInput, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(loc, candidate);
-  return candidateRegion.getResult(0);
+  scope.annotate();
+  return candidate;
 }
 
-static mlir::Value buildHiddenUpdateRegion(GRUCellLowering &match,
+static mlir::Value buildHiddenUpdateStage(GRUCellLowering &match,
                                            mlir::Value candidate,
                                            mlir::Value updateGate,
                                            mlir::RewriterBase &rewriter) {
   mlir::Location loc = match.gruCellOp.getLoc();
   rewriter.setInsertionPoint(match.gruCellOp);
-  auto hiddenUpdateRegion = rewriter.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{match.resultTy},
-      mlir::ValueRange{candidate, updateGate, match.gruCellOp.getHPrev()},
-      "digital.hidden_update",
-      rewriter.getStringAttr("gru_cell_hidden_update"));
-
-  mlir::Block *body = new mlir::Block();
-  hiddenUpdateRegion.getBody().push_back(body);
-  llvm::SmallVector<mlir::Type> inputTypes = {
-      candidate.getType(), updateGate.getType(),
-      match.gruCellOp.getHPrev().getType()};
-  llvm::SmallVector<mlir::Location> inputLocs = {
-      candidate.getLoc(), updateGate.getLoc(),
-      match.gruCellOp.getHPrev().getLoc()};
-  body->addArguments(inputTypes, inputLocs);
-
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      rewriter, "digital.hidden_update", "gru_cell_hidden_update");
   mlir::RankedTensorType resultTy = match.resultTy;
   mlir::Value hiddenMinusCandidate = converter_recurrent_elementwise::buildSub(
-      loc, resultTy, body->getArgument(2), body->getArgument(0), rewriter);
+      loc, resultTy, match.gruCellOp.getHPrev(), candidate, rewriter);
   mlir::Value updateDelta = converter_recurrent_elementwise::buildMul(
-      loc, resultTy, body->getArgument(1), hiddenMinusCandidate, rewriter);
+      loc, resultTy, updateGate, hiddenMinusCandidate, rewriter);
   mlir::Value nextHidden = converter_recurrent_elementwise::buildAdd(
-      loc, resultTy, body->getArgument(0), updateDelta, rewriter);
-
-  rewriter.create<mlir::sculptor::YieldOp>(loc, nextHidden);
-  return hiddenUpdateRegion.getResult(0);
+      loc, resultTy, candidate, updateDelta, rewriter);
+  scope.annotate();
+  return nextHidden;
 }
 
 // Applies GRUCell gates while preserving the reset-new dependency.
 static mlir::Value buildGateMath(GRUCellLowering &match,
                                  mlir::Value preActivation,
                                  mlir::RewriterBase &rewriter) {
-  GRUGateSlices slices = buildGateSplitRegion(match, preActivation, rewriter);
-  GRUGateActivations gates = buildGateActivationRegion(match, slices, rewriter);
-  mlir::Value candidate = buildCandidateUpdateRegion(
+  GRUGateSlices slices = buildGateSplitStage(match, preActivation, rewriter);
+  GRUGateActivations gates = buildGateActivationStage(match, slices, rewriter);
+  mlir::Value candidate = buildCandidateUpdateStage(
       match, gates.reset, slices.inputNew, slices.hiddenNew, rewriter);
-  return buildHiddenUpdateRegion(match, candidate, gates.update, rewriter);
+  return buildHiddenUpdateStage(match, candidate, gates.update, rewriter);
 }
 
 static mlir::LogicalResult
-lowerGRUCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedGRUCellLayer(func);
+lowerGRUCellOp(NNGRUCellOp op, mlir::RewriterBase &rewriter) {
+  auto match = matchGRUCellLayer(op);
   if (mlir::failed(match))
     return mlir::failure();
 
@@ -521,13 +438,13 @@ lowerGRUCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
   rewriter.setInsertionPoint((*match).gruCellOp);
   auto fusedWeight =
       rewriter.create<ConstantOp>(loc, (*match).fusedWeightTy, fusedWeightAttr);
-  mlir::Value fusedInput = buildInputRecombineRegion(*match, rewriter);
+  mlir::Value fusedInput = buildInputRecombineStage(*match, rewriter);
   mlir::Value mvmResult =
       mvm_build::buildMVM(loc, (*match).preActivationTy, fusedInput,
                           fusedWeight.getResult(), rewriter);
 
   auto preActivation =
-      buildBiasAddRegion(*match, fusedBiasAttr, mvmResult, rewriter);
+      buildBiasAddStage(*match, fusedBiasAttr, mvmResult, rewriter);
   if (mlir::failed(preActivation))
     return mlir::failure();
 
@@ -539,6 +456,15 @@ lowerGRUCellLayerToMVM(mlir::func::FuncOp func, mlir::RewriterBase &rewriter) {
        match->biasHHConstant},
       rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult
+lowerGRUCellLayerToMVM(mlir::func::FuncOp func,
+                       mlir::RewriterBase &rewriter) {
+  auto match = matchExtractedGRUCellLayer(func);
+  if (mlir::failed(match))
+    return mlir::failure();
+  return lowerGRUCellOp(match->gruCellOp, rewriter);
 }
 
 // Converts extracted sculptor.nn.gru_cell layer bodies to fused sculptor.mvm plus
@@ -557,6 +483,20 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineGRUCellLayers(func::FuncOp func) {
+  SmallVector<NNGRUCellOp> ops;
+  func.walk([&](NNGRUCellOp op) { ops.push_back(op); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNGRUCellOp op : ops) {
+    if (failed(lowerGRUCellOp(op, rewriter))) {
+      op.emitOpError("cannot decompose supported inline GRUCell");
+      return failure();
+    }
+  }
+  return success();
+}
 
 void registerGRUCellConverter(LayerToMVMConverters &converters,
                               LayerToMVMConverterMap &converterMap,

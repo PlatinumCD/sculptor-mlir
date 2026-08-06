@@ -212,11 +212,16 @@ def Sculptor_ArrayLoadOp
     Sculptor_LogicalArrayType:$array
   );
 
+  let results = (outs
+    Sculptor_ArrayLoadedType:$loaded
+  );
+
   let hasVerifier = 1;
 
   let assemblyFormat = [{
     $vector `,` $array attr-dict
     `:` type($vector) `,` qualified(type($array))
+    `->` qualified(type($loaded))
   }];
 }
 
@@ -231,6 +236,7 @@ def Sculptor_ArrayExecuteOp
   let summary = "Execute a logical accelerator array";
 
   let arguments = (ins
+    Sculptor_ArrayLoadedType:$loaded,
     Sculptor_LogicalArrayType:$array
   );
 
@@ -238,8 +244,12 @@ def Sculptor_ArrayExecuteOp
     Sculptor_ArrayResultType:$result
   );
 
+  let hasVerifier = 1;
+
   let assemblyFormat = [{
-    $array attr-dict `:` qualified(type($array)) `->` qualified(type($result))
+    $loaded `,` $array attr-dict
+    `:` qualified(type($loaded)) `,` qualified(type($array))
+    `->` qualified(type($result))
   }];
 }
 
@@ -254,7 +264,8 @@ def Sculptor_ArrayStoreOp
   let summary = "Store an accelerator array result into tensor IR";
 
   let arguments = (ins
-    Sculptor_ArrayResultType:$input
+    Sculptor_ArrayResultType:$input,
+    Sculptor_LogicalArrayType:$array
   );
 
   let results = (outs
@@ -264,7 +275,9 @@ def Sculptor_ArrayStoreOp
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    $input attr-dict `:` qualified(type($input)) `->` type($output)
+    $input `,` $array attr-dict
+    `:` qualified(type($input)) `,` qualified(type($array))
+    `->` type($output)
   }];
 }
 

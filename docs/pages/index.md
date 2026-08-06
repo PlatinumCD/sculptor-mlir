@@ -1,131 +1,39 @@
-# `sculptor-mlir`
+# Sculptor MLIR
 
-`sculptor-mlir` is an experimental MLIR compiler for lowering
-neural-network-shaped tensor and `linalg` programs into an analog
-compute-in-memory execution model.
+Sculptor maps tensor programs to logical tiles and then to a physical mesh.
+The compiler keeps computation structure visible until mapping is complete.
 
-`sculptor-mlir` is built as an out-of-tree MLIR project. It expects an existing
-LLVM/MLIR build tree and focuses on the Sculptor dialect, compiler passes,
-runtime lowering path, and simulator-facing support code.
+## Primary Pipeline
 
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Build Requirements</summary>
+| Stage | Pass | Result |
+|---|---|---|
+| Normalize layers | `--sculptor-canonicalize-layers` | Canonical neural-network operations |
+| Expose layers | `--sculptor-extract-layers` | Explicit layer operations |
+| Decompose layers | `--sculptor-convert-layers` | General tensor and `sculptor.mvm` operations |
+| Expand analog work | `--sculptor-expand-mvm-to-golem` | Matrix setup, vector tile, array load, execute, store, and recombine operations |
+| Expand digital work | `--sculptor-expand-digital-work` | Independently mappable digital work units |
+| Build hierarchy | `--sculptor-build-ra-tree` | A Resource Allocation tree over compute operations |
+| Select a plan | `--sculptor-plan-mapping` | Ordered spatial and temporal planning decisions |
+| Apply the plan | `--sculptor-apply-mapping-plan` | Tiled operations and plan bindings |
+| Place logical tiles | `--sculptor-place-logical-tiles` | Logical tiles assigned to mesh coordinates |
+| Outline routines | `--sculptor-outline-tile-routines` | Tensor-level routines inside tile modules |
+| Build runtime graph | `--sculptor-materialize-tile-runtime-graph` | Tile-local tasks and communication resources |
+| Extract one tile | `--sculptor-extract-tile-module` | A standalone module for one tile |
+| Plan scratchpad | `--sculptor-plan-tile-scratchpad` | Tile-local storage offsets and sizes |
 
+The pivot pipeline does not use placement islands. It maps explicit compute
+operations through an RA tree and a logical-tile graph.
 
-The `sculptor-mlir` build needs these host tools available in `PATH`:
+## Source Layout
 
-| Requirement | Used for |
+| Directory | Purpose |
 |---|---|
-| `cmake` | Configuring `sculptor-mlir` against LLVM and MLIR. |
-| `ninja` | Driving the generated build tree. |
-| C/C++ compiler toolchain | Building the dialect library, passes, tools, and runtime code. |
-| LLVM/MLIR CMake packages | Providing `LLVM_DIR` and `MLIR_DIR` for the out-of-tree build. |
+| `Transforms/mapping` | Compute graphs, RA trees, mapping plans, logical tiles, and physical placement |
+| `Transforms/planners` | Registered planning strategies |
+| `Transforms/Golem` | Expansion of `sculptor.mvm` into Golem operations |
+| `Transforms/converters` | Layer decomposition |
+| `Transforms/canonicalizers` | Layer normalization |
 
-`sculptor-mlir` expects LLVM and MLIR CMake package configs from an LLVM project
-build tree:
-
-```text
-<llvm-project-build>/lib/cmake/llvm
-<llvm-project-build>/lib/cmake/mlir
-```
-
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Source Layout</summary>
-
-
-The actual checkout path uses `src/`, not `source/`. This tree shows the main
-source-bearing directories and omits generated output such as `site/` and hidden
-tooling directories.
-
-```text
-src/
-└── sculptor-mlir/
-    ├── CMakeLists.txt
-    ├── README.md
-    ├── include/sculptor-mlir/Dialect/Sculptor/
-    │   ├── Conversion/
-    │   │   ├── golem/
-    │   │   └── runtime/
-    │   ├── IR/
-    │   │   └── Ops/
-    │   └── Transforms/
-    │       ├── Golem/
-    │       ├── Support/
-    │       │   ├── Assembly/
-    │       │   ├── Canonicalization/
-    │       │   ├── Conversion/
-    │       │   ├── Extraction/
-    │       │   ├── IR/
-    │       │   └── Layers/
-    │       └── task_schedulers/
-    ├── lib/Dialect/Sculptor/
-    │   ├── Conversion/
-    │   │   ├── golem/
-    │   │   └── runtime/
-    │   ├── IR/
-    │   │   └── Ops/
-    │   └── Transforms/
-    │       ├── assemblers/
-    │       ├── canonicalizers/
-    │       ├── converters/
-    │       ├── extractors/
-    │       ├── Golem/
-    │       ├── Support/
-    │       │   └── Conversion/
-    │       └── task_schedulers/
-    ├── runtime/common/
-    │   ├── include/
-    │   └── lib/
-    ├── tools/sculptor-mlir-opt/
-    ├── tests/mlir/
-    └── docs/
-        ├── mkdocs.yml
-        └── pages/
-```
-
-
-### `include/`
-
-`include/` contains the public headers and TableGen files for the Sculptor
-dialect: ops, types, pass declarations, conversion interfaces, and shared
-compiler support.
-
-### `lib/`
-
-`lib/` contains the implementation behind those declarations: dialect behavior,
-passes, rewrites, layer conversion, task graph construction, scheduling, Golem
-expansion, and runtime lowering.
-
-### `runtime/`
-
-`runtime/` contains support code for lowered programs. The first public tree
-includes `runtime/common/`, which provides the shared runtime ABI, graph image
-model, task argument helpers, resource slot handling, and backend extension
-surface.
-
-### `tools/`
-
-`tools/` contains the `sculptor-mlir-opt` pass driver.
-
-### `tests/`
-
-`tests/` contains MLIR regression inputs for parser, verifier, transformation,
-conversion, scheduling, and runtime-graph emission behavior.
-
-### `docs/`
-
-`docs/` contains this MkDocs site: configuration and Markdown source pages.
-
-</details>
-
-<details class="doc-section" open markdown="1">
-<summary markdown="block">## Next</summary>
-
-
-Read [Design](design.md) for the compiler pipeline, IR boundaries, pass
-responsibilities, runtime model, and current limits.
-
-</details>
+Use the navigation to read about the [architecture](design.md), [pass
+pipeline](passes.md), [mapping and RA tree](mapping.md), [runtime and tile
+ABI](runtime.md), [testing](testing.md), and [development workflow](development.md).

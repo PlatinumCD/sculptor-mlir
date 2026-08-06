@@ -3,6 +3,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/ConstantUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/MVMBuildUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/TensorTypeUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -16,6 +17,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -25,10 +27,10 @@
 #include <memory>
 #include <string>
 
-namespace mvm_build = mlir::sculptor::mvm_build;
 namespace nn_layer_match = mlir::sculptor::nn_layer_match;
 namespace tensor_type = mlir::sculptor::tensor_type;
 namespace converter_constant = mlir::sculptor::converter_constant;
+namespace mvm_build = mlir::sculptor::mvm_build;
 
 namespace {
 
@@ -82,6 +84,7 @@ struct TransformerBlockLowering {
   mlir::StringRef normMode = "post";
   bool hasProjectionBias = false;
   bool hasLayerNormAffine = false;
+  bool hasLayerNormBias = false;
   bool hasFinalNorm = false;
   bool causal = false;
   bool hasCrossAttention = false;
@@ -93,6 +96,12 @@ static bool isEncoder(TransformerBlockLowering &match) {
 
 static bool isDecoder(TransformerBlockLowering &match) {
   return match.blockKind == mlir::sculptor::TransformerBlockKind::Decoder;
+}
+
+static mlir::StringAttr getSemanticBlockKindAttr(NNTransformerBlockOp blockOp) {
+  return mlir::StringAttr::get(
+      blockOp.getContext(),
+      mlir::sculptor::stringifyTransformerBlockKind(blockOp.getBlockKind()));
 }
 
 static llvm::SmallVector<mlir::OpFoldResult>
@@ -569,15 +578,6 @@ evaluateStaticF32Tensor(mlir::Value value, mlir::RankedTensorType expectedTy) {
   return std::move(tensor->f32Values);
 }
 
-static mlir::Block *addTaskRegionBody(mlir::sculptor::TaskRegionOp region,
-                                      mlir::ValueRange inputs) {
-  mlir::Block *body = new mlir::Block();
-  region.getBody().push_back(body);
-  for (mlir::Value input : inputs)
-    body->addArgument(input.getType(), input.getLoc());
-  return body;
-}
-
 static mlir::FailureOr<ProjectionLowering>
 matchProjection(mlir::Value weight, mlir::Value bias, int64_t outputWidth,
                 int64_t inputWidth, bool expectsBias) {
@@ -626,7 +626,7 @@ matchProjection(mlir::Value weight, mlir::Value bias, int64_t outputWidth,
 
 static mlir::FailureOr<NormLowering>
 matchNorm(mlir::Value weight, mlir::Value bias, bool sectionPresent,
-          bool expectsAffine, int64_t hiddenSize) {
+          bool expectsAffine, bool expectsBias, int64_t hiddenSize) {
   NormLowering norm;
   norm.present = sectionPresent;
 
@@ -642,26 +642,31 @@ matchNorm(mlir::Value weight, mlir::Value bias, bool sectionPresent,
     return norm;
   }
 
-  if (!weight || !bias)
+  if (!weight || (expectsBias && !bias) || (!expectsBias && bias))
     return mlir::failure();
 
   auto weightTy =
       tensor_type::getPositiveStaticRank1F32Tensor(weight.getType());
-  auto biasTy = tensor_type::getPositiveStaticRank1F32Tensor(bias.getType());
-  if (mlir::failed(weightTy) || mlir::failed(biasTy) ||
-      weightTy->getShape() != llvm::ArrayRef<int64_t>({hiddenSize}) ||
-      biasTy->getShape() != llvm::ArrayRef<int64_t>({hiddenSize}))
+  if (mlir::failed(weightTy) ||
+      weightTy->getShape() != llvm::ArrayRef<int64_t>({hiddenSize}))
     return mlir::failure();
 
   auto weightConstant = weight.getDefiningOp<ConstantOp>();
-  auto biasConstant = bias.getDefiningOp<ConstantOp>();
-  if (!weightConstant || !biasConstant)
+  if (!weightConstant)
     return mlir::failure();
 
   norm.weight = weight;
-  norm.bias = bias;
   norm.weightConstant = weightConstant;
-  norm.biasConstant = biasConstant;
+  if (expectsBias) {
+    auto biasTy = tensor_type::getPositiveStaticRank1F32Tensor(bias.getType());
+    auto biasConstant = bias.getDefiningOp<ConstantOp>();
+    if (mlir::failed(biasTy) ||
+        biasTy->getShape() != llvm::ArrayRef<int64_t>({hiddenSize}) ||
+        !biasConstant)
+      return mlir::failure();
+    norm.bias = bias;
+    norm.biasConstant = biasConstant;
+  }
   return norm;
 }
 
@@ -742,26 +747,24 @@ matchBlockFunctionSignature(mlir::func::FuncOp func,
 }
 
 static mlir::FailureOr<TransformerBlockLowering>
-matchExtractedTransformerBlock(mlir::func::FuncOp func) {
-  auto blockOp = matchSingleTransformerBlockOp(func);
-  if (mlir::failed(blockOp))
+matchTransformerBlock(NNTransformerBlockOp blockOp) {
+  if (!blockOp)
     return mlir::failure();
 
   TransformerBlockLowering match;
-  match.blockOp = *blockOp;
-  if (mlir::failed(matchBlockFunctionSignature(func, *blockOp, match)))
-    return mlir::failure();
+  match.blockOp = blockOp;
+  match.blockKind = blockOp.getBlockKind();
 
-  mlir::StringRef normMode = blockOp->getNormMode();
-  if (!blockOp->getBatchFirst() || blockOp->getActivation() != "gelu" ||
+  mlir::StringRef normMode = blockOp.getNormMode();
+  if (!blockOp.getBatchFirst() || blockOp.getActivation() != "gelu" ||
       (normMode != "post" && normMode != "pre"))
     return mlir::failure();
 
   auto inputTy =
-      tensor_type::getPositiveStaticF32Tensor(blockOp->getInput().getType(),
+      tensor_type::getPositiveStaticF32Tensor(blockOp.getInput().getType(),
                                               /*expectedRank=*/3);
   auto outputTy =
-      tensor_type::getPositiveStaticF32Tensor(blockOp->getOutput().getType(),
+      tensor_type::getPositiveStaticF32Tensor(blockOp.getOutput().getType(),
                                               /*expectedRank=*/3);
   if (mlir::failed(inputTy) || mlir::failed(outputTy))
     return mlir::failure();
@@ -771,17 +774,18 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
   match.elementType = inputTy->getElementType();
   match.batchSize = inputTy->getShape()[0];
   match.sequenceLength = inputTy->getShape()[1];
-  match.hiddenSize = blockOp->getHiddenSize();
-  match.numHeads = blockOp->getNumHeads();
-  match.headDim = blockOp->getHeadDim();
-  match.mlpHiddenSize = blockOp->getMlpHiddenSize();
-  match.layerNormEps = blockOp->getLayerNormEpsAttr().getValueAsDouble();
+  match.hiddenSize = blockOp.getHiddenSize();
+  match.numHeads = blockOp.getNumHeads();
+  match.headDim = blockOp.getHeadDim();
+  match.mlpHiddenSize = blockOp.getMlpHiddenSize();
+  match.layerNormEps = blockOp.getLayerNormEpsAttr().getValueAsDouble();
   match.normMode = normMode;
-  match.hasProjectionBias = blockOp->getHasProjectionBias();
-  match.hasLayerNormAffine = blockOp->getHasLayerNormAffine();
-  match.hasFinalNorm = blockOp->getHasFinalNorm();
-  match.causal = blockOp->getCausal();
-  match.hasCrossAttention = blockOp->getHasCrossAttention();
+  match.hasProjectionBias = blockOp.getHasProjectionBias();
+  match.hasLayerNormAffine = blockOp.getHasLayerNormAffine();
+  match.hasLayerNormBias = blockOp.getHasLayerNormBias();
+  match.hasFinalNorm = blockOp.getHasFinalNorm();
+  match.causal = blockOp.getCausal();
+  match.hasCrossAttention = blockOp.getHasCrossAttention();
 
   if (match.hiddenSize <= 0 || match.numHeads <= 0 || match.headDim <= 0 ||
       match.mlpHiddenSize <= 0 ||
@@ -795,9 +799,9 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
       return mlir::failure();
 
     if (match.hasCrossAttention) {
-      auto memoryTy = tensor_type::getPositiveStaticF32Tensor(
-          blockOp->getMemory().getType(),
-          /*expectedRank=*/3);
+      auto memoryTy =
+          tensor_type::getPositiveStaticF32Tensor(blockOp.getMemory().getType(),
+                                                  /*expectedRank=*/3);
       if (mlir::failed(memoryTy) ||
           memoryTy->getShape()[0] != match.batchSize ||
           memoryTy->getShape()[2] != match.hiddenSize)
@@ -807,27 +811,29 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
     }
   }
 
-  auto qkv = matchProjection(blockOp->getQkvWeight(), blockOp->getQkvBias(),
+  auto qkv = matchProjection(blockOp.getQkvWeight(), blockOp.getQkvBias(),
                              match.hiddenSize * 3, match.hiddenSize,
                              match.hasProjectionBias);
   auto attnOutput = matchProjection(
-      blockOp->getAttnOutputWeight(), blockOp->getAttnOutputBias(),
+      blockOp.getAttnOutputWeight(), blockOp.getAttnOutputBias(),
       match.hiddenSize, match.hiddenSize, match.hasProjectionBias);
-  auto mlpUp = matchProjection(blockOp->getMlpUpWeight(),
-                               blockOp->getMlpUpBias(), match.mlpHiddenSize,
-                               match.hiddenSize, match.hasProjectionBias);
-  auto mlpDown = matchProjection(blockOp->getMlpDownWeight(),
-                                 blockOp->getMlpDownBias(), match.hiddenSize,
+  auto mlpUp = matchProjection(blockOp.getMlpUpWeight(), blockOp.getMlpUpBias(),
+                               match.mlpHiddenSize, match.hiddenSize,
+                               match.hasProjectionBias);
+  auto mlpDown = matchProjection(blockOp.getMlpDownWeight(),
+                                 blockOp.getMlpDownBias(), match.hiddenSize,
                                  match.mlpHiddenSize, match.hasProjectionBias);
-  auto attnNorm = matchNorm(
-      blockOp->getAttnNormWeight(), blockOp->getAttnNormBias(),
-      /*sectionPresent=*/true, match.hasLayerNormAffine, match.hiddenSize);
-  auto mlpNorm = matchNorm(
-      blockOp->getMlpNormWeight(), blockOp->getMlpNormBias(),
-      /*sectionPresent=*/true, match.hasLayerNormAffine, match.hiddenSize);
+  auto attnNorm =
+      matchNorm(blockOp.getAttnNormWeight(), blockOp.getAttnNormBias(),
+                /*sectionPresent=*/true, match.hasLayerNormAffine,
+                match.hasLayerNormBias, match.hiddenSize);
+  auto mlpNorm = matchNorm(blockOp.getMlpNormWeight(), blockOp.getMlpNormBias(),
+                           /*sectionPresent=*/true, match.hasLayerNormAffine,
+                           match.hasLayerNormBias, match.hiddenSize);
   auto finalNorm =
-      matchNorm(blockOp->getFinalNormWeight(), blockOp->getFinalNormBias(),
-                match.hasFinalNorm, match.hasLayerNormAffine, match.hiddenSize);
+      matchNorm(blockOp.getFinalNormWeight(), blockOp.getFinalNormBias(),
+                match.hasFinalNorm, match.hasLayerNormAffine,
+                match.hasLayerNormBias, match.hiddenSize);
 
   if (mlir::failed(qkv) || mlir::failed(attnOutput) || mlir::failed(mlpUp) ||
       mlir::failed(mlpDown) || mlir::failed(attnNorm) ||
@@ -843,26 +849,27 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
   match.finalNorm = *finalNorm;
 
   if (!match.hasCrossAttention) {
-    if (blockOp->getCrossQueryWeight() || blockOp->getCrossQueryBias() ||
-        blockOp->getCrossKeyValueWeight() || blockOp->getCrossKeyValueBias() ||
-        blockOp->getCrossOutputWeight() || blockOp->getCrossOutputBias() ||
-        blockOp->getCrossNormWeight() || blockOp->getCrossNormBias())
+    if (blockOp.getCrossQueryWeight() || blockOp.getCrossQueryBias() ||
+        blockOp.getCrossKeyValueWeight() || blockOp.getCrossKeyValueBias() ||
+        blockOp.getCrossOutputWeight() || blockOp.getCrossOutputBias() ||
+        blockOp.getCrossNormWeight() || blockOp.getCrossNormBias())
       return mlir::failure();
     return match;
   }
 
   auto crossQuery = matchProjection(
-      blockOp->getCrossQueryWeight(), blockOp->getCrossQueryBias(),
+      blockOp.getCrossQueryWeight(), blockOp.getCrossQueryBias(),
       match.hiddenSize, match.hiddenSize, match.hasProjectionBias);
   auto crossKeyValue = matchProjection(
-      blockOp->getCrossKeyValueWeight(), blockOp->getCrossKeyValueBias(),
+      blockOp.getCrossKeyValueWeight(), blockOp.getCrossKeyValueBias(),
       match.hiddenSize * 2, match.hiddenSize, match.hasProjectionBias);
   auto crossOutput = matchProjection(
-      blockOp->getCrossOutputWeight(), blockOp->getCrossOutputBias(),
+      blockOp.getCrossOutputWeight(), blockOp.getCrossOutputBias(),
       match.hiddenSize, match.hiddenSize, match.hasProjectionBias);
-  auto crossNorm = matchNorm(
-      blockOp->getCrossNormWeight(), blockOp->getCrossNormBias(),
-      /*sectionPresent=*/true, match.hasLayerNormAffine, match.hiddenSize);
+  auto crossNorm =
+      matchNorm(blockOp.getCrossNormWeight(), blockOp.getCrossNormBias(),
+                /*sectionPresent=*/true, match.hasLayerNormAffine,
+                match.hasLayerNormBias, match.hiddenSize);
   if (mlir::failed(crossQuery) || mlir::failed(crossKeyValue) ||
       mlir::failed(crossOutput) || mlir::failed(crossNorm))
     return mlir::failure();
@@ -874,7 +881,7 @@ matchExtractedTransformerBlock(mlir::func::FuncOp func) {
   return match;
 }
 
-static mlir::Value buildExtractTokenRegion(TransformerBlockLowering &match,
+static mlir::Value buildExtractTokenStage(TransformerBlockLowering &match,
                                            mlir::Value sequence, int64_t batch,
                                            int64_t step, int64_t width,
                                            llvm::StringRef name,
@@ -882,18 +889,13 @@ static mlir::Value buildExtractTokenRegion(TransformerBlockLowering &match,
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType rowTy =
       mlir::RankedTensorType::get({1, width}, match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{rowTy}, mlir::ValueRange{sequence},
-      "digital.token_extract", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{sequence});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(builder,
+                                                "digital.token_extract", name);
 
   mlir::RankedTensorType sliceTy =
       mlir::RankedTensorType::get({1, 1, width}, match.elementType);
   auto slice = builder.create<mlir::tensor::ExtractSliceOp>(
-      loc, sliceTy, body->getArgument(0),
+      loc, sliceTy, sequence,
       buildIndexAttrs(builder, {batch, step, 0}),
       buildIndexAttrs(builder, {1, 1, width}),
       buildIndexAttrs(builder, {1, 1, 1}));
@@ -903,11 +905,11 @@ static mlir::Value buildExtractTokenRegion(TransformerBlockLowering &match,
                         .create<mlir::tensor::CollapseShapeOp>(
                             loc, rowTy, slice.getResult(), reassociation)
                         .getResult();
-  builder.create<mlir::sculptor::YieldOp>(loc, row);
-  return region.getResult(0);
+  scope.annotate();
+  return row;
 }
 
-static mlir::Value buildBiasAddRegion(TransformerBlockLowering &match,
+static mlir::Value buildBiasAddStage(TransformerBlockLowering &match,
                                       ProjectionLowering &projection,
                                       mlir::RankedTensorType rowResultTy,
                                       mlir::Value mvmResult,
@@ -917,13 +919,8 @@ static mlir::Value buildBiasAddRegion(TransformerBlockLowering &match,
     return mvmResult;
 
   mlir::Location loc = match.blockOp.getLoc();
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{rowResultTy}, mlir::ValueRange{mvmResult},
-      "digital.bias_add", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{mvmResult});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.bias_add",
+                                                name);
 
   auto biasConstant =
       builder.create<ConstantOp>(loc, projection.biasConstant.getType(),
@@ -939,27 +936,22 @@ static mlir::Value buildBiasAddRegion(TransformerBlockLowering &match,
   mlir::Value biased =
       builder
           .create<mlir::linalg::AddOp>(
-              loc, mlir::ValueRange{body->getArgument(0), expandedBias},
+              loc, mlir::ValueRange{mvmResult, expandedBias},
               mlir::ValueRange{init})
           .getResult(0);
-  builder.create<mlir::sculptor::YieldOp>(loc, biased);
-  return region.getResult(0);
+  scope.annotate();
+  return biased;
 }
 
-static mlir::Value buildOutputRecombineRegion(TransformerBlockLowering &match,
+static mlir::Value buildOutputRecombineStage(TransformerBlockLowering &match,
                                               llvm::ArrayRef<mlir::Value> rows,
                                               mlir::RankedTensorType outputTy,
                                               int64_t sequenceLength,
                                               llvm::StringRef name,
                                               mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{outputTy}, mlir::ValueRange(rows),
-      "digital.output_recombine", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange(rows));
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.output_recombine", name);
 
   int64_t width = outputTy.getShape()[2];
   mlir::RankedTensorType sliceTy =
@@ -975,7 +967,7 @@ static mlir::Value buildOutputRecombineRegion(TransformerBlockLowering &match,
       mlir::Value expanded =
           builder
               .create<mlir::tensor::ExpandShapeOp>(
-                  loc, sliceTy, body->getArgument(rowIndex++), reassociation)
+                  loc, sliceTy, rows[rowIndex++], reassociation)
               .getResult();
       output = builder
                    .create<mlir::tensor::InsertSliceOp>(
@@ -987,8 +979,8 @@ static mlir::Value buildOutputRecombineRegion(TransformerBlockLowering &match,
     }
   }
 
-  builder.create<mlir::sculptor::YieldOp>(loc, output);
-  return region.getResult(0);
+  scope.annotate();
+  return output;
 }
 
 static mlir::Value
@@ -1006,12 +998,17 @@ buildSequenceProjection(TransformerBlockLowering &match, mlir::Value sequence,
     for (int64_t step = 0; step < sequenceLength; ++step) {
       std::string suffix =
           "_b" + std::to_string(batch) + "_s" + std::to_string(step);
-      mlir::Value token = buildExtractTokenRegion(
+      mlir::Value token = buildExtractTokenStage(
           match, sequence, batch, step, inputWidth,
           std::string(name) + "_token_extract" + suffix, builder);
       mlir::Value mvm = mvm_build::buildMVM(loc, rowResultTy, token,
                                             projection.weight, builder);
-      rows.push_back(buildBiasAddRegion(
+      mvm.getDefiningOp()->setAttr("sculptor.semantic.kind",
+                                   builder.getStringAttr("projection"));
+      mvm.getDefiningOp()->setAttr(
+          "sculptor.semantic.name",
+          builder.getStringAttr(std::string(name) + suffix));
+      rows.push_back(buildBiasAddStage(
           match, projection, rowResultTy, mvm,
           std::string(name) + "_bias_add" + suffix, builder));
     }
@@ -1019,32 +1016,27 @@ buildSequenceProjection(TransformerBlockLowering &match, mlir::Value sequence,
 
   mlir::RankedTensorType outputTy = mlir::RankedTensorType::get(
       {match.batchSize, sequenceLength, outputWidth}, match.elementType);
-  return buildOutputRecombineRegion(match, rows, outputTy, sequenceLength,
+  return buildOutputRecombineStage(match, rows, outputTy, sequenceLength,
                                     std::string(name) + "_output_recombine",
                                     builder);
 }
 
 static llvm::SmallVector<mlir::Value, 3>
-buildQKVSplitRegion(TransformerBlockLowering &match, mlir::Value qkv,
+buildQKVSplitStage(TransformerBlockLowering &match, mlir::Value qkv,
                     llvm::StringRef name, mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType resultTy = mlir::RankedTensorType::get(
       {match.batchSize, match.sequenceLength, match.hiddenSize},
       match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{resultTy, resultTy, resultTy}, mlir::ValueRange{qkv},
-      "digital.qkv_split", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{qkv});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.qkv_split",
+                                                name);
 
   llvm::SmallVector<mlir::Value, 3> parts;
   for (int64_t part = 0; part < 3; ++part) {
     parts.push_back(
         builder
             .create<mlir::tensor::ExtractSliceOp>(
-                loc, resultTy, body->getArgument(0),
+                loc, resultTy, qkv,
                 buildIndexAttrs(builder, {0, 0, part * match.hiddenSize}),
                 buildIndexAttrs(builder, {match.batchSize, match.sequenceLength,
                                           match.hiddenSize}),
@@ -1052,31 +1044,26 @@ buildQKVSplitRegion(TransformerBlockLowering &match, mlir::Value qkv,
             .getResult());
   }
 
-  builder.create<mlir::sculptor::YieldOp>(loc, parts);
-  return {region.getResult(0), region.getResult(1), region.getResult(2)};
+  scope.annotate();
+  return parts;
 }
 
 static llvm::SmallVector<mlir::Value, 2>
-buildCrossKVSplitRegion(TransformerBlockLowering &match, mlir::Value kv,
+buildCrossKVSplitStage(TransformerBlockLowering &match, mlir::Value kv,
                         llvm::StringRef name, mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType resultTy = mlir::RankedTensorType::get(
       {match.batchSize, match.memoryLength, match.hiddenSize},
       match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{resultTy, resultTy}, mlir::ValueRange{kv},
-      "digital.cross_kv_split", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{kv});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.cross_kv_split", name);
 
   llvm::SmallVector<mlir::Value, 2> parts;
   for (int64_t part = 0; part < 2; ++part) {
     parts.push_back(
         builder
             .create<mlir::tensor::ExtractSliceOp>(
-                loc, resultTy, body->getArgument(0),
+                loc, resultTy, kv,
                 buildIndexAttrs(builder, {0, 0, part * match.hiddenSize}),
                 buildIndexAttrs(builder, {match.batchSize, match.memoryLength,
                                           match.hiddenSize}),
@@ -1084,8 +1071,8 @@ buildCrossKVSplitRegion(TransformerBlockLowering &match, mlir::Value kv,
             .getResult());
   }
 
-  builder.create<mlir::sculptor::YieldOp>(loc, parts);
-  return {region.getResult(0), region.getResult(1)};
+  scope.annotate();
+  return parts;
 }
 
 static mlir::Value buildHeadExpandedView(TransformerBlockLowering &match,
@@ -1105,7 +1092,7 @@ static mlir::Value buildHeadExpandedView(TransformerBlockLowering &match,
 }
 
 static mlir::Value
-buildAttentionScoresRegion(TransformerBlockLowering &match, mlir::Value query,
+buildAttentionScoresStage(TransformerBlockLowering &match, mlir::Value query,
                            mlir::Value key, int64_t queryLength,
                            int64_t keyLength, bool causal, llvm::StringRef name,
                            mlir::OpBuilder &builder) {
@@ -1113,20 +1100,15 @@ buildAttentionScoresRegion(TransformerBlockLowering &match, mlir::Value query,
   mlir::RankedTensorType scoreTy = mlir::RankedTensorType::get(
       {match.batchSize, match.numHeads, queryLength, keyLength},
       match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{scoreTy}, mlir::ValueRange{query, key},
-      "digital.attention_scores", builder.getStringAttr(name));
-  region->setAttr("head_dim", builder.getI64IntegerAttr(match.headDim));
-  region->setAttr("causal", builder.getBoolAttr(causal));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{query, key});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.attention_scores", name);
+  scope.set("head_dim", builder.getI64IntegerAttr(match.headDim));
+  scope.set("causal", builder.getBoolAttr(causal));
 
   mlir::Value queryHeads =
-      buildHeadExpandedView(match, body->getArgument(0), queryLength, builder);
+      buildHeadExpandedView(match, query, queryLength, builder);
   mlir::Value keyHeads =
-      buildHeadExpandedView(match, body->getArgument(1), keyLength, builder);
+      buildHeadExpandedView(match, key, keyLength, builder);
 
   mlir::MLIRContext *context = builder.getContext();
   mlir::AffineExpr b = builder.getAffineDimExpr(0);
@@ -1204,12 +1186,12 @@ buildAttentionScoresRegion(TransformerBlockLowering &match, mlir::Value query,
               })
           .getResult(0);
 
-  builder.create<mlir::sculptor::YieldOp>(loc, scores);
-  return region.getResult(0);
+  scope.annotate();
+  return scores;
 }
 
 static mlir::Value
-buildAttentionSoftmaxRegion(TransformerBlockLowering &match, mlir::Value scores,
+buildAttentionSoftmaxStage(TransformerBlockLowering &match, mlir::Value scores,
                             int64_t queryLength, int64_t keyLength,
                             llvm::StringRef name, mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
@@ -1218,13 +1200,8 @@ buildAttentionSoftmaxRegion(TransformerBlockLowering &match, mlir::Value scores,
       match.elementType);
   mlir::RankedTensorType reduceTy = mlir::RankedTensorType::get(
       {match.batchSize, match.numHeads, queryLength, 1}, match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{scoreTy}, mlir::ValueRange{scores},
-      "digital.attention_softmax", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{scores});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.attention_softmax", name);
 
   mlir::Value negInf =
       buildF32Constant(builder, loc, -std::numeric_limits<float>::infinity());
@@ -1251,7 +1228,7 @@ buildAttentionSoftmaxRegion(TransformerBlockLowering &match, mlir::Value scores,
   mlir::Value maxValue =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, reduceTy, mlir::ValueRange{body->getArgument(0)},
+              loc, reduceTy, mlir::ValueRange{scores},
               mlir::ValueRange{maxFill},
               llvm::SmallVector<mlir::AffineMap, 2>{scoreMap, reduceMap},
               reduceIterators,
@@ -1270,7 +1247,7 @@ buildAttentionSoftmaxRegion(TransformerBlockLowering &match, mlir::Value scores,
   mlir::Value expValue =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, scoreTy, mlir::ValueRange{body->getArgument(0), maxValue},
+              loc, scoreTy, mlir::ValueRange{scores, maxValue},
               mlir::ValueRange{expInit},
               llvm::SmallVector<mlir::AffineMap, 3>{scoreMap, reduceMap,
                                                     scoreMap},
@@ -1323,12 +1300,12 @@ buildAttentionSoftmaxRegion(TransformerBlockLowering &match, mlir::Value scores,
               })
           .getResult(0);
 
-  builder.create<mlir::sculptor::YieldOp>(loc, probabilities);
-  return region.getResult(0);
+  scope.annotate();
+  return probabilities;
 }
 
 static mlir::Value
-buildAttentionApplyRegion(TransformerBlockLowering &match,
+buildAttentionApplyStage(TransformerBlockLowering &match,
                           mlir::Value probabilities, mlir::Value value,
                           int64_t queryLength, int64_t keyLength,
                           llvm::StringRef name, mlir::OpBuilder &builder) {
@@ -1336,18 +1313,12 @@ buildAttentionApplyRegion(TransformerBlockLowering &match,
   mlir::RankedTensorType headTy = mlir::RankedTensorType::get(
       {match.batchSize, match.numHeads, queryLength, match.headDim},
       match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{headTy}, mlir::ValueRange{probabilities, value},
-      "digital.attention_apply", builder.getStringAttr(name));
-  region->setAttr("head_dim", builder.getI64IntegerAttr(match.headDim));
-  mlir::Block *body =
-      addTaskRegionBody(region, mlir::ValueRange{probabilities, value});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.attention_apply", name);
+  scope.set("head_dim", builder.getI64IntegerAttr(match.headDim));
 
   mlir::Value valueHeads =
-      buildHeadExpandedView(match, body->getArgument(1), keyLength, builder);
+      buildHeadExpandedView(match, value, keyLength, builder);
   mlir::MLIRContext *context = builder.getContext();
   mlir::AffineExpr b = builder.getAffineDimExpr(0);
   mlir::AffineExpr h = builder.getAffineDimExpr(1);
@@ -1373,7 +1344,7 @@ buildAttentionApplyRegion(TransformerBlockLowering &match,
   mlir::Value heads =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, headTy, mlir::ValueRange{body->getArgument(0), valueHeads},
+              loc, headTy, mlir::ValueRange{probabilities, valueHeads},
               mlir::ValueRange{headFill},
               llvm::SmallVector<mlir::AffineMap, 3>{probabilityMap, valueMap,
                                                     headMap},
@@ -1388,11 +1359,11 @@ buildAttentionApplyRegion(TransformerBlockLowering &match,
               })
           .getResult(0);
 
-  builder.create<mlir::sculptor::YieldOp>(loc, heads);
-  return region.getResult(0);
+  scope.annotate();
+  return heads;
 }
 
-static mlir::Value buildHeadRecombineRegion(TransformerBlockLowering &match,
+static mlir::Value buildHeadRecombineStage(TransformerBlockLowering &match,
                                             mlir::Value heads,
                                             int64_t sequenceLength,
                                             llvm::StringRef name,
@@ -1400,13 +1371,8 @@ static mlir::Value buildHeadRecombineRegion(TransformerBlockLowering &match,
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType outputTy = mlir::RankedTensorType::get(
       {match.batchSize, sequenceLength, match.hiddenSize}, match.elementType);
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{outputTy}, mlir::ValueRange{heads},
-      "digital.head_recombine", builder.getStringAttr(name));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{heads});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.head_recombine", name);
 
   mlir::RankedTensorType transposedTy = mlir::RankedTensorType::get(
       {match.batchSize, sequenceLength, match.numHeads, match.headDim},
@@ -1415,7 +1381,7 @@ static mlir::Value buildHeadRecombineRegion(TransformerBlockLowering &match,
       loc, transposedTy.getShape(), transposedTy.getElementType());
   mlir::Value transposed = builder
                                .create<mlir::linalg::TransposeOp>(
-                                   loc, body->getArgument(0), transposeInit,
+                                   loc, heads, transposeInit,
                                    llvm::ArrayRef<int64_t>{0, 2, 1, 3})
                                ->getResult(0);
   llvm::SmallVector<mlir::ReassociationIndices, 3> reassociation = {
@@ -1425,25 +1391,19 @@ static mlir::Value buildHeadRecombineRegion(TransformerBlockLowering &match,
                                loc, outputTy, transposed, reassociation)
                            .getResult();
 
-  builder.create<mlir::sculptor::YieldOp>(loc, output);
-  return region.getResult(0);
+  scope.annotate();
+  return output;
 }
 
-static mlir::Value buildResidualAddRegion(TransformerBlockLowering &match,
+static mlir::Value buildResidualAddStage(TransformerBlockLowering &match,
                                           mlir::Value residual,
                                           mlir::Value update,
                                           llvm::StringRef name,
                                           mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   auto resultTy = llvm::cast<mlir::RankedTensorType>(residual.getType());
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{resultTy}, mlir::ValueRange{residual, update},
-      "digital.residual_add", builder.getStringAttr(name));
-  mlir::Block *body =
-      addTaskRegionBody(region, mlir::ValueRange{residual, update});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, "digital.residual_add", name);
 
   mlir::Value init = builder.create<EmptyOp>(loc, resultTy.getShape(),
                                              resultTy.getElementType());
@@ -1454,8 +1414,7 @@ static mlir::Value buildResidualAddRegion(TransformerBlockLowering &match,
   mlir::Value result =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, resultTy,
-              mlir::ValueRange{body->getArgument(0), body->getArgument(1)},
+              loc, resultTy, mlir::ValueRange{residual, update},
               mlir::ValueRange{init}, maps, iterators,
               [](mlir::OpBuilder &builder, mlir::Location nestedLoc,
                  mlir::ValueRange args) {
@@ -1464,11 +1423,11 @@ static mlir::Value buildResidualAddRegion(TransformerBlockLowering &match,
                 builder.create<mlir::linalg::YieldOp>(nestedLoc, sum);
               })
           .getResult(0);
-  builder.create<mlir::sculptor::YieldOp>(loc, result);
-  return region.getResult(0);
+  scope.annotate();
+  return result;
 }
 
-static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
+static mlir::Value buildLayerNormStage(TransformerBlockLowering &match,
                                         mlir::Value input, NormLowering &norm,
                                         llvm::StringRef name,
                                         mlir::OpBuilder &builder) {
@@ -1477,20 +1436,9 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
 
   mlir::Location loc = match.blockOp.getLoc();
   auto resultTy = llvm::cast<mlir::RankedTensorType>(input.getType());
-  llvm::SmallVector<mlir::Value> inputs = {input};
-  if (norm.weight) {
-    inputs.push_back(norm.weight);
-    inputs.push_back(norm.bias);
-  }
-
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{resultTy}, mlir::ValueRange(inputs),
-      "digital.layer_norm", builder.getStringAttr(name));
-  region->setAttr("epsilon", builder.getF64FloatAttr(match.layerNormEps));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange(inputs));
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.layer_norm",
+                                                name);
+  scope.set("epsilon", builder.getF64FloatAttr(match.layerNormEps));
 
   mlir::RankedTensorType reduceTy = mlir::RankedTensorType::get(
       {resultTy.getShape()[0], resultTy.getShape()[1], 1},
@@ -1521,7 +1469,7 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
   mlir::Value mean =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, reduceTy, mlir::ValueRange{body->getArgument(0)},
+              loc, reduceTy, mlir::ValueRange{input},
               mlir::ValueRange{meanFill},
               llvm::SmallVector<mlir::AffineMap, 2>{valueMap, reduceMap},
               reduceIterators,
@@ -1543,7 +1491,7 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
   mlir::Value variance =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, reduceTy, mlir::ValueRange{body->getArgument(0), mean},
+              loc, reduceTy, mlir::ValueRange{input, mean},
               mlir::ValueRange{varianceFill},
               llvm::SmallVector<mlir::AffineMap, 3>{valueMap, reduceMap,
                                                     reduceMap},
@@ -1566,15 +1514,16 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
       loc, resultTy.getShape(), resultTy.getElementType());
   llvm::SmallVector<mlir::AffineMap, 6> normMaps = {valueMap, reduceMap,
                                                     reduceMap};
-  llvm::SmallVector<mlir::Value> normInputs = {body->getArgument(0), mean,
-                                               variance};
+  llvm::SmallVector<mlir::Value> normInputs = {input, mean, variance};
   if (norm.weight) {
     mlir::AffineMap affineMap =
         mlir::AffineMap::get(/*dimCount=*/3, /*symbolCount=*/0, {h}, context);
     normMaps.push_back(affineMap);
-    normMaps.push_back(affineMap);
-    normInputs.push_back(body->getArgument(1));
-    normInputs.push_back(body->getArgument(2));
+    normInputs.push_back(norm.weight);
+    if (norm.bias) {
+      normMaps.push_back(affineMap);
+      normInputs.push_back(norm.bias);
+    }
   }
   normMaps.push_back(valueMap);
 
@@ -1584,6 +1533,7 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
               loc, resultTy, mlir::ValueRange(normInputs),
               mlir::ValueRange{normalizedInit}, normMaps, parallelIterators,
               [hasAffine = static_cast<bool>(norm.weight),
+               hasBias = static_cast<bool>(norm.bias),
                eps = match.layerNormEps](mlir::OpBuilder &builder,
                                          mlir::Location nestedLoc,
                                          mlir::ValueRange args) {
@@ -1600,30 +1550,27 @@ static mlir::Value buildLayerNormRegion(TransformerBlockLowering &match,
                 if (hasAffine) {
                   normalized = builder.create<mlir::arith::MulFOp>(
                       nestedLoc, normalized, args[3]);
+                }
+                if (hasBias) {
                   normalized = builder.create<mlir::arith::AddFOp>(
-                      nestedLoc, normalized, args[4]);
+                      nestedLoc, normalized, args[hasAffine ? 4 : 3]);
                 }
                 builder.create<mlir::linalg::YieldOp>(nestedLoc, normalized);
               })
           .getResult(0);
 
-  builder.create<mlir::sculptor::YieldOp>(loc, output);
-  return region.getResult(0);
+  scope.annotate();
+  return output;
 }
 
-static mlir::Value buildGELURegion(TransformerBlockLowering &match,
+static mlir::Value buildGELUStage(TransformerBlockLowering &match,
                                    mlir::Value input, llvm::StringRef name,
                                    mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   auto resultTy = llvm::cast<mlir::RankedTensorType>(input.getType());
-  auto region = builder.create<mlir::sculptor::TaskRegionOp>(
-      loc, mlir::TypeRange{resultTy}, mlir::ValueRange{input},
-      "digital.activation", builder.getStringAttr(name));
-  region->setAttr("activation", builder.getStringAttr("gelu"));
-  mlir::Block *body = addTaskRegionBody(region, mlir::ValueRange{input});
-
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.activation",
+                                                name);
+  scope.set("activation", builder.getStringAttr("gelu"));
 
   mlir::Value init = builder.create<EmptyOp>(loc, resultTy.getShape(),
                                              resultTy.getElementType());
@@ -1634,7 +1581,7 @@ static mlir::Value buildGELURegion(TransformerBlockLowering &match,
   mlir::Value activated =
       builder
           .create<mlir::linalg::GenericOp>(
-              loc, resultTy, mlir::ValueRange{body->getArgument(0)},
+              loc, resultTy, mlir::ValueRange{input},
               mlir::ValueRange{init}, maps, iterators,
               [](mlir::OpBuilder &builder, mlir::Location nestedLoc,
                  mlir::ValueRange args) {
@@ -1656,8 +1603,8 @@ static mlir::Value buildGELURegion(TransformerBlockLowering &match,
               })
           .getResult(0);
 
-  builder.create<mlir::sculptor::YieldOp>(loc, activated);
-  return region.getResult(0);
+  scope.annotate();
+  return activated;
 }
 
 static mlir::Value buildSelfAttentionSection(TransformerBlockLowering &match,
@@ -1667,27 +1614,27 @@ static mlir::Value buildSelfAttentionSection(TransformerBlockLowering &match,
       match, input, match.qkv, match.hiddenSize, match.hiddenSize * 3,
       match.sequenceLength, "transformer_block_qkv", builder);
   llvm::SmallVector<mlir::Value, 3> qkvParts =
-      buildQKVSplitRegion(match, qkv, "transformer_block_qkv_split", builder);
-  mlir::Value scores = buildAttentionScoresRegion(
+      buildQKVSplitStage(match, qkv, "transformer_block_qkv_split", builder);
+  mlir::Value scores = buildAttentionScoresStage(
       match, qkvParts[0], qkvParts[1], match.sequenceLength,
       match.sequenceLength, causal, "transformer_block_self_attention_scores",
       builder);
-  mlir::Value probabilities = buildAttentionSoftmaxRegion(
+  mlir::Value probabilities = buildAttentionSoftmaxStage(
       match, scores, match.sequenceLength, match.sequenceLength,
       "transformer_block_self_attention_softmax", builder);
-  mlir::Value headValues = buildAttentionApplyRegion(
+  mlir::Value headValues = buildAttentionApplyStage(
       match, probabilities, qkvParts[2], match.sequenceLength,
       match.sequenceLength, "transformer_block_self_attention_apply", builder);
-  mlir::Value attention = buildHeadRecombineRegion(
+  mlir::Value attention = buildHeadRecombineStage(
       match, headValues, match.sequenceLength,
       "transformer_block_self_head_recombine", builder);
   mlir::Value outputProjection = buildSequenceProjection(
       match, attention, match.attnOutput, match.hiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_attn_output", builder);
-  mlir::Value residual = buildResidualAddRegion(
+  mlir::Value residual = buildResidualAddStage(
       match, input, outputProjection,
       "transformer_block_self_attn_residual_add", builder);
-  return buildLayerNormRegion(match, residual, match.attnNorm,
+  return buildLayerNormStage(match, residual, match.attnNorm,
                               "transformer_block_attn_norm", builder);
 }
 
@@ -1695,30 +1642,30 @@ static mlir::Value
 buildPreNormSelfAttentionSection(TransformerBlockLowering &match,
                                  mlir::Value input, bool causal,
                                  mlir::OpBuilder &builder) {
-  mlir::Value normalized = buildLayerNormRegion(
+  mlir::Value normalized = buildLayerNormStage(
       match, input, match.attnNorm, "transformer_block_attn_norm", builder);
   mlir::Value qkv = buildSequenceProjection(
       match, normalized, match.qkv, match.hiddenSize, match.hiddenSize * 3,
       match.sequenceLength, "transformer_block_qkv", builder);
   llvm::SmallVector<mlir::Value, 3> qkvParts =
-      buildQKVSplitRegion(match, qkv, "transformer_block_qkv_split", builder);
-  mlir::Value scores = buildAttentionScoresRegion(
+      buildQKVSplitStage(match, qkv, "transformer_block_qkv_split", builder);
+  mlir::Value scores = buildAttentionScoresStage(
       match, qkvParts[0], qkvParts[1], match.sequenceLength,
       match.sequenceLength, causal, "transformer_block_self_attention_scores",
       builder);
-  mlir::Value probabilities = buildAttentionSoftmaxRegion(
+  mlir::Value probabilities = buildAttentionSoftmaxStage(
       match, scores, match.sequenceLength, match.sequenceLength,
       "transformer_block_self_attention_softmax", builder);
-  mlir::Value headValues = buildAttentionApplyRegion(
+  mlir::Value headValues = buildAttentionApplyStage(
       match, probabilities, qkvParts[2], match.sequenceLength,
       match.sequenceLength, "transformer_block_self_attention_apply", builder);
-  mlir::Value attention = buildHeadRecombineRegion(
+  mlir::Value attention = buildHeadRecombineStage(
       match, headValues, match.sequenceLength,
       "transformer_block_self_head_recombine", builder);
   mlir::Value outputProjection = buildSequenceProjection(
       match, attention, match.attnOutput, match.hiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_attn_output", builder);
-  return buildResidualAddRegion(match, input, outputProjection,
+  return buildResidualAddStage(match, input, outputProjection,
                                 "transformer_block_self_attn_residual_add",
                                 builder);
 }
@@ -1733,27 +1680,27 @@ static mlir::Value buildCrossAttentionSection(TransformerBlockLowering &match,
       match, match.blockOp.getMemory(), match.crossKeyValue, match.hiddenSize,
       match.hiddenSize * 2, match.memoryLength,
       "transformer_block_cross_key_value", builder);
-  llvm::SmallVector<mlir::Value, 2> kvParts = buildCrossKVSplitRegion(
+  llvm::SmallVector<mlir::Value, 2> kvParts = buildCrossKVSplitStage(
       match, keyValue, "transformer_block_cross_kv_split", builder);
-  mlir::Value scores = buildAttentionScoresRegion(
+  mlir::Value scores = buildAttentionScoresStage(
       match, query, kvParts[0], match.sequenceLength, match.memoryLength,
       /*causal=*/false, "transformer_block_cross_attention_scores", builder);
-  mlir::Value probabilities = buildAttentionSoftmaxRegion(
+  mlir::Value probabilities = buildAttentionSoftmaxStage(
       match, scores, match.sequenceLength, match.memoryLength,
       "transformer_block_cross_attention_softmax", builder);
-  mlir::Value headValues = buildAttentionApplyRegion(
+  mlir::Value headValues = buildAttentionApplyStage(
       match, probabilities, kvParts[1], match.sequenceLength,
       match.memoryLength, "transformer_block_cross_attention_apply", builder);
-  mlir::Value attention = buildHeadRecombineRegion(
+  mlir::Value attention = buildHeadRecombineStage(
       match, headValues, match.sequenceLength,
       "transformer_block_cross_head_recombine", builder);
   mlir::Value outputProjection = buildSequenceProjection(
       match, attention, match.crossOutput, match.hiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_cross_output", builder);
-  mlir::Value residual = buildResidualAddRegion(
+  mlir::Value residual = buildResidualAddStage(
       match, decoderState, outputProjection,
       "transformer_block_cross_attn_residual_add", builder);
-  return buildLayerNormRegion(match, residual, match.crossNorm,
+  return buildLayerNormStage(match, residual, match.crossNorm,
                               "transformer_block_cross_norm", builder);
 }
 
@@ -1764,30 +1711,30 @@ static mlir::Value buildMLPSection(TransformerBlockLowering &match,
       match, input, match.mlpUp, match.hiddenSize, match.mlpHiddenSize,
       match.sequenceLength, "transformer_block_mlp_up", builder);
   mlir::Value activated =
-      buildGELURegion(match, up, "transformer_block_mlp_gelu", builder);
+      buildGELUStage(match, up, "transformer_block_mlp_gelu", builder);
   mlir::Value down = buildSequenceProjection(
       match, activated, match.mlpDown, match.mlpHiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_mlp_down", builder);
-  mlir::Value residual = buildResidualAddRegion(
+  mlir::Value residual = buildResidualAddStage(
       match, input, down, "transformer_block_mlp_residual_add", builder);
-  return buildLayerNormRegion(match, residual, match.mlpNorm,
+  return buildLayerNormStage(match, residual, match.mlpNorm,
                               "transformer_block_mlp_norm", builder);
 }
 
 static mlir::Value buildPreNormMLPSection(TransformerBlockLowering &match,
                                           mlir::Value input,
                                           mlir::OpBuilder &builder) {
-  mlir::Value normalized = buildLayerNormRegion(
+  mlir::Value normalized = buildLayerNormStage(
       match, input, match.mlpNorm, "transformer_block_mlp_norm", builder);
   mlir::Value up = buildSequenceProjection(
       match, normalized, match.mlpUp, match.hiddenSize, match.mlpHiddenSize,
       match.sequenceLength, "transformer_block_mlp_up", builder);
   mlir::Value activated =
-      buildGELURegion(match, up, "transformer_block_mlp_gelu", builder);
+      buildGELUStage(match, up, "transformer_block_mlp_gelu", builder);
   mlir::Value down = buildSequenceProjection(
       match, activated, match.mlpDown, match.mlpHiddenSize, match.hiddenSize,
       match.sequenceLength, "transformer_block_mlp_down", builder);
-  return buildResidualAddRegion(match, input, down,
+  return buildResidualAddStage(match, input, down,
                                 "transformer_block_mlp_residual_add", builder);
 }
 
@@ -1909,12 +1856,27 @@ static void eraseDeadTopLevelOps(mlir::func::FuncOp func,
   }
 }
 
+static void annotateGeneratedOperations(mlir::Operation *first,
+                                        mlir::Operation *end,
+                                        NNTransformerBlockOp blockOp) {
+  for (mlir::Operation *op = first; op && op != end; op = op->getNextNode()) {
+    if (!op->hasAttr("sculptor.semantic.block_index"))
+      op->setAttr("sculptor.semantic.block_index", blockOp.getBlockIndexAttr());
+    if (!op->hasAttr("sculptor.semantic.block_kind"))
+      op->setAttr("sculptor.semantic.block_kind",
+                  getSemanticBlockKindAttr(blockOp));
+  }
+}
+
 static mlir::LogicalResult
-lowerTransformerBlockToMVM(mlir::func::FuncOp func,
-                           mlir::RewriterBase &rewriter) {
-  auto match = matchExtractedTransformerBlock(func);
+decomposeTransformerBlock(NNTransformerBlockOp blockOp,
+                          mlir::RewriterBase &rewriter) {
+  auto match = matchTransformerBlock(blockOp);
   if (mlir::failed(match))
     return mlir::failure();
+
+  auto parentFunc = blockOp->getParentOfType<mlir::func::FuncOp>();
+  mlir::Operation *previous = blockOp->getPrevNode();
 
   rewriter.setInsertionPoint(match->blockOp);
   if (mlir::failed(materializeProjectionOperands(*match, rewriter)))
@@ -1932,14 +1894,32 @@ lowerTransformerBlockToMVM(mlir::func::FuncOp func,
       state = buildCrossAttentionSection(*match, state, rewriter);
     state = buildMLPSection(*match, state, rewriter);
   }
-  state = buildLayerNormRegion(*match, state, match->finalNorm,
+  state = buildLayerNormStage(*match, state, match->finalNorm,
                                "transformer_block_final_norm", rewriter);
 
+  mlir::Operation *first =
+      previous ? previous->getNextNode() : &*blockOp->getBlock()->begin();
+  annotateGeneratedOperations(first, blockOp, blockOp);
   match->blockOp.getOutput().replaceAllUsesWith(state);
   rewriter.eraseOp(match->blockOp);
   eraseUnusedProjectionBiases(*match, rewriter);
-  eraseDeadTopLevelOps(func, rewriter);
+  if (parentFunc)
+    eraseDeadTopLevelOps(parentFunc, rewriter);
   return mlir::success();
+}
+
+static mlir::LogicalResult
+lowerExtractedTransformerBlockToMVM(mlir::func::FuncOp func,
+                                    mlir::RewriterBase &rewriter) {
+  auto blockOp = matchSingleTransformerBlockOp(func);
+  if (mlir::failed(blockOp))
+    return mlir::failure();
+
+  TransformerBlockLowering signature;
+  signature.blockKind = blockOp->getBlockKind();
+  if (mlir::failed(matchBlockFunctionSignature(func, *blockOp, signature)))
+    return mlir::failure();
+  return decomposeTransformerBlock(*blockOp, rewriter);
 }
 
 class TransformerBlockConverter : public mlir::sculptor::LayerToMVMConverter {
@@ -1948,7 +1928,7 @@ public:
 
   void lowerToMVM(mlir::func::FuncOp func) const override {
     mlir::IRRewriter rewriter(func.getContext());
-    (void)lowerTransformerBlockToMVM(func, rewriter);
+    (void)lowerExtractedTransformerBlockToMVM(func, rewriter);
   }
 };
 
@@ -1956,6 +1936,20 @@ public:
 
 namespace mlir {
 namespace sculptor {
+
+LogicalResult decomposeInlineTransformerBlocks(func::FuncOp func) {
+  SmallVector<NNTransformerBlockOp> blocks;
+  func.walk([&](NNTransformerBlockOp block) { blocks.push_back(block); });
+
+  IRRewriter rewriter(func.getContext());
+  for (NNTransformerBlockOp block : blocks) {
+    if (!block || !block->getBlock())
+      continue;
+    if (failed(decomposeTransformerBlock(block, rewriter)))
+      return block.emitOpError("failed to decompose inline Transformer block");
+  }
+  return success();
+}
 
 void registerTransformerBlockConverter(LayerToMVMConverters &converters,
                                        LayerToMVMConverterMap &converterMap,

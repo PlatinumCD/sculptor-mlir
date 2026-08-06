@@ -33,9 +33,10 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Design: design.md
-  - Walkthrough: walkthrough.md
-  - Placement: placement.md
-  - Island Formation: island-formation.md
-  - Timing: timing.md
+  - Architecture: design.md
+  - Pass Pipeline: passes.md
+  - Mapping and RA Tree: mapping.md
+  - Runtime and Tile ABI: runtime.md
+  - Testing and Validation: testing.md
+  - Development Guide: development.md
   - GitHub: https://github.com/PlatinumCD/sculptor-mlir

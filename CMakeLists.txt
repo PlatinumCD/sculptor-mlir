@@ -11,24 +11,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(SCULPTOR_MLIR_BUILD_RUNTIME "Build Sculptor runtime libraries" ON)
+option(SCULPTOR_MLIR_BUILD_RUNTIME_TESTS
+       "Build host tests for the Sculptor runtime" OFF)
 
-find_package(Git QUIET)
-set(SCULPTOR_COMPILER_REVISION "${PROJECT_VERSION}")
-if(GIT_FOUND)
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} rev-parse --verify HEAD
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    RESULT_VARIABLE SCULPTOR_GIT_REVISION_RESULT
-    OUTPUT_VARIABLE SCULPTOR_GIT_REVISION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-  if(SCULPTOR_GIT_REVISION_RESULT EQUAL 0)
-    set(SCULPTOR_COMPILER_REVISION "${SCULPTOR_GIT_REVISION}")
-  endif()
+if(SCULPTOR_MLIR_BUILD_RUNTIME_TESTS)
+  enable_testing()
 endif()
-set(SCULPTOR_COMPILER_REVISION "${SCULPTOR_COMPILER_REVISION}" CACHE STRING
-    "Revision recorded in Sculptor timing-model provenance")
 
 find_package(MLIR REQUIRED CONFIG)
 message(STATUS "Found MLIR at: ${MLIR_DIR}")
@@ -52,7 +40,6 @@ include_directories(SYSTEM
 add_definitions(${LLVM_DEFINITIONS})
 
 include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/include)
-include_directories(${PROJECT_SOURCE_DIR}/runtime/common/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 
 # Put all executables in <build>/bin and libraries in <build>/lib.

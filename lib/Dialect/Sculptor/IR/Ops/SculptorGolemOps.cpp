@@ -60,7 +60,29 @@ mlir::LogicalResult mlir::sculptor::ArrayLoadOp::verify() {
   return verifyLeadingDimEquals(*this, vectorType, 1, "vector");
 }
 
+mlir::LogicalResult mlir::sculptor::ArrayExecuteOp::verify() {
+  auto load = getLoaded().getDefiningOp<ArrayLoadOp>();
+  if (!load)
+    return emitOpError("expected loaded token produced by sculptor.array.load");
+
+  if (load.getArray() != getArray()) {
+    return emitOpError(
+        "expected loaded token and array operand to reference the same array");
+  }
+
+  return success();
+}
+
 mlir::LogicalResult mlir::sculptor::ArrayStoreOp::verify() {
+  auto execute = getInput().getDefiningOp<ArrayExecuteOp>();
+  if (!execute)
+    return emitOpError("expected input produced by sculptor.array.execute");
+
+  if (execute.getArray() != getArray()) {
+    return emitOpError(
+        "expected input and array operand to reference the same array");
+  }
+
   RankedTensorType outputType = getOutput().getType();
 
   if (failed(verifyStaticRank2F32Tensor(*this, outputType, "output")))

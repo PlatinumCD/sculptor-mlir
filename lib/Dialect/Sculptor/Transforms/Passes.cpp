@@ -1,54 +1,42 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Passes.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/AnalyzeTaskGraphTiming.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/AssembleTaskGraph.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/BalanceTaskGraphReductions.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildTaskGraphIslands.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/ApplyMappingPlan.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/BuildRATree.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/CanonicalizeLayers.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ConvertLayers.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/DistributeDigitalMatmul.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphIslandMap.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphSimModel.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExportTaskGraphVis.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractCoreModule.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExpandDigitalWork.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTaskGraphResources.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/FuseTaskGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractTileModule.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTileRuntimeGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/DuplicateMatrices.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Golem/ExpandMVMToGolem.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/LowerScheduledMVMToDigital.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTasks.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/OptimizeTaskGraph.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/PartitionTaskGraphByCore.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/PlanCoreScratchpad.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/ScheduleTaskGraph.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/VectorizeMarkedElementwise.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/MaterializeTileRuntimeGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/OutlineTileRoutines.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PlaceLogicalTiles.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PlanTileScratchpad.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/PlanMapping.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/planners/MappingPlannerRegistry.h"
 
 namespace mlir {
 namespace sculptor {
 
 // Registers the transform pass bundle exposed by this library entry point.
 void registerSculptorPasses() {
-  registerAnalyzeTaskGraphTimingPass();
-  registerAssembleTaskGraphPass();
-  registerBalanceTaskGraphReductionsPass();
-  registerBuildTaskGraphIslandsPass();
+  mapping::registerMappingPlanners();
+  registerApplyMappingPlanPass();
+  registerBuildRATreePass();
   registerCanonicalizeLayersPass();
   registerConvertLayersPass();
-  registerDistributeDigitalMatmulPass();
-  registerExportTaskGraphIslandMapPass();
-  registerExportTaskGraphSimModelPass();
-  registerExportTaskGraphVisPass();
+  registerExpandDigitalWorkPass();
+  registerDuplicateMatricesPass();
   registerExpandMVMToGolemPass();
-  registerExtractCoreModulePass();
+  registerExtractTileModulePass();
   registerExtractLayersPass();
-  registerFinalizeTaskGraphResourcesPass();
-  registerFuseTaskGraphPass();
-  registerLowerScheduledMVMToDigitalPass();
-  registerMaterializeTasksPass();
-  registerOptimizeTaskGraphPass();
-  registerPartitionTaskGraphByCorePass();
-  registerPlanCoreScratchpadPass();
-  registerScheduleTaskGraphPass();
-  registerVectorizeMarkedElementwisePass();
+  registerFinalizeTileRuntimeGraphPass();
+  registerMaterializeTileRuntimeGraphPass();
+  registerOutlineTileRoutinesPass();
+  registerPlaceLogicalTilesPass();
+  registerPlanTileScratchpadPass();
+  registerPlanMappingPass();
 }
 
 } // namespace sculptor

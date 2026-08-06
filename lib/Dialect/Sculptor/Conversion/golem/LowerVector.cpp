@@ -123,7 +123,8 @@ public:
         rewriter, op.getLoc(), mlir::sculptor::golem::kLoadShimName,
         {vectorMemref, *localArrayId});
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOpWithMultiple(
+        op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange{}});
     return mlir::success();
   }
 };

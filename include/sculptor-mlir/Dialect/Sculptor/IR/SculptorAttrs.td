@@ -41,193 +41,432 @@ def Sculptor_TaskReductionAttr
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-def Sculptor_MatmulDistributionStrategyOutputColumns
-    : I32EnumAttrCase<"OutputColumns", 0, "output_columns">;
-def Sculptor_MatmulDistributionStrategyOutputRows
-    : I32EnumAttrCase<"OutputRows", 1, "output_rows">;
-def Sculptor_MatmulDistributionStrategyTwoDimensional
-    : I32EnumAttrCase<"TwoDimensional", 2, "two_dimensional">;
-def Sculptor_MatmulDistributionStrategyAttentionHeads
-    : I32EnumAttrCase<"AttentionHeads", 3, "attention_heads">;
+def Sculptor_RATreeNodeKindSpatialCut
+    : I32EnumAttrCase<"SpatialCut", 0, "spatial_cut">;
+def Sculptor_RATreeNodeKindTemporalCut
+    : I32EnumAttrCase<"TemporalCut", 1, "temporal_cut">;
+def Sculptor_RATreeNodeKindLeaf
+    : I32EnumAttrCase<"Leaf", 2, "leaf">;
 
-def Sculptor_MatmulDistributionStrategy
-    : I32EnumAttr<"MatmulDistributionStrategy",
-                  "Digital matmul distribution strategy", [
-        Sculptor_MatmulDistributionStrategyOutputColumns,
-        Sculptor_MatmulDistributionStrategyOutputRows,
-        Sculptor_MatmulDistributionStrategyTwoDimensional,
-        Sculptor_MatmulDistributionStrategyAttentionHeads
+def Sculptor_RATreeNodeKind
+    : I32EnumAttr<"RATreeNodeKind", "Resource Allocation Tree node kind", [
+        Sculptor_RATreeNodeKindSpatialCut,
+        Sculptor_RATreeNodeKindTemporalCut,
+        Sculptor_RATreeNodeKindLeaf
       ]> {
   let cppNamespace = "::mlir::sculptor";
 }
 
-def Sculptor_DistributionPlacementPolicyUnconstrained
-    : I32EnumAttrCase<"Unconstrained", 0, "unconstrained">;
-def Sculptor_DistributionPlacementPolicyPreferDistinct
-    : I32EnumAttrCase<"PreferDistinct", 1, "prefer_distinct">;
-def Sculptor_DistributionPlacementPolicyRequireDistinct
-    : I32EnumAttrCase<"RequireDistinct", 2, "require_distinct">;
-
-def Sculptor_DistributionPlacementPolicy
-    : I32EnumAttr<"DistributionPlacementPolicy",
-                  "Placement policy for a distributed task group", [
-        Sculptor_DistributionPlacementPolicyUnconstrained,
-        Sculptor_DistributionPlacementPolicyPreferDistinct,
-        Sculptor_DistributionPlacementPolicyRequireDistinct
-      ]> {
-  let cppNamespace = "::mlir::sculptor";
-}
-
-def Sculptor_TaskDistributionRolePartition
-    : I32EnumAttrCase<"Partition", 0, "partition">;
-def Sculptor_TaskDistributionRoleShard
-    : I32EnumAttrCase<"Shard", 1, "shard">;
-def Sculptor_TaskDistributionRoleAssembly
-    : I32EnumAttrCase<"Assembly", 2, "assembly">;
-
-def Sculptor_TaskDistributionRole
-    : I32EnumAttr<"TaskDistributionRole",
-                  "Role of a task in a distributed operation", [
-        Sculptor_TaskDistributionRolePartition,
-        Sculptor_TaskDistributionRoleShard,
-        Sculptor_TaskDistributionRoleAssembly
-      ]> {
-  let cppNamespace = "::mlir::sculptor";
-}
-
-def Sculptor_TaskDistributionAttr
-    : Sculptor_Attr<"TaskDistribution", "task_distribution"> {
-  let summary = "digital task distribution metadata";
+def Sculptor_MappingWorkUnitAttr
+    : Sculptor_Attr<"MappingWorkUnit", "mapping_work_unit"> {
+  let summary = "one statically bounded tile of a compute operation";
   let description = [{
-    Identifies the tasks introduced when one digital operation is partitioned
-    into independently placeable shards. The group and shard coordinates are
-    stable logical identities; physical core assignment remains a scheduler
-    decision.
+    Identifies one result tile selected by a mapping planner and the
+    corresponding iteration-domain tile. All offsets and sizes are static.
+    The work unit remains declarative until a mapping-application pass invokes
+    the operation's TilingInterface implementation.
   }];
   let parameters = (ins
-    "IntegerAttr":$groupId,
-    EnumParameter<Sculptor_TaskDistributionRole>:$role,
-    "IntegerAttr":$shardId,
-    "IntegerAttr":$shardCount,
-    "IntegerAttr":$rowShard,
-    "IntegerAttr":$rowShards,
-    "IntegerAttr":$columnShard,
-    "IntegerAttr":$columnShards,
-    EnumParameter<Sculptor_MatmulDistributionStrategy>:$strategy,
-    EnumParameter<Sculptor_DistributionPlacementPolicy>:$placement
+    "IntegerAttr":$id,
+    "IntegerAttr":$operationId,
+    "IntegerAttr":$resultNumber,
+    "ArrayAttr":$resultOffsets,
+    "ArrayAttr":$resultSizes,
+    "ArrayAttr":$iterationOffsets,
+    "ArrayAttr":$iterationSizes
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-def Sculptor_TimingModelAttr
-    : Sculptor_Attr<"TimingModel", "timing_model"> {
-  let summary = "hardware timing model used for task graph analysis";
+def Sculptor_MappingWorkUnitEdgeAttr
+    : Sculptor_Attr<"MappingWorkUnitEdge", "mapping_work_unit_edge"> {
+  let summary = "an exact dependency between mapping work units";
+  let description = [{
+    Refines one operation-level compute-graph dependency to identify the
+    producer and consumer work units that actually communicate. A work-unit
+    ID of -1 denotes an operation-wide endpoint. The operation-level DAG
+    remains the fallback for dependency pairs with no explicit refinement.
+  }];
   let parameters = (ins
-    "StringAttr":$costModel,
-    "IntegerAttr":$costModelRevision,
-    "StringAttr":$compilerRevision,
-    "StringAttr":$timingBoundary,
-    "StringAttr":$runtimeTaskPolicy,
-    "StringAttr":$runtimeTransmitPolicy,
-    "StringAttr":$memoryBackend,
-    "IntegerAttr":$analogMVMLatencyNs,
-    "IntegerAttr":$analogIOBitsPerCycle,
-    "BoolAttr":$analogIOShared,
-    "FloatAttr":$digitalClockGHz,
-    "IntegerAttr":$digitalIssueWidth,
-    "IntegerAttr":$digitalVectorBitsPerCycle,
-    "IntegerAttr":$fixedRuntimeDispatchCycles,
-    "IntegerAttr":$fixedTaskEntryCycles,
-    "IntegerAttr":$fixedTaskExitCycles,
-    "IntegerAttr":$networkLinkBitsPerCycle,
-    "IntegerAttr":$networkHopLatencyCycles,
-    "BoolAttr":$networkPipelined,
-    "IntegerAttr":$networkLinkWordBits,
-    "IntegerAttr":$protocolWordsPerRoute,
-    "IntegerAttr":$nicInjectionWordsPerCycle,
-    "IntegerAttr":$rxDmaWordsPerCycle,
-    "StringAttr":$routingPolicy
+    "IntegerAttr":$sourceOperationId,
+    "IntegerAttr":$sourceWorkUnitId,
+    "IntegerAttr":$targetOperationId,
+    "IntegerAttr":$targetWorkUnitId,
+    "IntegerAttr":$byteSize
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-def Sculptor_IslandTimingAttr
-    : Sculptor_Attr<"IslandTiming", "island_timing"> {
-  let summary = "timing profile for one logical placement island";
-  let parameters = (ins
-    "IntegerAttr":$islandId,
-    "IntegerAttr":$taskCount,
-    "FloatAttr":$totalWorkNs,
-    "FloatAttr":$analogWorkNs,
-    "FloatAttr":$digitalWorkNs,
-    "FloatAttr":$earliestStartNs,
-    "FloatAttr":$earliestFinishNs,
-    "FloatAttr":$criticalPathRemainingNs,
-    "FloatAttr":$slackNs,
-    "BoolAttr":$isCritical
-  );
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-def Sculptor_TimedIslandEdgeAttr
-    : Sculptor_Attr<"TimedIslandEdge", "timed_island_edge"> {
-  let summary = "timing profile for one directed island dependency";
-  let parameters = (ins
-    "IntegerAttr":$producerIsland,
-    "IntegerAttr":$consumerIsland,
-    "IntegerAttr":$bytes,
-    "FloatAttr":$estimatedTransferNsPerHop,
-    "FloatAttr":$estimatedAdditionalHopNs,
-    "FloatAttr":$criticality,
-    "FloatAttr":$producerReadyTimeNs,
-    "FloatAttr":$consumerTimingPressure
-  );
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-def Sculptor_NetworkEdgeTimingAttr
-    : Sculptor_Attr<"NetworkEdgeTiming", "network_edge_timing"> {
-  let summary = "placement-aware timing for one task graph network edge";
-  let parameters = (ins
-    "IntegerAttr":$producerTask,
-    "IntegerAttr":$consumerTask,
-    "IntegerAttr":$sourceCore,
-    "IntegerAttr":$destinationCore,
-    "IntegerAttr":$meshHops,
-    "IntegerAttr":$payloadWords,
-    "IntegerAttr":$protocolWords,
-    "FloatAttr":$transferStartNs,
-    "FloatAttr":$injectionStartNs,
-    "FloatAttr":$injectionFinishNs,
-    "FloatAttr":$routeArrivalNs,
-    "FloatAttr":$receiveStartNs,
-    "FloatAttr":$receiveCompleteNs,
-    "FloatAttr":$transferFinishNs,
-    "FloatAttr":$networkLatencyNs,
-    "FloatAttr":$contentionDelayNs,
-    "FloatAttr":$nicQueueDelayNs,
-    "FloatAttr":$linkQueueDelayNs,
-    "FloatAttr":$receiveQueueDelayNs,
-    "IntegerAttr":$causalParentTask,
-    "IntegerAttr":$causalParentEdge,
-    "StringAttr":$causalResource
-  );
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-def Sculptor_CausalTimingEventAttr
-    : Sculptor_Attr<"CausalTimingEvent", "causal_timing_event"> {
-  let summary = "one event on the causal deployment critical chain";
+def Sculptor_RATreeNodeAttr
+    : Sculptor_Attr<"RATreeNode", "ra_tree_node"> {
+  let summary = "one structural Resource Allocation Tree node";
+  let description = [{
+    Describes one node in an unevaluated Resource Allocation Tree. Parent,
+    child, and operation references use deterministic integer IDs. A value of
+    -1 denotes an inapplicable parent or operation. Only leaves reference
+    operations.
+  }];
   let parameters = (ins
     "IntegerAttr":$id,
-    "StringAttr":$kind,
-    "IntegerAttr":$taskIndex,
-    "IntegerAttr":$edgeIndex,
-    "IntegerAttr":$coreId,
+    EnumParameter<Sculptor_RATreeNodeKind>:$kind,
+    "IntegerAttr":$parentId,
+    "ArrayAttr":$childIds,
+    "IntegerAttr":$operationId,
+    "IntegerAttr":$workUnitId,
+    "IntegerAttr":$workGroupCount
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_RATreeAttr
+    : Sculptor_Attr<"RATree", "ra_tree"> {
+  let summary = "structural Resource Allocation Tree for one compute graph";
+  let description = [{
+    Stores a deterministic structural RA Tree over supported compute
+    operations. These include generic structured MLIR operations and explicit
+    backend-neutral Sculptor primitives such as sculptor.mvm. The computation
+    DAG is deliberately not copied into this attribute; later passes rebuild
+    it from SSA and validate the graph fingerprint.
+  }];
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "IntegerAttr":$rootId,
+    "ArrayAttr":$nodes,
+    "ArrayAttr":$workUnits,
+    "ArrayAttr":$workUnitEdges,
+    "IntegerAttr":$operationCount,
+    "IntegerAttr":$tensorCount,
+    "StringAttr":$graphFingerprint
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingPlanObjectiveLatency
+    : I32EnumAttrCase<"Latency", 0, "latency">;
+
+def Sculptor_MappingPlanObjective
+    : I32EnumAttr<"MappingPlanObjective", "Mapping plan objective", [
+        Sculptor_MappingPlanObjectiveLatency
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_RATreeNodeEvaluationAttr
+    : Sculptor_Attr<"RATreeNodeEvaluation", "ra_tree_node_evaluation"> {
+  let summary = "reference evaluation for one Resource Allocation Tree node";
+  let parameters = (ins
+    "IntegerAttr":$nodeId,
+    "BoolAttr":$feasible,
+    "FloatAttr":$estimatedLatencyNs,
+    "IntegerAttr":$crossingBytes,
+    "FloatAttr":$estimatedCommunicationNs,
+    "IntegerAttr":$requiredResourceUnits,
+    "IntegerAttr":$pipelineStages,
+    "StringAttr":$infeasibilityReason
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingCandidateEvaluationAttr
+    : Sculptor_Attr<"MappingCandidateEvaluation",
+                    "mapping_candidate_evaluation"> {
+  let summary = "root evaluation summary for one mapping candidate";
+  let parameters = (ins
+    "StringAttr":$name,
+    "BoolAttr":$selected,
+    "BoolAttr":$feasible,
+    "FloatAttr":$estimatedLatencyNs,
+    "IntegerAttr":$crossingBytes,
+    "FloatAttr":$estimatedCommunicationNs,
+    "IntegerAttr":$requiredResourceUnits,
+    "IntegerAttr":$pipelineStages,
+    "StringAttr":$infeasibilityReason
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingLaneKindDigital
+    : I32EnumAttrCase<"Digital", 0, "digital">;
+def Sculptor_MappingLaneKindAnalog
+    : I32EnumAttrCase<"Analog", 1, "analog">;
+
+def Sculptor_MappingLaneKind
+    : I32EnumAttr<"MappingLaneKind", "Realized logical lane kind", [
+        Sculptor_MappingLaneKindDigital,
+        Sculptor_MappingLaneKindAnalog
+      ]> {
+  let cppNamespace = "::mlir::sculptor";
+}
+
+def Sculptor_MappingNodeAllocationAttr
+    : Sculptor_Attr<"MappingNodeAllocation", "mapping_node_allocation"> {
+  let summary = "logical resources inherited by one RA-tree node";
+  let parameters = (ins
+    "IntegerAttr":$nodeId,
+    "ArrayAttr":$digitalTileIds,
+    "ArrayAttr":$analogTileIds,
+    "ArrayAttr":$analogLaneIndices
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingLeafAssignmentAttr
+    : Sculptor_Attr<"MappingLeafAssignment", "mapping_leaf_assignment"> {
+  let summary = "realized logical tile and lane assignment for one RA leaf";
+  let parameters = (ins
+    "IntegerAttr":$leafId,
+    "IntegerAttr":$operationId,
+    "IntegerAttr":$tileId,
+    EnumParameter<Sculptor_MappingLaneKind>:$laneKind,
+    "IntegerAttr":$laneIndex,
     "FloatAttr":$startNs,
-    "FloatAttr":$finishNs,
-    "IntegerAttr":$parentEvent,
-    "StringAttr":$resource
+    "FloatAttr":$finishNs
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingRealizationAttr
+    : Sculptor_Attr<"MappingRealization", "mapping_realization"> {
+  let summary = "explicit logical-tile realization of an RA tree";
+  let description = [{
+    Records the logical tile and lane resources inherited by every RA-tree
+    node and the concrete lane assigned to every leaf. It remains independent
+    of physical mesh coordinates and runtime core identities.
+  }];
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "IntegerAttr":$logicalTileCount,
+    "IntegerAttr":$analogLanesPerTile,
+    "ArrayAttr":$digitalWorkPerTile,
+    "ArrayAttr":$nodeAllocations,
+    "ArrayAttr":$leafAssignments
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileAssignmentAttr
+    : Sculptor_Attr<"LogicalTileAssignment", "logical_tile_assignment"> {
+  let summary = "RA leaf assignment retained by one logical tile";
+  let parameters = (ins
+    "IntegerAttr":$leafId,
+    "IntegerAttr":$operationId,
+    "IntegerAttr":$workUnitId,
+    EnumParameter<Sculptor_MappingLaneKind>:$laneKind,
+    "IntegerAttr":$laneIndex,
+    "ArrayAttr":$raNodePath,
+    "FloatAttr":$startNs,
+    "FloatAttr":$finishNs
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileAnalogLaneAttr
+    : Sculptor_Attr<"LogicalTileAnalogLane", "logical_tile_analog_lane"> {
+  let summary = "one analog lane in a logical tile";
+  let parameters = (ins
+    "IntegerAttr":$laneIndex,
+    "IntegerAttr":$laneBindingGroup,
+    "ArrayAttr":$assignments
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileDependencyAttr
+    : Sculptor_Attr<"LogicalTileDependency", "logical_tile_dependency"> {
+  let summary = "ST-graph dependency retained by logical-tile formation";
+  let parameters = (ins
+    "IntegerAttr":$sourceOperationId,
+    "IntegerAttr":$sourceWorkUnitId,
+    "IntegerAttr":$targetOperationId,
+    "IntegerAttr":$targetWorkUnitId,
+    "IntegerAttr":$tensorId,
+    "IntegerAttr":$byteSize
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileAttr
+    : Sculptor_Attr<"LogicalTile", "logical_tile"> {
+  let summary = "RA-planned logical tile before physical placement";
+  let parameters = (ins
+    "IntegerAttr":$tileId,
+    "IntegerAttr":$digitalWork,
+    "ArrayAttr":$digitalAssignments,
+    "ArrayAttr":$analogLanes,
+    "ArrayAttr":$modelInputTensorIds,
+    "ArrayAttr":$modelOutputTensorIds,
+    "ArrayAttr":$internalDependencies
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileEdgeAttr
+    : Sculptor_Attr<"LogicalTileEdge", "logical_tile_edge"> {
+  let summary = "weighted communication edge between logical tiles";
+  let parameters = (ins
+    "IntegerAttr":$edgeId,
+    "IntegerAttr":$sourceTileId,
+    "IntegerAttr":$targetTileId,
+    "IntegerAttr":$byteSize,
+    "ArrayAttr":$dependencies
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileGraphAttr
+    : Sculptor_Attr<"LogicalTileGraph", "logical_tile_graph"> {
+  let summary = "logical placement units and their weighted communication";
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "IntegerAttr":$plannedMeshRows,
+    "IntegerAttr":$plannedMeshCols,
+    "IntegerAttr":$logicalTileCapacity,
+    "IntegerAttr":$analogLanesPerTile,
+    "ArrayAttr":$tiles,
+    "ArrayAttr":$edges
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_PhysicalTileAssignmentAttr
+    : Sculptor_Attr<"PhysicalTileAssignment", "physical_tile_assignment"> {
+  let summary = "physical mesh location assigned to one logical tile";
+  let parameters = (ins
+    "IntegerAttr":$logicalTileId,
+    "IntegerAttr":$physicalTileId,
+    "IntegerAttr":$row,
+    "IntegerAttr":$column
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_PlacedLogicalTileEdgeAttr
+    : Sculptor_Attr<"PlacedLogicalTileEdge", "placed_logical_tile_edge"> {
+  let summary = "placement cost of one logical-tile communication edge";
+  let parameters = (ins
+    "IntegerAttr":$edgeId,
+    "IntegerAttr":$sourceTileId,
+    "IntegerAttr":$targetTileId,
+    "IntegerAttr":$byteSize,
+    "IntegerAttr":$manhattanHops,
+    "IntegerAttr":$transferCost
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTilePlacementAttr
+    : Sculptor_Attr<"LogicalTilePlacement", "logical_tile_placement"> {
+  let summary = "physical placement of an RA-planned logical-tile graph";
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "StringAttr":$schedule,
+    "IntegerAttr":$meshRows,
+    "IntegerAttr":$meshCols,
+    "IntegerAttr":$arraysPerCore,
+    "IntegerAttr":$initialScore,
+    "IntegerAttr":$totalTransferCost,
+    "IntegerAttr":$evaluations,
+    "ArrayAttr":$assignments,
+    "ArrayAttr":$edges
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_AnnealingScoreSampleAttr
+    : Sculptor_Attr<"AnnealingScoreSample", "annealing_score_sample"> {
+  let summary = "one evaluated simulated-annealing placement move";
+  let parameters = (ins
+    "IntegerAttr":$iteration,
+    "IntegerAttr":$candidateScore,
+    "IntegerAttr":$currentScore,
+    "IntegerAttr":$bestScore,
+    "BoolAttr":$accepted
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_TileRoutineRouteAttr
+    : Sculptor_Attr<"TileRoutineRoute", "tile_routine_route"> {
+  let summary = "one routed tensor value between outlined tile routines";
+  let parameters = (ins
+    "IntegerAttr":$id,
+    "IntegerAttr":$sourceTile,
+    "IntegerAttr":$sourceRoutine,
+    "IntegerAttr":$sourceOutput,
+    "IntegerAttr":$destinationTile,
+    "IntegerAttr":$destinationRoutine,
+    "IntegerAttr":$destinationInput,
+    "IntegerAttr":$resourceId,
+    "IntegerAttr":$tensorId,
+    "IntegerAttr":$byteSize
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_TileRoutineBindingAttr
+    : Sculptor_Attr<"TileRoutineBinding", "tile_routine_binding"> {
+  let summary = "one same-tile value binding between outlined routines";
+  let parameters = (ins
+    "IntegerAttr":$sourceRoutine,
+    "IntegerAttr":$sourceOutput,
+    "IntegerAttr":$destinationRoutine,
+    "IntegerAttr":$destinationInput,
+    "IntegerAttr":$resourceId,
+    "IntegerAttr":$byteSize
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_TileRoutineModelIOAttr
+    : Sculptor_Attr<"TileRoutineModelIO", "tile_routine_model_io"> {
+  let summary = "model input or output owned by one outlined tile routine";
+  let parameters = (ins
+    "IntegerAttr":$index,
+    "IntegerAttr":$tile,
+    "IntegerAttr":$routine,
+    "IntegerAttr":$port,
+    "IntegerAttr":$resourceId,
+    "IntegerAttr":$tensorId,
+    "IntegerAttr":$byteSize
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_LogicalTileAnnealingTraceAttr
+    : Sculptor_Attr<"LogicalTileAnnealingTrace", "logical_tile_annealing_trace"> {
+  let summary = "score trajectory for logical-tile simulated annealing";
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "IntegerAttr":$initialScore,
+    "IntegerAttr":$finalScore,
+    "IntegerAttr":$evaluations,
+    "ArrayAttr":$samples
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+def Sculptor_MappingPlanAttr
+    : Sculptor_Attr<"MappingPlan", "mapping_plan"> {
+  let summary = "selected mapping planner result and reference evaluation";
+  let description = [{
+    Records the planner, objective, selected RA-tree identity, root metrics,
+    evaluated alternatives, and per-node evaluation. It contains planning
+    decisions only and does not assign runtime task or core identities.
+  }];
+  let parameters = (ins
+    "IntegerAttr":$version,
+    "StringAttr":$planner,
+    EnumParameter<Sculptor_MappingPlanObjective>:$objective,
+    "StringAttr":$raTreeFingerprint,
+    "BoolAttr":$feasible,
+    "FloatAttr":$estimatedLatencyNs,
+    "IntegerAttr":$crossingBytes,
+    "FloatAttr":$estimatedCommunicationNs,
+    "IntegerAttr":$requiredResourceUnits,
+    "IntegerAttr":$pipelineStages,
+    "ArrayAttr":$candidates,
+    "ArrayAttr":$nodeEvaluations,
+    "MappingRealizationAttr":$realization
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
