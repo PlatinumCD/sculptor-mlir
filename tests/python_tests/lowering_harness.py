@@ -171,6 +171,68 @@ def lower_to_ra_tree(case: LoweringCase) -> str:
     return result.stdout
 
 
+def lower_to_logical_tile_placement(
+    case: LoweringCase,
+    *,
+    tile_order: str,
+    priority_mode: str,
+    candidate_scope: str = "cardinal",
+    lookahead: int = 1,
+) -> str:
+    """Lower one model through configurable greedy logical-tile placement."""
+
+    sculptor_opt = Path(os.environ.get("SCULPTOR_MLIR_OPT", DEFAULT_SCULPTOR_OPT))
+    if not sculptor_opt.is_file():
+        raise RuntimeError(f"missing sculptor-mlir-opt: {sculptor_opt}")
+
+    command = [
+        str(sculptor_opt),
+        "-",
+        "--sculptor-canonicalize-layers",
+        "--sculptor-extract-layers",
+        "--sculptor-convert-layers",
+        (
+            "--sculptor-expand-mvm-to-golem="
+            f"array-rows={case.array_rows} array-cols={case.array_cols}"
+        ),
+    ]
+    if case.duplicate_matrices:
+        command.append("--sculptor-duplicate-matrices")
+    command.extend(
+        [
+            "--sculptor-build-ra-tree",
+            (
+                "--sculptor-plan-mapping=strategies=setup-first "
+                f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
+                f"arrays-per-core={case.arrays_per_core} "
+                f"array-rows={case.array_rows} array-cols={case.array_cols}"
+            ),
+            (
+                "--sculptor-place-logical-tiles=schedule=greedy "
+                f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
+                f"arrays-per-core={case.arrays_per_core} "
+                f"greedy-tile-order={tile_order} "
+                f"greedy-priority-mode={priority_mode} "
+                f"greedy-candidate-scope={candidate_scope} "
+                f"greedy-lookahead={lookahead}"
+            ),
+        ]
+    )
+    result = subprocess.run(
+        command,
+        input=export_linalg(case),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AssertionError(
+            f"{case.name} placement failed with exit code {result.returncode}:\n"
+            f"{result.stderr}"
+        )
+    return result.stdout
+
+
 def _run_sculptor_stage(command: list[str], stage: str) -> None:
     result = subprocess.run(
         command,

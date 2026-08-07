@@ -81,8 +81,6 @@ parseLogicalTileSchedule(StringRef value, Operation *anchor,
     return LogicalTileScheduleKind::Snake;
   if (value == "greedy")
     return LogicalTileScheduleKind::Greedy;
-  if (value == "greedy-beam")
-    return LogicalTileScheduleKind::GreedyBeam;
   if (value == "annealing" && allowAnnealing)
     return LogicalTileScheduleKind::Annealing;
   anchor->emitError("unknown logical-tile placement schedule '")
@@ -98,12 +96,74 @@ StringRef stringifyLogicalTileSchedule(LogicalTileScheduleKind schedule) {
     return "snake";
   case LogicalTileScheduleKind::Greedy:
     return "greedy";
-  case LogicalTileScheduleKind::GreedyBeam:
-    return "greedy-beam";
   case LogicalTileScheduleKind::Annealing:
     return "annealing";
   }
   llvm_unreachable("unknown logical-tile placement schedule");
+}
+
+FailureOr<GreedyTileOrder> parseGreedyTileOrder(StringRef value,
+                                                Operation *anchor) {
+  if (value == "sequential")
+    return GreedyTileOrder::Sequential;
+  if (value == "priority")
+    return GreedyTileOrder::Priority;
+  anchor->emitError("unknown greedy logical-tile order '") << value << "'";
+  return failure();
+}
+
+StringRef stringifyGreedyTileOrder(GreedyTileOrder order) {
+  switch (order) {
+  case GreedyTileOrder::Sequential:
+    return "sequential";
+  case GreedyTileOrder::Priority:
+    return "priority";
+  }
+  llvm_unreachable("unknown greedy logical-tile order");
+}
+
+FailureOr<GreedyPriorityMode> parseGreedyPriorityMode(StringRef value,
+                                                      Operation *anchor) {
+  if (value == "sum")
+    return GreedyPriorityMode::Sum;
+  if (value == "max")
+    return GreedyPriorityMode::Max;
+  anchor->emitError("unknown greedy priority mode '") << value << "'";
+  return failure();
+}
+
+StringRef stringifyGreedyPriorityMode(GreedyPriorityMode mode) {
+  switch (mode) {
+  case GreedyPriorityMode::Sum:
+    return "sum";
+  case GreedyPriorityMode::Max:
+    return "max";
+  }
+  llvm_unreachable("unknown greedy priority mode");
+}
+
+FailureOr<GreedyCandidateScope> parseGreedyCandidateScope(StringRef value,
+                                                          Operation *anchor) {
+  if (value == "cardinal")
+    return GreedyCandidateScope::Cardinal;
+  if (value == "diagonal")
+    return GreedyCandidateScope::Diagonal;
+  if (value == "frontier")
+    return GreedyCandidateScope::Frontier;
+  anchor->emitError("unknown greedy candidate scope '") << value << "'";
+  return failure();
+}
+
+StringRef stringifyGreedyCandidateScope(GreedyCandidateScope scope) {
+  switch (scope) {
+  case GreedyCandidateScope::Cardinal:
+    return "cardinal";
+  case GreedyCandidateScope::Diagonal:
+    return "diagonal";
+  case GreedyCandidateScope::Frontier:
+    return "frontier";
+  }
+  llvm_unreachable("unknown greedy candidate scope");
 }
 
 LogicalResult validateLogicalTilePlacementProblem(

@@ -16,8 +16,8 @@ struct PlaceLogicalTilesPass
 
   Option<std::string> schedule{
       *this, "schedule",
-      llvm::cl::desc("Physical placement schedule: random, snake, greedy, "
-                     "greedy-beam, or annealing"),
+      llvm::cl::desc(
+          "Physical placement schedule: random, snake, greedy, or annealing"),
       llvm::cl::init("greedy")};
 
   Option<int64_t> meshRows{*this, "mesh-rows",
@@ -36,17 +36,26 @@ struct PlaceLogicalTilesPass
                      "tile shape"),
       llvm::cl::init(0)};
 
-  Option<int64_t> lookahead{
-      *this, "lookahead",
-      llvm::cl::desc("Number of logical-tile placements evaluated by "
-                     "greedy-beam before committing the current placement"),
-      llvm::cl::init(1)};
+  Option<std::string> greedyTileOrder{
+      *this, "greedy-tile-order",
+      llvm::cl::desc("Greedy logical-tile order: sequential or priority"),
+      llvm::cl::init("sequential")};
 
-  Option<int64_t> beamWidth{
-      *this, "beam-width",
-      llvm::cl::desc("Number of partial placements retained at each "
-                     "greedy-beam lookahead depth"),
-      llvm::cl::init(8)};
+  Option<std::string> greedyPriorityMode{
+      *this, "greedy-priority-mode",
+      llvm::cl::desc("Priority queue affinity mode: sum or max"),
+      llvm::cl::init("sum")};
+
+  Option<std::string> greedyCandidateScope{
+      *this, "greedy-candidate-scope",
+      llvm::cl::desc(
+          "Greedy physical candidate scope: cardinal, diagonal, or frontier"),
+      llvm::cl::init("cardinal")};
+
+  Option<int64_t> greedyLookahead{
+      *this, "greedy-lookahead",
+      llvm::cl::desc("Number of placements included in each greedy rollout"),
+      llvm::cl::init(1)};
 
   Option<int64_t> randomSeed{*this, "random-seed",
                              llvm::cl::desc("Deterministic random seed"),
@@ -54,8 +63,7 @@ struct PlaceLogicalTilesPass
 
   Option<std::string> annealingInitialSchedule{
       *this, "annealing-initial-schedule",
-      llvm::cl::desc(
-          "Annealing initial schedule: random, snake, greedy, or greedy-beam"),
+      llvm::cl::desc("Annealing initial schedule: random, snake, or greedy"),
       llvm::cl::init("greedy")};
 
   Option<int64_t> annealingIterations{
@@ -91,8 +99,10 @@ struct PlaceLogicalTilesPass
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;
-    lookahead = pass.lookahead;
-    beamWidth = pass.beamWidth;
+    greedyTileOrder = pass.greedyTileOrder;
+    greedyPriorityMode = pass.greedyPriorityMode;
+    greedyCandidateScope = pass.greedyCandidateScope;
+    greedyLookahead = pass.greedyLookahead;
     randomSeed = pass.randomSeed;
     annealingInitialSchedule = pass.annealingInitialSchedule;
     annealingIterations = pass.annealingIterations;

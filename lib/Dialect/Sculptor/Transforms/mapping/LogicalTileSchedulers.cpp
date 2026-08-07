@@ -1,22 +1,22 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <map>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <set>
 #include <tuple>
+#include <vector>
 
 namespace {
 
 using namespace mlir;
 using namespace mlir::sculptor::mapping;
-
-using TilePair = std::pair<int64_t, int64_t>;
 
 struct PlacementSearchResult {
   SmallVector<int64_t> physicalTiles;
@@ -31,12 +31,51 @@ struct GreedyPhysicalCandidate {
   int64_t regionDistance = 0;
 };
 
-struct GreedyBeamState {
-  SmallVector<std::pair<size_t, int64_t>, 4> decisions;
-  int64_t cumulativeCost = 0;
-  int64_t firstIncrementalCost = 0;
-  int64_t firstRegionDistance = 0;
-  int64_t firstPhysicalTile = -1;
+struct GreedyTilePriorityEntry {
+  size_t tileIndex = 0;
+  int64_t primary = 0;
+  int64_t secondary = 0;
+  int64_t logicalTileId = -1;
+  uint64_t version = 0;
+};
+
+struct GreedyTilePriorityLess {
+  bool operator()(const GreedyTilePriorityEntry &lhs,
+                  const GreedyTilePriorityEntry &rhs) const {
+    if (lhs.primary != rhs.primary)
+      return lhs.primary < rhs.primary;
+    if (lhs.secondary != rhs.secondary)
+      return lhs.secondary < rhs.secondary;
+    return lhs.logicalTileId > rhs.logicalTileId;
+  }
+};
+
+using GreedyTilePriorityQueue =
+    std::priority_queue<GreedyTilePriorityEntry,
+                        std::vector<GreedyTilePriorityEntry>,
+                        GreedyTilePriorityLess>;
+
+struct GreedyPlacementState {
+  explicit GreedyPlacementState(size_t tileCount)
+      : physicalByTileIndex(tileCount, -1), placed(tileCount, false),
+        frontierSum(tileCount, 0), frontierMax(tileCount, 0),
+        frontierVersion(tileCount, 0) {}
+
+  SmallVector<int64_t> physicalByTileIndex;
+  SmallVector<bool> placed;
+  llvm::DenseSet<int64_t> usedPhysicalTiles;
+  std::set<int64_t> physicalFrontier;
+  SmallVector<int64_t> frontierSum;
+  SmallVector<int64_t> frontierMax;
+  SmallVector<uint64_t> frontierVersion;
+  GreedyTilePriorityQueue priorityQueue;
+  int64_t currentPhysicalTile = 0;
+  size_t placedCount = 0;
+};
+
+struct GreedyRolloutResult {
+  GreedyPhysicalCandidate firstPlacement;
+  int64_t totalCost = 0;
 };
 
 FailureOr<int64_t> getMeshCapacity(const LogicalTilePlacementProblem &problem) {
@@ -108,13 +147,13 @@ FailureOr<int64_t> checkedWeightedDistance(int64_t bytes, int64_t distance,
 }
 
 FailureOr<PlacementSearchResult>
-buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
+buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
+                     const GreedyPlacementConfig &config) {
   FailureOr<int64_t> capacity = getMeshCapacity(problem);
   if (failed(capacity))
     return failure();
   const size_t tileCount = problem.tileGraph.tiles.size();
-  SmallVector<int64_t> physicalByTileIndex(tileCount, -1);
-  SmallVector<bool> placed(tileCount, false);
+  GreedyPlacementState state(tileCount);
   SmallVector<llvm::DenseMap<unsigned, int64_t>> affinity(tileCount);
 
   for (const LogicalTileEdge &edge : problem.tileGraph.edges) {
@@ -140,22 +179,104 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
     return problem.tileGraph.tiles[lhs].id < problem.tileGraph.tiles[rhs].id;
   });
 
-  std::set<int64_t> usedPhysicalTiles;
+  auto visitPhysicalNeighbors = [&](int64_t physicalTile,
+                                    bool includeDiagonals, auto &&visitor) {
+    int64_t row = physicalTile / problem.mesh.columns;
+    int64_t column = physicalTile % problem.mesh.columns;
+    for (int64_t rowOffset = -1; rowOffset <= 1; ++rowOffset) {
+      for (int64_t columnOffset = -1; columnOffset <= 1; ++columnOffset) {
+        if (rowOffset == 0 && columnOffset == 0)
+          continue;
+        if (!includeDiagonals && std::abs(rowOffset) + std::abs(columnOffset) != 1)
+          continue;
+        int64_t candidateRow = row + rowOffset;
+        int64_t candidateColumn = column + columnOffset;
+        if (candidateRow < 0 || candidateRow >= problem.mesh.rows ||
+            candidateColumn < 0 || candidateColumn >= problem.mesh.columns)
+          continue;
+        visitor(candidateRow * problem.mesh.columns + candidateColumn);
+      }
+    }
+  };
+
+  auto recordPhysicalPlacement = [&](GreedyPlacementState &target,
+                                     int64_t physicalTile) {
+    target.physicalFrontier.erase(physicalTile);
+    target.usedPhysicalTiles.insert(physicalTile);
+    visitPhysicalNeighbors(physicalTile, /*includeDiagonals=*/true,
+                           [&](int64_t neighbor) {
+                             if (!target.usedPhysicalTiles.contains(neighbor))
+                               target.physicalFrontier.insert(neighbor);
+                           });
+  };
+
   size_t firstTile = tileOrder.front();
-  physicalByTileIndex[firstTile] = 0;
-  placed[firstTile] = true;
-  usedPhysicalTiles.insert(0);
-  int64_t currentPhysicalTile = 0;
+  state.physicalByTileIndex[firstTile] = 0;
+  state.placed[firstTile] = true;
+  state.placedCount = 1;
+  recordPhysicalPlacement(state, 0);
   int64_t evaluations = 0;
 
-  auto scoreCandidate = [&](size_t tile,
+  auto pushPriority = [&](GreedyPlacementState &target, size_t tile) {
+    int64_t primary = config.priorityMode == GreedyPriorityMode::Sum
+                          ? target.frontierSum[tile]
+                          : target.frontierMax[tile];
+    int64_t secondary = config.priorityMode == GreedyPriorityMode::Sum
+                            ? target.frontierMax[tile]
+                            : target.frontierSum[tile];
+    target.priorityQueue.push({tile, primary, secondary,
+                               problem.tileGraph.tiles[tile].id,
+                               target.frontierVersion[tile]});
+  };
+
+  auto updatePriorityFrontier = [&](GreedyPlacementState &target,
+                                    size_t newlyPlaced) -> LogicalResult {
+    for (const auto &[neighbor, bytes] : affinity[newlyPlaced]) {
+      if (target.placed[neighbor])
+        continue;
+      std::optional<int64_t> updated =
+          llvm::checkedAdd(target.frontierSum[neighbor], bytes);
+      if (!updated) {
+        problem.anchor->emitError("greedy tile-order affinity overflow");
+        return failure();
+      }
+      target.frontierSum[neighbor] = *updated;
+      target.frontierMax[neighbor] =
+          std::max(target.frontierMax[neighbor], bytes);
+      ++target.frontierVersion[neighbor];
+      pushPriority(target, neighbor);
+    }
+    return success();
+  };
+
+  auto selectPriorityTile = [&](GreedyPlacementState &target) {
+    while (!target.priorityQueue.empty()) {
+      GreedyTilePriorityEntry entry = target.priorityQueue.top();
+      target.priorityQueue.pop();
+      if (target.placed[entry.tileIndex] ||
+          entry.version != target.frontierVersion[entry.tileIndex])
+        continue;
+      return entry.tileIndex;
+    }
+    for (size_t tile : tileOrder) {
+      if (!target.placed[tile])
+        return tile;
+    }
+    return tileCount;
+  };
+
+  if (config.tileOrder == GreedyTileOrder::Priority &&
+      failed(updatePriorityFrontier(state, firstTile)))
+    return failure();
+
+  auto scoreCandidate = [&](const GreedyPlacementState &target, size_t tile,
                             int64_t physicalTile) -> FailureOr<int64_t> {
     int64_t cost = 0;
     for (const auto &[neighbor, bytes] : affinity[tile]) {
-      if (!placed[neighbor])
+      if (!target.placed[neighbor])
         continue;
       int64_t distance = manhattanDistance(
-          physicalTile, physicalByTileIndex[neighbor], problem.mesh);
+          physicalTile, target.physicalByTileIndex[neighbor], problem.mesh);
       FailureOr<int64_t> contribution =
           checkedWeightedDistance(bytes, distance, problem.anchor);
       if (failed(contribution))
@@ -171,33 +292,32 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
     return cost;
   };
 
-  auto collectLocalCandidates = [&]() {
-    SmallVector<int64_t, 4> candidates;
-    int64_t row = currentPhysicalTile / problem.mesh.columns;
-    int64_t column = currentPhysicalTile % problem.mesh.columns;
-    const std::pair<int64_t, int64_t> offsets[] = {
-        {-1, 0}, {0, -1}, {0, 1}, {1, 0}};
-    for (auto [rowOffset, columnOffset] : offsets) {
-      int64_t candidateRow = row + rowOffset;
-      int64_t candidateColumn = column + columnOffset;
-      if (candidateRow < 0 || candidateRow >= problem.mesh.rows ||
-          candidateColumn < 0 || candidateColumn >= problem.mesh.columns)
-        continue;
-      int64_t candidate = candidateRow * problem.mesh.columns + candidateColumn;
-      if (!usedPhysicalTiles.contains(candidate))
-        candidates.push_back(candidate);
+  auto collectScopedCandidates = [&](const GreedyPlacementState &target) {
+    SmallVector<int64_t, 8> candidates;
+    if (config.candidateScope == GreedyCandidateScope::Frontier) {
+      candidates.append(target.physicalFrontier.begin(),
+                        target.physicalFrontier.end());
+      return candidates;
     }
+    bool includeDiagonals =
+        config.candidateScope == GreedyCandidateScope::Diagonal;
+    visitPhysicalNeighbors(target.currentPhysicalTile, includeDiagonals,
+                           [&](int64_t candidate) {
+                             if (!target.usedPhysicalTiles.contains(candidate))
+                               candidates.push_back(candidate);
+                           });
     return candidates;
   };
 
-  auto collectNearestOpenCandidates = [&]() {
+  auto collectNearestOpenCandidates =
+      [&](const GreedyPlacementState &target) {
     SmallVector<int64_t> candidates;
     int64_t nearestDistance = std::numeric_limits<int64_t>::max();
     for (int64_t candidate = 0; candidate < *capacity; ++candidate) {
-      if (usedPhysicalTiles.contains(candidate))
+      if (target.usedPhysicalTiles.contains(candidate))
         continue;
       int64_t distance =
-          manhattanDistance(currentPhysicalTile, candidate, problem.mesh);
+          manhattanDistance(target.currentPhysicalTile, candidate, problem.mesh);
       if (distance < nearestDistance) {
         nearestDistance = distance;
         candidates.clear();
@@ -208,11 +328,27 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
     return candidates;
   };
 
-  for (size_t orderIndex = 1; orderIndex < tileOrder.size(); ++orderIndex) {
-    size_t tile = tileOrder[orderIndex];
-    SmallVector<int64_t> candidates = collectLocalCandidates();
+  auto selectNextLogicalTile = [&](GreedyPlacementState &target) {
+    if (config.tileOrder == GreedyTileOrder::Priority)
+      return selectPriorityTile(target);
+    for (size_t tile : tileOrder) {
+      if (!target.placed[tile])
+        return tile;
+    }
+    return tileCount;
+  };
+
+  auto collectCandidates = [&](const GreedyPlacementState &target) {
+    SmallVector<int64_t> candidates = collectScopedCandidates(target);
     if (candidates.empty())
-      candidates = collectNearestOpenCandidates();
+      candidates = collectNearestOpenCandidates(target);
+    return candidates;
+  };
+
+  auto chooseImmediatePlacement =
+      [&](const GreedyPlacementState &target,
+          size_t tile) -> FailureOr<GreedyPhysicalCandidate> {
+    SmallVector<int64_t> candidates = collectCandidates(target);
     if (candidates.empty()) {
       problem.anchor->emitError(
           "greedy logical-tile placement exhausted the physical mesh");
@@ -222,13 +358,15 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
     GreedyPhysicalCandidate best;
     bool hasBest = false;
     for (int64_t candidate : candidates) {
-      FailureOr<int64_t> incrementalCost = scoreCandidate(tile, candidate);
+      FailureOr<int64_t> incrementalCost =
+          scoreCandidate(target, tile, candidate);
       if (failed(incrementalCost))
         return failure();
       ++evaluations;
       GreedyPhysicalCandidate scored{
           candidate, *incrementalCost,
-          manhattanDistance(currentPhysicalTile, candidate, problem.mesh)};
+          manhattanDistance(target.currentPhysicalTile, candidate,
+                            problem.mesh)};
       if (!hasBest || std::tie(scored.incrementalCost, scored.regionDistance,
                                scored.physicalTile) <
                           std::tie(best.incrementalCost, best.regionDistance,
@@ -237,244 +375,119 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem) {
         hasBest = true;
       }
     }
+    return best;
+  };
 
-    physicalByTileIndex[tile] = best.physicalTile;
-    placed[tile] = true;
-    usedPhysicalTiles.insert(best.physicalTile);
-    currentPhysicalTile = best.physicalTile;
-  }
-
-  return PlacementSearchResult{std::move(physicalByTileIndex), 0, evaluations};
-}
-
-FailureOr<PlacementSearchResult>
-buildGreedyBeamPlacement(const LogicalTilePlacementProblem &problem,
-                         int64_t lookahead, int64_t beamWidth) {
-  FailureOr<int64_t> capacity = getMeshCapacity(problem);
-  if (failed(capacity))
-    return failure();
-  const size_t tileCount = problem.tileGraph.tiles.size();
-  SmallVector<int64_t> physicalByTileIndex(tileCount, -1);
-  SmallVector<bool> placed(tileCount, false);
-  std::set<int64_t> usedPhysicalTiles;
-
-  std::map<TilePair, int64_t> affinity;
-  SmallVector<int64_t> weightedDegree(tileCount, 0);
-  for (const LogicalTileEdge &edge : problem.tileGraph.edges) {
-    unsigned source = problem.tileGraph.tileIndexById.lookup(edge.sourceTileId);
-    unsigned target = problem.tileGraph.tileIndexById.lookup(edge.targetTileId);
-    TilePair pair =
-        source < target ? TilePair{source, target} : TilePair{target, source};
-    std::optional<int64_t> pairWeight =
-        llvm::checkedAdd(affinity[pair], edge.byteSize);
-    std::optional<int64_t> sourceDegree =
-        llvm::checkedAdd(weightedDegree[source], edge.byteSize);
-    std::optional<int64_t> targetDegree =
-        llvm::checkedAdd(weightedDegree[target], edge.byteSize);
-    if (!pairWeight || !sourceDegree || !targetDegree) {
-      problem.anchor->emitError("logical-tile affinity weight overflow");
+  auto commitPlacement = [&](GreedyPlacementState &target, size_t tile,
+                             int64_t physicalTile) -> LogicalResult {
+    if (target.placed[tile] ||
+        target.usedPhysicalTiles.contains(physicalTile)) {
+      problem.anchor->emitError("greedy rollout attempted duplicate placement");
       return failure();
     }
-    affinity[pair] = *pairWeight;
-    weightedDegree[source] = *sourceDegree;
-    weightedDegree[target] = *targetDegree;
-  }
-
-  auto communication = [&](size_t first, size_t second) {
-    TilePair pair =
-        first < second ? TilePair{first, second} : TilePair{second, first};
-    auto found = affinity.find(pair);
-    return found == affinity.end() ? int64_t{0} : found->second;
+    target.physicalByTileIndex[tile] = physicalTile;
+    target.placed[tile] = true;
+    ++target.placedCount;
+    recordPhysicalPlacement(target, physicalTile);
+    target.currentPhysicalTile = physicalTile;
+    if (config.tileOrder == GreedyTileOrder::Priority &&
+        failed(updatePriorityFrontier(target, tile)))
+      return failure();
+    return success();
   };
 
-  size_t firstTile = 0;
-  for (size_t tile = 1; tile < tileCount; ++tile) {
-    if (weightedDegree[tile] > weightedDegree[firstTile] ||
-        (weightedDegree[tile] == weightedDegree[firstTile] &&
-         problem.tileGraph.tiles[tile].id <
-             problem.tileGraph.tiles[firstTile].id))
-      firstTile = tile;
-  }
-  int64_t centerRow = problem.mesh.rows / 2;
-  int64_t centerColumn = problem.mesh.columns / 2;
-  int64_t centerPhysicalTile = centerRow * problem.mesh.columns + centerColumn;
-  physicalByTileIndex[firstTile] = centerPhysicalTile;
-  placed[firstTile] = true;
-  usedPhysicalTiles.insert(centerPhysicalTile);
-
-  int64_t evaluations = 0;
-  size_t placedCount = 1;
-  auto selectNextTile = [&]() {
-    size_t nextTile = tileCount;
-    int64_t bestPlacedAffinity = -1;
-    int64_t bestDegree = -1;
-    for (size_t tile = 0; tile < tileCount; ++tile) {
-      if (placed[tile])
-        continue;
-      int64_t placedAffinity = 0;
-      for (size_t other = 0; other < tileCount; ++other) {
-        if (placed[other])
-          placedAffinity += communication(tile, other);
-      }
-      if (nextTile == tileCount || placedAffinity > bestPlacedAffinity ||
-          (placedAffinity == bestPlacedAffinity &&
-           weightedDegree[tile] > bestDegree) ||
-          (placedAffinity == bestPlacedAffinity &&
-           weightedDegree[tile] == bestDegree &&
-           problem.tileGraph.tiles[tile].id <
-               problem.tileGraph.tiles[nextTile].id)) {
-        nextTile = tile;
-        bestPlacedAffinity = placedAffinity;
-        bestDegree = weightedDegree[tile];
-      }
-    }
-    return nextTile;
-  };
-
-  auto collectCandidates =
-      [&](size_t nextTile) -> FailureOr<SmallVector<GreedyPhysicalCandidate>> {
-    SmallVector<GreedyPhysicalCandidate> candidates;
-    candidates.reserve(*capacity - usedPhysicalTiles.size());
-    for (int64_t candidate = 0; candidate < *capacity; ++candidate) {
-      if (usedPhysicalTiles.contains(candidate))
-        continue;
-      int64_t incrementalCost = 0;
-      int64_t regionDistance = *capacity;
-      for (size_t other = 0; other < tileCount; ++other) {
-        if (!placed[other])
-          continue;
-        int64_t distance = manhattanDistance(
-            candidate, physicalByTileIndex[other], problem.mesh);
-        regionDistance = std::min(regionDistance, distance);
-        int64_t bytes = communication(nextTile, other);
-        FailureOr<int64_t> edgeCost =
-            checkedWeightedDistance(bytes, distance, problem.anchor);
-        if (failed(edgeCost))
-          return failure();
-        std::optional<int64_t> updated =
-            llvm::checkedAdd(incrementalCost, *edgeCost);
-        if (!updated) {
-          problem.anchor->emitError(
-              "greedy logical-tile incremental score overflow");
-          return failure();
-        }
-        incrementalCost = *updated;
-      }
-      ++evaluations;
-      candidates.push_back({candidate, incrementalCost, regionDistance});
-    }
-
-    llvm::sort(candidates, [](const GreedyPhysicalCandidate &lhs,
-                              const GreedyPhysicalCandidate &rhs) {
-      return std::tie(lhs.incrementalCost, lhs.regionDistance,
-                      lhs.physicalTile) < std::tie(rhs.incrementalCost,
-                                                   rhs.regionDistance,
-                                                   rhs.physicalTile);
-    });
-    return candidates;
-  };
-
-  auto placeDecision = [&](size_t tile, int64_t physicalTile) {
-    physicalByTileIndex[tile] = physicalTile;
-    placed[tile] = true;
-    usedPhysicalTiles.insert(physicalTile);
-    ++placedCount;
-  };
-  auto unplaceDecision = [&](size_t tile, int64_t physicalTile) {
-    --placedCount;
-    usedPhysicalTiles.erase(physicalTile);
-    placed[tile] = false;
-    physicalByTileIndex[tile] = -1;
-  };
-
-  auto applyState = [&](const GreedyBeamState &state) {
-    for (const auto &[tile, physicalTile] : state.decisions)
-      placeDecision(tile, physicalTile);
-  };
-  auto unapplyState = [&](const GreedyBeamState &state) {
-    for (auto decision = state.decisions.rbegin();
-         decision != state.decisions.rend(); ++decision)
-      unplaceDecision(decision->first, decision->second);
-  };
-  auto compareBeamStates = [](const GreedyBeamState &lhs,
-                              const GreedyBeamState &rhs) {
-    auto lhsKey = std::tie(lhs.cumulativeCost, lhs.firstIncrementalCost,
-                           lhs.firstRegionDistance, lhs.firstPhysicalTile);
-    auto rhsKey = std::tie(rhs.cumulativeCost, rhs.firstIncrementalCost,
-                           rhs.firstRegionDistance, rhs.firstPhysicalTile);
-    if (lhsKey != rhsKey)
-      return lhsKey < rhsKey;
-    return std::lexicographical_compare(
-        lhs.decisions.begin(), lhs.decisions.end(), rhs.decisions.begin(),
-        rhs.decisions.end());
-  };
-
-  while (placedCount < tileCount) {
-    SmallVector<GreedyBeamState> beam(1);
-    int64_t depthLimit = std::min<int64_t>(
-        lookahead, static_cast<int64_t>(tileCount - placedCount));
-    for (int64_t depth = 0; depth < depthLimit; ++depth) {
-      SmallVector<GreedyBeamState> expanded;
-      for (const GreedyBeamState &state : beam) {
-        applyState(state);
-        size_t nextTile = selectNextTile();
-        FailureOr<SmallVector<GreedyPhysicalCandidate>> candidates =
-            collectCandidates(nextTile);
-        unapplyState(state);
-        if (failed(candidates) || candidates->empty()) {
-          problem.anchor->emitError(
-              "greedy logical-tile beam exhausted the physical mesh");
-          return failure();
-        }
-
-        for (const GreedyPhysicalCandidate &candidate : *candidates) {
-          std::optional<int64_t> total =
-              llvm::checkedAdd(state.cumulativeCost, candidate.incrementalCost);
-          if (!total) {
-            problem.anchor->emitError(
-                "greedy logical-tile beam score overflow");
-            return failure();
-          }
-          GreedyBeamState child = state;
-          child.decisions.push_back({nextTile, candidate.physicalTile});
-          child.cumulativeCost = *total;
-          if (depth == 0) {
-            child.firstIncrementalCost = candidate.incrementalCost;
-            child.firstRegionDistance = candidate.regionDistance;
-            child.firstPhysicalTile = candidate.physicalTile;
-          }
-          expanded.push_back(std::move(child));
-        }
-      }
-      llvm::sort(expanded, compareBeamStates);
-      if (expanded.size() > static_cast<size_t>(beamWidth))
-        expanded.resize(static_cast<size_t>(beamWidth));
-      beam = std::move(expanded);
-    }
-    if (beam.empty() || beam.front().decisions.empty()) {
+  while (state.placedCount < tileCount) {
+    size_t tile = selectNextLogicalTile(state);
+    if (tile == tileCount) {
       problem.anchor->emitError(
-          "greedy logical-tile beam did not produce a placement");
+          "greedy tile order exhausted before all tiles were placed");
       return failure();
     }
-    const auto &[nextTile, physicalTile] = beam.front().decisions.front();
-    placeDecision(nextTile, physicalTile);
+    SmallVector<int64_t> candidates = collectCandidates(state);
+    if (candidates.empty()) {
+      problem.anchor->emitError(
+          "greedy logical-tile placement exhausted the physical mesh");
+      return failure();
+    }
+
+    GreedyRolloutResult best;
+    bool hasBest = false;
+    for (int64_t candidate : candidates) {
+      FailureOr<int64_t> incrementalCost =
+          scoreCandidate(state, tile, candidate);
+      if (failed(incrementalCost))
+        return failure();
+      ++evaluations;
+      GreedyPhysicalCandidate firstPlacement{
+          candidate, *incrementalCost,
+          manhattanDistance(state.currentPhysicalTile, candidate,
+                            problem.mesh)};
+
+      GreedyPlacementState simulation = state;
+      if (failed(commitPlacement(simulation, tile, candidate)))
+        return failure();
+      int64_t rolloutCost = *incrementalCost;
+      int64_t rolloutDepth = std::min<int64_t>(
+          config.lookahead,
+          static_cast<int64_t>(tileCount - state.placedCount));
+      for (int64_t depth = 1;
+           depth < rolloutDepth && simulation.placedCount < tileCount;
+           ++depth) {
+        size_t futureTile = selectNextLogicalTile(simulation);
+        if (futureTile == tileCount) {
+          problem.anchor->emitError(
+              "greedy rollout exhausted logical tiles unexpectedly");
+          return failure();
+        }
+        FailureOr<GreedyPhysicalCandidate> futurePlacement =
+            chooseImmediatePlacement(simulation, futureTile);
+        if (failed(futurePlacement))
+          return failure();
+        std::optional<int64_t> updatedCost =
+            llvm::checkedAdd(rolloutCost, futurePlacement->incrementalCost);
+        if (!updatedCost) {
+          problem.anchor->emitError("greedy rollout cost overflow");
+          return failure();
+        }
+        rolloutCost = *updatedCost;
+        if (failed(commitPlacement(simulation, futureTile,
+                                   futurePlacement->physicalTile)))
+          return failure();
+      }
+
+      GreedyRolloutResult scored{firstPlacement, rolloutCost};
+      if (!hasBest ||
+          std::tie(scored.totalCost, scored.firstPlacement.incrementalCost,
+                   scored.firstPlacement.regionDistance,
+                   scored.firstPlacement.physicalTile) <
+              std::tie(best.totalCost, best.firstPlacement.incrementalCost,
+                       best.firstPlacement.regionDistance,
+                       best.firstPlacement.physicalTile)) {
+        best = scored;
+        hasBest = true;
+      }
+    }
+
+    if (failed(
+            commitPlacement(state, tile, best.firstPlacement.physicalTile)))
+      return failure();
   }
-  return PlacementSearchResult{std::move(physicalByTileIndex), 0, evaluations};
+
+  return PlacementSearchResult{std::move(state.physicalByTileIndex), 0,
+                               evaluations};
 }
 
 FailureOr<PlacementSearchResult>
 buildInitialPlacement(const LogicalTilePlacementProblem &problem,
                       LogicalTileScheduleKind schedule, int64_t randomSeed,
-                      int64_t greedyLookahead, int64_t greedyBeamWidth) {
+                      const GreedyPlacementConfig &greedyConfig) {
   switch (schedule) {
   case LogicalTileScheduleKind::Random:
     return buildRandomPlacement(problem, randomSeed);
   case LogicalTileScheduleKind::Snake:
     return buildSnakePlacement(problem);
   case LogicalTileScheduleKind::Greedy:
-    return buildGreedyPlacement(problem);
-  case LogicalTileScheduleKind::GreedyBeam:
-    return buildGreedyBeamPlacement(problem, greedyLookahead, greedyBeamWidth);
+    return buildGreedyPlacement(problem, greedyConfig);
   case LogicalTileScheduleKind::Annealing:
     problem.anchor->emitError(
         "annealing cannot initialize logical-tile placement from itself");
@@ -488,7 +501,7 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
              const LogicalTilePlacementConfig &config) {
   FailureOr<PlacementSearchResult> initial = buildInitialPlacement(
       problem, config.annealingInitialSchedule, config.randomSeed,
-      config.greedyLookahead, config.greedyBeamWidth);
+      config.greedy);
   if (failed(initial))
     return failure();
   FailureOr<int64_t> initialScore =
@@ -583,13 +596,14 @@ scheduleLogicalTiles(const LogicalTilePlacementProblem &problem,
                      const LogicalTilePlacementConfig &config) {
   if (failed(validateLogicalTilePlacementProblem(problem)))
     return failure();
-  if (config.annealingIterations < 0 || config.greedyLookahead <= 0 ||
-      config.greedyLookahead > 8 || config.greedyBeamWidth <= 0 ||
+  if (config.greedy.lookahead <= 0) {
+    problem.anchor->emitError("greedy lookahead must be positive");
+    return failure();
+  }
+  if (config.annealingIterations < 0 ||
       config.annealingInitialTemperature < 0.0 ||
       config.annealingCoolingRate <= 0.0 || config.annealingCoolingRate > 1.0) {
-    problem.anchor->emitError(
-        "invalid logical-tile search parameters; greedy lookahead must be "
-        "between 1 and 8 and beam width must be positive");
+    problem.anchor->emitError("invalid logical-tile annealing parameters");
     return failure();
   }
 
@@ -597,8 +611,7 @@ scheduleLogicalTiles(const LogicalTilePlacementProblem &problem,
       config.schedule == LogicalTileScheduleKind::Annealing
           ? runAnnealing(problem, config)
           : buildInitialPlacement(problem, config.schedule, config.randomSeed,
-                                  config.greedyLookahead,
-                                  config.greedyBeamWidth);
+                                  config.greedy);
   if (failed(search))
     return failure();
   FailureOr<int64_t> score =

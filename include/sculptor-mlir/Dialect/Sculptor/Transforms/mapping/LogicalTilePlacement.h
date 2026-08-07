@@ -22,10 +22,14 @@ inline constexpr StringLiteral kLogicalTilePlacementAttrName =
     "sculptor.mapping.logical_tile_placement";
 inline constexpr StringLiteral kLogicalTileAnnealingTraceAttrName =
     "sculptor.mapping.logical_tile_annealing_trace";
+inline constexpr StringLiteral kLogicalTileGreedyTileOrderAttrName =
+    "sculptor.mapping.logical_tile_greedy_tile_order";
+inline constexpr StringLiteral kLogicalTileGreedyPriorityModeAttrName =
+    "sculptor.mapping.logical_tile_greedy_priority_mode";
+inline constexpr StringLiteral kLogicalTileGreedyCandidateScopeAttrName =
+    "sculptor.mapping.logical_tile_greedy_candidate_scope";
 inline constexpr StringLiteral kLogicalTileGreedyLookaheadAttrName =
     "sculptor.mapping.logical_tile_greedy_lookahead";
-inline constexpr StringLiteral kLogicalTileGreedyBeamWidthAttrName =
-    "sculptor.mapping.logical_tile_greedy_beam_width";
 
 struct PhysicalMeshGeometry {
   int64_t rows = 0;
@@ -43,14 +47,35 @@ enum class LogicalTileScheduleKind {
   Random,
   Snake,
   Greedy,
-  GreedyBeam,
   Annealing,
+};
+
+enum class GreedyTileOrder {
+  Sequential,
+  Priority,
+};
+
+enum class GreedyPriorityMode {
+  Sum,
+  Max,
+};
+
+enum class GreedyCandidateScope {
+  Cardinal,
+  Diagonal,
+  Frontier,
+};
+
+struct GreedyPlacementConfig {
+  GreedyTileOrder tileOrder = GreedyTileOrder::Sequential;
+  GreedyPriorityMode priorityMode = GreedyPriorityMode::Sum;
+  GreedyCandidateScope candidateScope = GreedyCandidateScope::Cardinal;
+  int64_t lookahead = 1;
 };
 
 struct LogicalTilePlacementConfig {
   LogicalTileScheduleKind schedule = LogicalTileScheduleKind::Greedy;
-  int64_t greedyLookahead = 1;
-  int64_t greedyBeamWidth = 8;
+  GreedyPlacementConfig greedy;
   LogicalTileScheduleKind annealingInitialSchedule =
       LogicalTileScheduleKind::Greedy;
   int64_t randomSeed = 0;
@@ -113,6 +138,21 @@ parseLogicalTileSchedule(StringRef value, Operation *anchor,
                          bool allowAnnealing = true);
 
 StringRef stringifyLogicalTileSchedule(LogicalTileScheduleKind schedule);
+
+FailureOr<GreedyTileOrder> parseGreedyTileOrder(StringRef value,
+                                                Operation *anchor);
+
+StringRef stringifyGreedyTileOrder(GreedyTileOrder order);
+
+FailureOr<GreedyPriorityMode> parseGreedyPriorityMode(StringRef value,
+                                                      Operation *anchor);
+
+StringRef stringifyGreedyPriorityMode(GreedyPriorityMode mode);
+
+FailureOr<GreedyCandidateScope> parseGreedyCandidateScope(StringRef value,
+                                                          Operation *anchor);
+
+StringRef stringifyGreedyCandidateScope(GreedyCandidateScope scope);
 
 LogicalResult
 validateLogicalTilePlacementProblem(const LogicalTilePlacementProblem &problem);

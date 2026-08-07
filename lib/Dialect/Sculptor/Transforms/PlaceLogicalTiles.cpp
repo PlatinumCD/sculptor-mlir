@@ -24,7 +24,15 @@ void PlaceLogicalTilesPass::runOnOperation() {
   FailureOr<mapping::LogicalTileScheduleKind> parsedInitial =
       mapping::parseLogicalTileSchedule(annealingInitialSchedule, module,
                                         /*allowAnnealing=*/false);
-  if (failed(parsedSchedule) || failed(parsedInitial)) {
+  FailureOr<mapping::GreedyTileOrder> parsedGreedyTileOrder =
+      mapping::parseGreedyTileOrder(greedyTileOrder, module);
+  FailureOr<mapping::GreedyPriorityMode> parsedGreedyPriorityMode =
+      mapping::parseGreedyPriorityMode(greedyPriorityMode, module);
+  FailureOr<mapping::GreedyCandidateScope> parsedGreedyCandidateScope =
+      mapping::parseGreedyCandidateScope(greedyCandidateScope, module);
+  if (failed(parsedSchedule) || failed(parsedInitial) ||
+      failed(parsedGreedyTileOrder) || failed(parsedGreedyPriorityMode) ||
+      failed(parsedGreedyCandidateScope)) {
     signalPassFailure();
     return;
   }
@@ -41,8 +49,10 @@ void PlaceLogicalTilesPass::runOnOperation() {
       return;
     }
     *summary << "function,schedule,mesh_rows,mesh_cols,arrays_per_core,"
-                "lookahead,beam_width,digital_workers,matrix_duplication,"
-                "matrix_setups,logical_tiles,logical_edges,initial_score,"
+                "greedy_tile_order,greedy_priority_mode,"
+                "greedy_candidate_scope,greedy_lookahead,digital_workers,"
+                "matrix_duplication,matrix_setups,logical_tiles,logical_edges,"
+                "initial_score,"
                 "total_transfer_cost,evaluations,estimated_latency_ns,"
                 "crossing_bytes,estimated_communication_ns,"
                 "required_resource_units,pipeline_stages\n";
@@ -100,8 +110,10 @@ void PlaceLogicalTilesPass::runOnOperation() {
         function};
     mapping::LogicalTilePlacementConfig config;
     config.schedule = *parsedSchedule;
-    config.greedyLookahead = lookahead;
-    config.greedyBeamWidth = beamWidth;
+    config.greedy.tileOrder = *parsedGreedyTileOrder;
+    config.greedy.priorityMode = *parsedGreedyPriorityMode;
+    config.greedy.candidateScope = *parsedGreedyCandidateScope;
+    config.greedy.lookahead = greedyLookahead;
     config.annealingInitialSchedule = *parsedInitial;
     config.randomSeed = randomSeed;
     config.annealingIterations = annealingIterations;
@@ -119,16 +131,35 @@ void PlaceLogicalTilesPass::runOnOperation() {
     function->setAttr(
         mapping::kLogicalTilePlacementAttrName,
         mapping::serializeLogicalTilePlacement(&getContext(), *placement));
-    if (*parsedSchedule == mapping::LogicalTileScheduleKind::GreedyBeam) {
+    bool usesGreedy =
+        *parsedSchedule == mapping::LogicalTileScheduleKind::Greedy ||
+        (*parsedSchedule == mapping::LogicalTileScheduleKind::Annealing &&
+         *parsedInitial == mapping::LogicalTileScheduleKind::Greedy);
+    if (usesGreedy) {
+      function->setAttr(
+          mapping::kLogicalTileGreedyTileOrderAttrName,
+          StringAttr::get(&getContext(),
+                          mapping::stringifyGreedyTileOrder(
+                              *parsedGreedyTileOrder)));
+      function->setAttr(
+          mapping::kLogicalTileGreedyPriorityModeAttrName,
+          StringAttr::get(&getContext(),
+                          mapping::stringifyGreedyPriorityMode(
+                              *parsedGreedyPriorityMode)));
+      function->setAttr(
+          mapping::kLogicalTileGreedyCandidateScopeAttrName,
+          StringAttr::get(&getContext(),
+                          mapping::stringifyGreedyCandidateScope(
+                              *parsedGreedyCandidateScope)));
       function->setAttr(
           mapping::kLogicalTileGreedyLookaheadAttrName,
-          IntegerAttr::get(IntegerType::get(&getContext(), 64), lookahead));
-      function->setAttr(
-          mapping::kLogicalTileGreedyBeamWidthAttrName,
-          IntegerAttr::get(IntegerType::get(&getContext(), 64), beamWidth));
+          IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                           greedyLookahead));
     } else {
+      function->removeAttr(mapping::kLogicalTileGreedyTileOrderAttrName);
+      function->removeAttr(mapping::kLogicalTileGreedyPriorityModeAttrName);
+      function->removeAttr(mapping::kLogicalTileGreedyCandidateScopeAttrName);
       function->removeAttr(mapping::kLogicalTileGreedyLookaheadAttrName);
-      function->removeAttr(mapping::kLogicalTileGreedyBeamWidthAttrName);
     }
     if (placement->annealingTrace) {
       function->setAttr(mapping::kLogicalTileAnnealingTraceAttrName,
@@ -138,12 +169,6 @@ void PlaceLogicalTilesPass::runOnOperation() {
       function->removeAttr(mapping::kLogicalTileAnnealingTraceAttrName);
     }
     if (summary) {
-      bool usesBeamSearch =
-          *parsedSchedule == mapping::LogicalTileScheduleKind::GreedyBeam ||
-          (*parsedSchedule == mapping::LogicalTileScheduleKind::Annealing &&
-           *parsedInitial == mapping::LogicalTileScheduleKind::GreedyBeam);
-      int64_t reportedLookahead = usesBeamSearch ? lookahead : 1;
-      int64_t reportedBeamWidth = usesBeamSearch ? beamWidth : 1;
       int64_t matrixSetupCount = 0;
       bool matrixDuplication = false;
       function.walk([&](Operation *operation) {
@@ -159,8 +184,14 @@ void PlaceLogicalTilesPass::runOnOperation() {
       *summary
           << function.getSymName() << ',' << placement->schedule << ','
           << placement->mesh.rows << ',' << placement->mesh.columns << ','
-          << placement->mesh.arraysPerCore << ',' << reportedLookahead << ','
-          << reportedBeamWidth << ','
+          << placement->mesh.arraysPerCore << ','
+          << mapping::stringifyGreedyTileOrder(*parsedGreedyTileOrder) << ','
+          << mapping::stringifyGreedyPriorityMode(*parsedGreedyPriorityMode)
+          << ','
+          << mapping::stringifyGreedyCandidateScope(
+                 *parsedGreedyCandidateScope)
+          << ','
+          << greedyLookahead << ','
           << (digitalWorkers ? digitalWorkers.getInt() : 1)
           << ',' << (matrixDuplication ? "on" : "off") << ','
           << matrixSetupCount << ',' << tileGraph->tiles.size() << ','
