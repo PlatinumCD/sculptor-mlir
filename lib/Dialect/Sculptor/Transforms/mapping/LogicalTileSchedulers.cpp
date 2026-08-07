@@ -530,6 +530,8 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
   std::uniform_int_distribution<int64_t> physicalDistribution(0, *capacity - 1);
 
   int64_t evaluations = 0;
+  int64_t lastCandidateScore = currentScore;
+  bool lastAccepted = true;
   for (int64_t iteration = 0; iteration < config.annealingIterations;
        ++iteration) {
     SmallVector<int64_t> candidate = current;
@@ -575,9 +577,19 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
       best = current;
       bestScore = currentScore;
     }
-    trace.samples.push_back(
-        {evaluations, *candidateScore, currentScore, bestScore, accept});
+    lastCandidateScore = *candidateScore;
+    lastAccepted = accept;
+    if (evaluations % config.annealingTraceSampleInterval == 0) {
+      trace.samples.push_back(
+          {evaluations, lastCandidateScore, currentScore, bestScore,
+           lastAccepted});
+    }
     temperature = std::max(1.0e-9, temperature * config.annealingCoolingRate);
+  }
+  if (trace.samples.back().iteration != evaluations) {
+    trace.samples.push_back(
+        {evaluations, lastCandidateScore, currentScore, bestScore,
+         lastAccepted});
   }
   trace.finalScore = bestScore;
   trace.evaluations = evaluations;
@@ -602,7 +614,8 @@ scheduleLogicalTiles(const LogicalTilePlacementProblem &problem,
   }
   if (config.annealingIterations < 0 ||
       config.annealingInitialTemperature < 0.0 ||
-      config.annealingCoolingRate <= 0.0 || config.annealingCoolingRate > 1.0) {
+      config.annealingCoolingRate <= 0.0 || config.annealingCoolingRate > 1.0 ||
+      config.annealingTraceSampleInterval <= 0) {
     problem.anchor->emitError("invalid logical-tile annealing parameters");
     return failure();
   }

@@ -3,6 +3,7 @@
 #include "ConsumerBoundFill/ConsumerBoundFillPlanner.h"
 #include "FanOutCut/FanOutCutPlanner.h"
 #include "MVMWave/MVMWavePlanner.h"
+#include "RecursiveForkJoin/RecursiveForkJoinPlanner.h"
 #include "SetupFirst/SetupFirstPlanner.h"
 
 #include "llvm/Support/ErrorHandling.h"
@@ -29,6 +30,11 @@ void registerMappingPlanners() {
       llvm::report_fatal_error(llvm::StringRef(error));
     if (failed(registry.registerPlanner(
             "mvm-wave", [] { return std::make_unique<MVMWavePlanner>(); },
+            &error)))
+      llvm::report_fatal_error(llvm::StringRef(error));
+    if (failed(registry.registerPlanner(
+            "recursive-fork-join",
+            [] { return std::make_unique<RecursiveForkJoinPlanner>(); },
             &error)))
       llvm::report_fatal_error(llvm::StringRef(error));
     if (failed(registry.registerPlanner(

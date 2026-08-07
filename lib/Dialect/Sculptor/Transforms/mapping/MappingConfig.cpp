@@ -83,6 +83,17 @@ parseNetworkContentionModel(StringRef value, Operation *anchor) {
   return failure();
 }
 
+FailureOr<MVMBodyPolicy> parseMVMBodyPolicy(StringRef value,
+                                            Operation *anchor) {
+  if (value == "packed")
+    return MVMBodyPolicy::Packed;
+  if (value == "spread")
+    return MVMBodyPolicy::Spread;
+  anchor->emitError("unknown MVM body policy '")
+      << value << "'; expected 'packed' or 'spread'";
+  return failure();
+}
+
 StringRef stringifyMappingObjective(MappingObjectiveKind objective) {
   switch (objective) {
   case MappingObjectiveKind::Latency:
@@ -99,6 +110,16 @@ StringRef stringifyNetworkContentionModel(NetworkContentionModel model) {
     return "link-serialized";
   }
   llvm_unreachable("unknown network contention model");
+}
+
+StringRef stringifyMVMBodyPolicy(MVMBodyPolicy policy) {
+  switch (policy) {
+  case MVMBodyPolicy::Packed:
+    return "packed";
+  case MVMBodyPolicy::Spread:
+    return "spread";
+  }
+  llvm_unreachable("unknown MVM body policy");
 }
 
 } // namespace mapping

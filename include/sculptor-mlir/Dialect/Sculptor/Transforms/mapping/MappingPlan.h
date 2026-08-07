@@ -49,6 +49,7 @@ struct MappingCandidateSummary {
 struct MappingPlan {
   std::string plannerName;
   MappingObjective objective;
+  MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;
   ResourceAllocationTree selectedTree;
   MappingEvaluation evaluation;
   SmallVector<MappingCandidateSummary, 0> candidates;

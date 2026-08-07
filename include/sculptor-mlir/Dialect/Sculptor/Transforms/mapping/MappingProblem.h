@@ -16,7 +16,7 @@ struct MappingProblem {
   const MappingHardwareModel &hardware;
   LogicalTileShape logicalTileShape;
   MappingObjective objective;
-  bool mvmWaveColocation = false;
+  MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;
   bool balanceDigitalWork = false;
   /// Intermediate refinements need costs and structural feasibility, but only
   /// the final tree needs a concrete logical-tile realization.

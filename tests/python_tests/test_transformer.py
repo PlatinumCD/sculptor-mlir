@@ -46,6 +46,38 @@ class TransformerBlockModel(torch.nn.Module):
 
 class TransformerLoweringTest(LoweringTestCase):
     @staticmethod
+    def stage_operation_id(placed_ir: str, stage_name: str) -> int:
+        return TransformerLoweringTest.stage_operation_id_matching(
+            placed_ir, re.escape(stage_name)
+        )
+
+    @staticmethod
+    def stage_operation_id_matching(placed_ir: str, stage_name: str) -> int:
+        match = re.search(
+            r"sculptor\.mapping\.operation_id = ([0-9]+) : i64[^}\n]*"
+            rf'sculptor\.mapping\.stage_name = "{stage_name}"',
+            placed_ir,
+        )
+        if match is None:
+            raise AssertionError(f"missing mapping stage {stage_name}")
+        return int(match.group(1))
+
+    @staticmethod
+    def operation_logical_tiles(placed_ir: str, operation_id: int) -> set[int]:
+        marker = "#sculptor.logical_tile<tileId = "
+        result: set[int] = set()
+        for chunk in placed_ir.split(marker)[1:]:
+            tile_match = re.match(r"([0-9]+) : i64", chunk)
+            if tile_match is None:
+                continue
+            tile_body = chunk.split("], edges = [", 1)[0]
+            if re.search(
+                rf"operationId = {operation_id} : i64(?:,|>)", tile_body
+            ):
+                result.add(int(tile_match.group(1)))
+        return result
+
+    @staticmethod
     def placement_case():
         return LoweringCase(
             "transformer_greedy_priority",
@@ -158,6 +190,79 @@ class TransformerLoweringTest(LoweringTestCase):
                 candidate_scope="frontier",
                 lookahead=0,
             )
+
+    def test_recursive_mvm_body_policies(self):
+        case = LoweringCase(
+            "transformer_recursive_mvm_body_policy",
+            lambda: TransformerBlockModel(bias=True),
+            lambda: (torch.ones(1, 4, 384),),
+            array_rows=1024,
+            array_cols=512,
+            external_linalg_lowering=True,
+            duplicate_matrices=True,
+        )
+        for policy in ("packed", "spread"):
+            with self.subTest(policy=policy):
+                placed_ir = lower_to_logical_tile_placement(
+                    case,
+                    tile_order="priority",
+                    priority_mode="max",
+                    candidate_scope="frontier",
+                    lookahead=3,
+                    mapping_strategies="setup-first,recursive-fork-join",
+                    mvm_body_policy=policy,
+                )
+                self.assertIn(
+                    f'sculptor.mapping.mvm_body_policy = "{policy}"',
+                    placed_ir,
+                )
+                if policy != "spread":
+                    continue
+
+                for token in range(4):
+                    home_names = (
+                        f"transformer_block_mlp_down_token_extract_b0_s{token}",
+                        f"transformer_block_mlp_down_bias_add_b0_s{token}",
+                    )
+                    home_tiles = []
+                    member_tiles = []
+                    for member in range(3):
+                        vector_id = self.stage_operation_id_matching(
+                            placed_ir,
+                            f"transformer_block_mlp_down_b0_s{token}_mvm_"
+                            rf"[0-9]+_vector_tile_{member}",
+                        )
+                        mvm_id = self.stage_operation_id_matching(
+                            placed_ir,
+                            f"transformer_block_mlp_down_b0_s{token}_mvm_"
+                            rf"[0-9]+_array_0_{member}",
+                        )
+                        vector_tiles = self.operation_logical_tiles(
+                            placed_ir, vector_id
+                        )
+                        mvm_tiles = self.operation_logical_tiles(placed_ir, mvm_id)
+                        self.assertEqual(vector_tiles, mvm_tiles)
+                        self.assertEqual(len(vector_tiles), 1)
+                        member_tiles.append(next(iter(vector_tiles)))
+
+                    for name in home_names:
+                        operation_id = self.stage_operation_id(placed_ir, name)
+                        tiles = self.operation_logical_tiles(placed_ir, operation_id)
+                        self.assertEqual(len(tiles), 1)
+                        home_tiles.append(next(iter(tiles)))
+                    recombine_id = self.stage_operation_id_matching(
+                        placed_ir,
+                        f"transformer_block_mlp_down_b0_s{token}_mvm_"
+                        r"[0-9]+_tile_recombine",
+                    )
+                    recombine_tiles = self.operation_logical_tiles(
+                        placed_ir, recombine_id
+                    )
+                    self.assertEqual(len(recombine_tiles), 1)
+                    home_tiles.append(next(iter(recombine_tiles)))
+                    self.assertEqual(len(set(home_tiles)), 1)
+                    self.assertEqual(home_tiles[0], member_tiles[0])
+                    self.assertEqual(len(set(member_tiles)), 3)
 
     def test_transformer_block_with_bias(self):
         self.assert_lowers(

@@ -254,7 +254,7 @@ collectModelIO(ModuleOp module, StringRef name, bool input, int64_t tileId) {
   if (failed(values))
     return failure();
   SmallVector<ModelIOInfo> entries;
-  std::set<std::pair<int64_t, int64_t>> seen;
+  std::set<std::tuple<int64_t, int64_t, int64_t, int64_t>> seen;
   for (Attribute value : *values) {
     auto entry = dyn_cast<TileRoutineModelIOAttr>(value);
     if (!entry || entry.getTile().getInt() != tileId) {
@@ -262,16 +262,21 @@ collectModelIO(ModuleOp module, StringRef name, bool input, int64_t tileId) {
           << name << "'";
       return failure();
     }
-    auto key = std::make_pair(entry.getIndex().getInt(),
-                              entry.getResourceId().getInt());
+    auto key = std::make_tuple(
+        entry.getIndex().getInt(), entry.getResourceId().getInt(),
+        entry.getRoutine().getInt(), entry.getPort().getInt());
     if (seen.insert(key).second)
       entries.push_back(ModelIOInfo{entry, input});
   }
   llvm::sort(entries, [](const ModelIOInfo &lhs, const ModelIOInfo &rhs) {
-    return std::tuple<int64_t, int64_t>{lhs.attr.getIndex().getInt(),
-                                        lhs.attr.getResourceId().getInt()} <
-           std::tuple<int64_t, int64_t>{rhs.attr.getIndex().getInt(),
-                                        rhs.attr.getResourceId().getInt()};
+    return std::tuple<int64_t, int64_t, int64_t, int64_t>{
+               lhs.attr.getIndex().getInt(),
+               lhs.attr.getResourceId().getInt(),
+               lhs.attr.getRoutine().getInt(), lhs.attr.getPort().getInt()} <
+           std::tuple<int64_t, int64_t, int64_t, int64_t>{
+               rhs.attr.getIndex().getInt(),
+               rhs.attr.getResourceId().getInt(),
+               rhs.attr.getRoutine().getInt(), rhs.attr.getPort().getInt()};
   });
   return entries;
 }
@@ -595,7 +600,12 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
 
   auto buildModelManifest = [&](ArrayRef<ModelIOInfo> entries, bool input) {
     SmallVector<Attribute> manifest;
+    std::set<std::pair<int64_t, int64_t>> emittedOwnership;
     for (const ModelIOInfo &entry : entries) {
+      auto ownership = std::make_pair(entry.attr.getIndex().getInt(),
+                                      entry.attr.getResourceId().getInt());
+      if (!emittedOwnership.insert(ownership).second)
+        continue;
       manifest.push_back(builder.getDictionaryAttr({
           builder.getNamedAttr(input ? "input_index" : "output_index",
                                entry.attr.getIndex()),

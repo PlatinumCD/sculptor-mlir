@@ -22,8 +22,23 @@ Current strategies include:
 |---|---|
 | `setup-first` | Places matrix setup work before dependent execution |
 | `mvm-wave` | Groups independent MVM work into spatial waves |
+| `recursive-fork-join` | Recovers recursive SESE regions while preserving structured MVM bodies |
 | `fan-out-cut` | Exposes parallel consumers after a fan-out |
 | `consumer-bound-fill` | Binds fill work to its consumer |
+
+## MVM Body Policy
+
+`--sculptor-plan-mapping` accepts `mvm-body-policy=packed|spread` and defaults
+to `spread`. Packed plans diagnose MVM bodies wider than the tile's analog
+lane count.
+
+- `packed` assigns every physical MVM in one body to analog lanes on one
+  logical tile.
+- `spread` assigns every physical MVM branch in one body to a distinct logical
+  tile.
+
+Both policies preserve matrix-setup lane bindings. The policy affects logical
+tile formation, not physical mesh placement.
 
 ## Logical Tiles
 

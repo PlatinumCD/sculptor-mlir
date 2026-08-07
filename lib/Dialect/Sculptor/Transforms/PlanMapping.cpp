@@ -122,9 +122,12 @@ void PlanMappingPass::runOnOperation() {
       buildHardwareModel(*this, module);
   FailureOr<mapping::MappingObjective> parsedObjective =
       mapping::parseMappingObjective(objective, module);
+  FailureOr<mapping::MVMBodyPolicy> parsedMVMBodyPolicy =
+      mapping::parseMVMBodyPolicy(mvmBodyPolicy, module);
   FailureOr<SmallVector<std::string>> strategyNames =
       parseStrategyPipeline(strategies, module);
-  if (failed(hardware) || failed(parsedObjective) || failed(strategyNames)) {
+  if (failed(hardware) || failed(parsedObjective) ||
+      failed(parsedMVMBodyPolicy) || failed(strategyNames)) {
     signalPassFailure();
     return;
   }
@@ -174,7 +177,7 @@ void PlanMappingPass::runOnOperation() {
                                       *hardware,
                                       *logicalTileShape,
                                       *parsedObjective,
-                                      mvmWaveColocation,
+                                      *parsedMVMBodyPolicy,
                                       balanceDigitalWork,
                                       isFinalPlanner,
                                       func};
@@ -204,6 +207,7 @@ void PlanMappingPass::runOnOperation() {
            "a non-empty strategy pipeline must produce a plan");
     mapping::MappingPlan plan = std::move(*lastStagePlan);
     plan.plannerName = llvm::join(*strategyNames, ",");
+    plan.mvmBodyPolicy = *parsedMVMBodyPolicy;
     plan.selectedTree = std::move(currentTree);
     if (strategyNames->size() > 1) {
       plan.candidates.clear();
@@ -292,12 +296,9 @@ void PlanMappingPass::runOnOperation() {
         mapping::serializeLogicalTileGraph(&getContext(), *logicalTileGraph));
     func->removeAttr(mapping::kLogicalTilePlacementAttrName);
     func->removeAttr(mapping::kLogicalTileAnnealingTraceAttrName);
-    if (mvmWaveColocation) {
-      func->setAttr("sculptor.mapping.mvm_wave_colocation",
-                    BoolAttr::get(&getContext(), true));
-    } else {
-      func->removeAttr("sculptor.mapping.mvm_wave_colocation");
-    }
+    func->setAttr("sculptor.mapping.mvm_body_policy",
+                  StringAttr::get(&getContext(), mapping::stringifyMVMBodyPolicy(
+                                                    *parsedMVMBodyPolicy)));
     if (balanceDigitalWork) {
       func->setAttr("sculptor.mapping.digital_work_balancing",
                     BoolAttr::get(&getContext(), true));

@@ -82,6 +82,7 @@ struct LogicalTilePlacementConfig {
   int64_t annealingIterations = 1000;
   double annealingInitialTemperature = 0.0;
   double annealingCoolingRate = 0.995;
+  int64_t annealingTraceSampleInterval = 1;
 };
 
 struct PhysicalTileLocation {

@@ -603,7 +603,8 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
       int64_t requiredAnalogLanes =
           isSetupFrontier ? static_cast<int64_t>(subtreeOperations->size())
                           : mvmWaveAnalogLaneCount;
-      if (isMVMWaveFrontier && context.problem.mvmWaveColocation &&
+      if (isMVMWaveFrontier &&
+          context.problem.mvmBodyPolicy == MVMBodyPolicy::Packed &&
           requiredAnalogLanes > analogLaneCount) {
         result = makeInfeasible(
             nodeId, (Twine("MVM wave requires ") + Twine(requiredAnalogLanes) +
@@ -614,7 +615,10 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
         return result;
       }
       result.requiredResourceUnits =
-          llvm::divideCeil(requiredAnalogLanes, analogLaneCount);
+          isMVMWaveFrontier &&
+                  context.problem.mvmBodyPolicy == MVMBodyPolicy::Spread
+              ? requiredAnalogLanes
+              : llvm::divideCeil(requiredAnalogLanes, analogLaneCount);
     } else {
       result.requiredResourceUnits = 0;
       for (const MappingNodeEvaluation &child : children) {

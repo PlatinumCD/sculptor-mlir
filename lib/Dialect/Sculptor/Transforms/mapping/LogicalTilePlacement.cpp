@@ -520,7 +520,8 @@ deserializeLogicalTileAnnealingTrace(LogicalTileAnnealingTraceAttr attr,
       trace.initialScore != plan.initialScore ||
       trace.finalScore != plan.totalTransferCost ||
       trace.evaluations != plan.evaluations || trace.evaluations < 0 ||
-      trace.samples.size() != static_cast<size_t>(trace.evaluations + 1)) {
+      trace.samples.empty() || trace.samples.front().iteration != 0 ||
+      trace.samples.back().iteration != trace.evaluations) {
     anchor->emitError("annealing trace does not match its placement plan");
     return failure();
   }
@@ -529,7 +530,10 @@ deserializeLogicalTileAnnealingTrace(LogicalTileAnnealingTraceAttr attr,
   int64_t previousBest = trace.initialScore;
   for (auto indexedSample : llvm::enumerate(trace.samples)) {
     const LogicalTileAnnealingSample &sample = indexedSample.value();
-    if (sample.iteration != static_cast<int64_t>(indexedSample.index()) ||
+    if ((indexedSample.index() > 0 &&
+         sample.iteration <=
+             trace.samples[indexedSample.index() - 1].iteration) ||
+        sample.iteration < 0 || sample.iteration > trace.evaluations ||
         sample.candidateScore < 0 || sample.currentScore < 0 ||
         sample.bestScore < 0) {
       anchor->emitError("invalid annealing score sample metadata");
@@ -544,11 +548,17 @@ deserializeLogicalTileAnnealingTrace(LogicalTileAnnealingTraceAttr attr,
       }
       continue;
     }
+    bool consecutive =
+        sample.iteration ==
+        trace.samples[indexedSample.index() - 1].iteration + 1;
     int64_t expectedCurrent =
         sample.accepted ? sample.candidateScore : previousCurrent;
     int64_t expectedBest = std::min(previousBest, expectedCurrent);
-    if (sample.currentScore != expectedCurrent ||
-        sample.bestScore != expectedBest) {
+    if ((consecutive && (sample.currentScore != expectedCurrent ||
+                         sample.bestScore != expectedBest)) ||
+        (!consecutive &&
+         (sample.bestScore > previousBest ||
+          sample.bestScore > sample.currentScore))) {
       anchor->emitError("annealing score trajectory is inconsistent");
       return failure();
     }

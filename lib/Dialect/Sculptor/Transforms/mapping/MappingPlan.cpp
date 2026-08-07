@@ -117,8 +117,9 @@ MappingPlanAttr serializeMappingPlan(MLIRContext *context,
       builder.getArrayAttr(leafAssignments));
 
   return MappingPlanAttr::get(
-      context, builder.getI64IntegerAttr(2),
+      context, builder.getI64IntegerAttr(3),
       builder.getStringAttr(plan.plannerName), objective,
+      builder.getStringAttr(stringifyMVMBodyPolicy(plan.mvmBodyPolicy)),
       builder.getStringAttr(computeRATreeFingerprint(plan.selectedTree)),
       builder.getBoolAttr(plan.evaluation.feasible),
       builder.getF64FloatAttr(plan.evaluation.estimatedLatencyNs),

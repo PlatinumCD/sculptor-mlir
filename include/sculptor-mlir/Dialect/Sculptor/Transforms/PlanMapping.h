@@ -37,11 +37,10 @@ struct PlanMappingPass
       llvm::cl::desc("Number of physical analog arrays per core"),
       llvm::cl::init(1)};
 
-  Option<bool> mvmWaveColocation{
-      *this, "mvm-wave-colocation",
-      llvm::cl::desc("Co-locate each MVM wave on one core and distribute "
-                     "waves across cores"),
-      llvm::cl::init(false)};
+  Option<std::string> mvmBodyPolicy{
+      *this, "mvm-body-policy",
+      llvm::cl::desc("MVM body realization policy: packed or spread"),
+      llvm::cl::init("spread")};
 
   Option<bool> balanceDigitalWork{
       *this, "balance-digital-work",
@@ -125,7 +124,7 @@ struct PlanMappingPass
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;
-    mvmWaveColocation = pass.mvmWaveColocation;
+    mvmBodyPolicy = pass.mvmBodyPolicy;
     balanceDigitalWork = pass.balanceDigitalWork;
     arrayRows = pass.arrayRows;
     arrayCols = pass.arrayCols;

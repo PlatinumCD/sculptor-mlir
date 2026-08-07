@@ -17,6 +17,15 @@ Each planner refines the RA tree that the preceding strategy produced.
 - `mvm-wave` preserves wave order with temporal cuts. Within each wave, vector
   preparation occurs first, physical MVM members form one spatial cut, and
   optional tile recombination occurs last.
+- `recursive-fork-join` detects nested single-entry/single-exit regions in the
+  compute DAG. It maps sequential regions to temporal cuts and disjoint
+  fork/join branches to spatial cuts. Complete MVM waves remain structured
+  bodies: global region discovery treats each wave as one atom. Under the
+  `packed` policy, vector preparation uses one digital lane before a spatial
+  analog frontier. Under `spread`, branch-specific vector preparation follows
+  each analog branch's dependency region. Recombination and bias remain after
+  the analog frontier. Unstructured regions retain a conservative topological
+  temporal order.
 - `fan-out-cut` exposes independent consumers of a fan-out through a spatial
   cut.
 - `consumer-bound-fill` keeps fill operations with the consumers that use

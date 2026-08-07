@@ -301,7 +301,7 @@ def run_mapping(args, token_count, workers, matrix_copy, base_path):
         f"mesh-rows={args.mesh_rows} mesh-cols={args.mesh_cols} "
         f"arrays-per-core={args.arrays_per_core} "
         f"array-rows={args.array_rows} array-cols={args.array_cols} "
-        "mvm-wave-colocation balance-digital-work verify-plan"
+        "mvm-body-policy=packed balance-digital-work verify-plan"
     )
     placement_options = (
         f"schedule=greedy mesh-rows={args.mesh_rows} mesh-cols={args.mesh_cols} "
@@ -375,7 +375,7 @@ def write_manifest(args):
             "fan-out-cut",
             "consumer-bound-fill",
         ],
-        "mvm_wave_colocation": True,
+        "mvm_body_policy": "packed",
         "balance_digital_work": True,
         "run_count": len(args.tokens)
         * len(args.digital_workers)

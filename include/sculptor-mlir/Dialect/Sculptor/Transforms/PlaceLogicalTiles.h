@@ -82,6 +82,12 @@ struct PlaceLogicalTilesPass
       llvm::cl::desc("Multiplicative annealing cooling rate"),
       llvm::cl::init(0.995)};
 
+  Option<int64_t> annealingTraceSampleInterval{
+      *this, "annealing-trace-sample-interval",
+      llvm::cl::desc("Record one annealing trajectory sample per N "
+                     "evaluations"),
+      llvm::cl::init(1)};
+
   Option<bool> verifyPlacement{
       *this, "verify-placement",
       llvm::cl::desc("Verify the physical logical-tile placement"),
@@ -108,6 +114,7 @@ struct PlaceLogicalTilesPass
     annealingIterations = pass.annealingIterations;
     annealingInitialTemperature = pass.annealingInitialTemperature;
     annealingCoolingRate = pass.annealingCoolingRate;
+    annealingTraceSampleInterval = pass.annealingTraceSampleInterval;
     verifyPlacement = pass.verifyPlacement;
     summaryOutput = pass.summaryOutput;
   }

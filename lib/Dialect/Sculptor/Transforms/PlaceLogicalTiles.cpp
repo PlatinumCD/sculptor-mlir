@@ -119,6 +119,7 @@ void PlaceLogicalTilesPass::runOnOperation() {
     config.annealingIterations = annealingIterations;
     config.annealingInitialTemperature = annealingInitialTemperature;
     config.annealingCoolingRate = annealingCoolingRate;
+    config.annealingTraceSampleInterval = annealingTraceSampleInterval;
 
     FailureOr<mapping::LogicalTilePlacementPlan> placement =
         mapping::scheduleLogicalTiles(problem, config);
