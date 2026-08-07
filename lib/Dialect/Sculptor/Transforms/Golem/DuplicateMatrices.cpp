@@ -29,8 +29,7 @@ struct MappingStage {
 };
 
 FailureOr<StringRef> getStageKind(Operation *operation) {
-  auto kind =
-      operation->getAttrOfType<StringAttr>(mapping::kStageKindAttrName);
+  auto kind = operation->getAttrOfType<StringAttr>(mapping::kStageKindAttrName);
   if (!kind)
     return operation->emitError("expected mapping stage kind"), failure();
   return kind.getValue();
@@ -76,18 +75,19 @@ FailureOr<Value> getPhysicalMVMArray(const MappingStage &stage) {
       arrays.push_back(value);
   };
 
-  for (Operation *member : stage.members) {
-    if (auto load = dyn_cast<sculptor::ArrayLoadOp>(member)) {
-      ++loads;
-      append(load.getArray());
-    } else if (auto execute = dyn_cast<sculptor::ArrayExecuteOp>(member)) {
-      ++executes;
-      append(execute.getArray());
-    } else if (auto store = dyn_cast<sculptor::ArrayStoreOp>(member)) {
-      ++stores;
-      append(store.getArray());
-    }
-  }
+  for (Operation *member : stage.members)
+    member->walk([&](Operation *operation) {
+      if (auto load = dyn_cast<sculptor::ArrayLoadOp>(operation)) {
+        ++loads;
+        append(load.getArray());
+      } else if (auto execute = dyn_cast<sculptor::ArrayExecuteOp>(operation)) {
+        ++executes;
+        append(execute.getArray());
+      } else if (auto store = dyn_cast<sculptor::ArrayStoreOp>(operation)) {
+        ++stores;
+        append(store.getArray());
+      }
+    });
 
   if (loads == 0 || executes == 0 || stores == 0)
     return stage.members.front()->emitError(
@@ -101,25 +101,47 @@ FailureOr<Value> getPhysicalMVMArray(const MappingStage &stage) {
   return arrays.front();
 }
 
-void replacePhysicalMVMArray(const MappingStage &stage, Value oldArray,
-                             Value newArray) {
+LogicalResult replacePhysicalMVMArray(const MappingStage &stage, Value oldArray,
+                                      Value newArray) {
   for (Operation *member : stage.members) {
-    if (auto load = dyn_cast<sculptor::ArrayLoadOp>(member)) {
-      assert(load.getArray() == oldArray);
-      load.getArrayMutable().set(newArray);
-    } else if (auto execute = dyn_cast<sculptor::ArrayExecuteOp>(member)) {
-      assert(execute.getArray() == oldArray);
-      execute.getArrayMutable().set(newArray);
-    } else if (auto store = dyn_cast<sculptor::ArrayStoreOp>(member)) {
-      assert(store.getArray() == oldArray);
-      store.getArrayMutable().set(newArray);
-    }
+    WalkResult result = member->walk([&](Operation *operation) -> WalkResult {
+      Value referencedArray;
+      if (auto load = dyn_cast<sculptor::ArrayLoadOp>(operation))
+        referencedArray = load.getArray();
+      else if (auto execute = dyn_cast<sculptor::ArrayExecuteOp>(operation))
+        referencedArray = execute.getArray();
+      else if (auto store = dyn_cast<sculptor::ArrayStoreOp>(operation))
+        referencedArray = store.getArray();
+      else
+        return WalkResult::advance();
+
+      if (referencedArray == oldArray)
+        return WalkResult::advance();
+      operation->emitError(
+          "physical-MVM array operation references an unexpected logical "
+          "array");
+      return WalkResult::interrupt();
+    });
+    if (result.wasInterrupted())
+      return failure();
   }
+
+  for (Operation *member : stage.members) {
+    member->walk([&](Operation *operation) {
+      if (auto load = dyn_cast<sculptor::ArrayLoadOp>(operation))
+        load.getArrayMutable().set(newArray);
+      else if (auto execute = dyn_cast<sculptor::ArrayExecuteOp>(operation))
+        execute.getArrayMutable().set(newArray);
+      else if (auto store = dyn_cast<sculptor::ArrayStoreOp>(operation))
+        store.getArrayMutable().set(newArray);
+    });
+  }
+  return success();
 }
 
-FailureOr<Value> cloneMatrixSetup(const MappingStage &setup,
-                                  int64_t newStageId, int64_t matrixId,
-                                  int64_t replicaId, StringRef consumerName,
+FailureOr<Value> cloneMatrixSetup(const MappingStage &setup, int64_t newStageId,
+                                  int64_t matrixId, int64_t replicaId,
+                                  StringRef consumerName,
                                   Operation *insertBefore,
                                   IRRewriter &rewriter) {
   IRMapping valueMapping;
@@ -128,8 +150,7 @@ FailureOr<Value> cloneMatrixSetup(const MappingStage &setup,
     return failure();
 
   std::string replicaName =
-      (Twine(consumerName) + "_matrix_setup_replica_" + Twine(replicaId))
-          .str();
+      (Twine(consumerName) + "_matrix_setup_replica_" + Twine(replicaId)).str();
 
   rewriter.setInsertionPoint(insertBefore);
   for (Operation *member : setup.members) {
@@ -144,8 +165,7 @@ FailureOr<Value> cloneMatrixSetup(const MappingStage &setup,
                    rewriter.getI64IntegerAttr(replicaId));
   }
 
-  Value clonedArray =
-      valueMapping.lookupOrNull((*originalArraySet).getArray());
+  Value clonedArray = valueMapping.lookupOrNull((*originalArraySet).getArray());
   if (!clonedArray)
     return insertBefore->emitError(
                "failed to clone matrix-setup logical array result"),
@@ -153,8 +173,8 @@ FailureOr<Value> cloneMatrixSetup(const MappingStage &setup,
   return clonedArray;
 }
 
-LogicalResult eraseUnusedOriginalSetups(
-    ArrayRef<MappingStage *> setups, IRRewriter &rewriter) {
+LogicalResult eraseUnusedOriginalSetups(ArrayRef<MappingStage *> setups,
+                                        IRRewriter &rewriter) {
   for (MappingStage *setup : setups) {
     DenseSet<Operation *> members(setup->members.begin(), setup->members.end());
     for (Operation *member : setup->members) {
@@ -172,17 +192,17 @@ LogicalResult eraseUnusedOriginalSetups(
   return success();
 }
 
-LogicalResult duplicateMatricesInFunction(
-    func::FuncOp function, llvm::StringMap<int64_t> &matrixIds,
-    int64_t &nextMatrixId) {
+LogicalResult duplicateMatricesInFunction(func::FuncOp function,
+                                          llvm::StringMap<int64_t> &matrixIds,
+                                          int64_t &nextMatrixId) {
   DenseMap<int64_t, MappingStage> stages;
   SmallVector<int64_t> stageOrder;
   int64_t maximumStageId = -1;
 
   for (Block &block : function.getBody()) {
     for (Operation &operation : block) {
-      auto stageId = operation.getAttrOfType<IntegerAttr>(
-          mapping::kStageIdAttrName);
+      auto stageId =
+          operation.getAttrOfType<IntegerAttr>(mapping::kStageIdAttrName);
       if (!stageId)
         continue;
       auto stageKind = getStageKind(&operation);
@@ -254,13 +274,14 @@ LogicalResult duplicateMatricesInFunction(
     if (auto name = physicalMVM->members.front()->getAttrOfType<StringAttr>(
             mapping::kStageNameAttrName))
       consumerName = name.getValue();
-    auto clonedArray = cloneMatrixSetup(*setup, nextStageId++, matrixId,
-                                        replicaId, consumerName,
-                                        physicalMVM->members.front(), rewriter);
+    auto clonedArray =
+        cloneMatrixSetup(*setup, nextStageId++, matrixId, replicaId,
+                         consumerName, physicalMVM->members.front(), rewriter);
     if (failed(clonedArray))
       return failure();
 
-    replacePhysicalMVMArray(*physicalMVM, *oldArray, *clonedArray);
+    if (failed(replacePhysicalMVMArray(*physicalMVM, *oldArray, *clonedArray)))
+      return failure();
     for (Operation *member : physicalMVM->members) {
       member->setAttr(tiling::kMatrixIdAttrName,
                       rewriter.getI64IntegerAttr(matrixId));
@@ -283,8 +304,8 @@ void DuplicateMatricesPass::runOnOperation() {
   for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
     if (function.isExternal())
       continue;
-    if (failed(duplicateMatricesInFunction(function, matrixIds,
-                                           nextMatrixId))) {
+    if (failed(
+            duplicateMatricesInFunction(function, matrixIds, nextMatrixId))) {
       signalPassFailure();
       return;
     }

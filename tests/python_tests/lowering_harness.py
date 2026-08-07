@@ -69,6 +69,7 @@ class LoweringCase:
     run_decompositions: bool = True
     preserve_layer_norm: bool = False
     external_linalg_lowering: bool = False
+    duplicate_matrices: bool = False
 
 
 def initialize_parameters(model: torch.nn.Module) -> None:
@@ -151,8 +152,10 @@ def lower_to_ra_tree(case: LoweringCase) -> str:
             "--sculptor-expand-mvm-to-golem="
             f"array-rows={case.array_rows} array-cols={case.array_cols}"
         ),
-        "--sculptor-build-ra-tree",
     ]
+    if case.duplicate_matrices:
+        command.append("--sculptor-duplicate-matrices")
+    command.append("--sculptor-build-ra-tree")
     result = subprocess.run(
         command,
         input=export_linalg(case),
@@ -223,21 +226,22 @@ def lower_to_tile_object(case: LoweringCase, output_dir: Path | None = None) -> 
 
     input_path = path("00-input.mlir")
     Path(input_path).write_text(export_linalg(case))
+    ra_command = [
+        str(sculptor_opt),
+        input_path,
+        "--sculptor-canonicalize-layers",
+        "--sculptor-extract-layers",
+        "--sculptor-convert-layers",
+        (
+            "--sculptor-expand-mvm-to-golem="
+            f"array-rows={case.array_rows} array-cols={case.array_cols}"
+        ),
+    ]
+    if case.duplicate_matrices:
+        ra_command.append("--sculptor-duplicate-matrices")
+    ra_command.extend(["--sculptor-build-ra-tree", "-o", path("01-ra.mlir")])
     _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            input_path,
-            "--sculptor-canonicalize-layers",
-            "--sculptor-extract-layers",
-            "--sculptor-convert-layers",
-            (
-                "--sculptor-expand-mvm-to-golem="
-                f"array-rows={case.array_rows} array-cols={case.array_cols}"
-            ),
-            "--sculptor-build-ra-tree",
-            "-o",
-            path("01-ra.mlir"),
-        ],
+        ra_command,
         f"{case.name} RA-tree lowering",
     )
     _run_sculptor_stage(

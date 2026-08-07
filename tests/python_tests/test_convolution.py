@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Python-backed tests for every supported convolution form."""
 
+import re
+
 import torch
 
 from lowering_harness import (
@@ -78,6 +80,54 @@ class ConvolutionLoweringTest(LoweringTestCase):
                 lambda: Conv2DModel(bias=True),
                 lambda: (torch.ones(1, 1, 5, 5),),
                 ("tensor<1x2x3x3xf32>",),
+            )
+        )
+
+    def test_conv2d_duplicate_matrices_rewrites_nested_physical_mvm(self):
+        lowered = self.assert_lowers(
+            LoweringCase(
+                "conv2d_duplicate_matrices_nested_loop",
+                lambda: Conv2DModel(bias=True),
+                lambda: (torch.ones(1, 1, 5, 5),),
+                ("tensor<1x2x3x3xf32>",),
+                array_rows=1024,
+                array_cols=512,
+                duplicate_matrices=True,
+            )
+        )
+
+        set_matches = re.findall(
+            r"(?m)^\s*(%[\w.]+) = sculptor\.array\.set ", lowered
+        )
+        self.assertEqual(len(set_matches), 1)
+        cloned_array = set_matches[0]
+
+        array_lines = [
+            line
+            for line in lowered.splitlines()
+            if any(
+                operation in line
+                for operation in (
+                    "sculptor.array.load ",
+                    "sculptor.array.execute ",
+                    "sculptor.array.store ",
+                )
+            )
+        ]
+        self.assertEqual(len(array_lines), 3)
+        self.assertTrue(
+            all(f", {cloned_array} " in line for line in array_lines)
+        )
+        self.assertTrue(
+            all("sculptor.mapping.stage_id" not in line for line in array_lines)
+        )
+        self.assertIn("matrix_setup_replica_0", lowered)
+        self.assertEqual(lowered.count("sculptor.array.set "), 1)
+        self.assertTrue(
+            any(
+                line.lstrip().startswith("} {")
+                and 'sculptor.mapping.stage_kind = "physical_mvm"' in line
+                for line in lowered.splitlines()
             )
         )
 

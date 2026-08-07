@@ -33,6 +33,16 @@ class TwoLinearModel(torch.nn.Module):
         return self.second(self.first(value))
 
 
+class ReusedLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(8, 8, bias=False)
+        initialize_parameters(self)
+
+    def forward(self, value):
+        return self.linear(self.linear(value))
+
+
 class LinearLoweringTest(LoweringTestCase):
     def test_two_linear_layers_have_distinct_matrix_setup_stages(self):
         lowered = self.assert_lowers(
@@ -72,6 +82,58 @@ class LinearLoweringTest(LoweringTestCase):
                 "forward_mvm_1_matrix_tile_0_0",
             },
         )
+
+    def test_duplicate_matrices_assigns_unique_replicas_to_shared_matrix(self):
+        lowered = self.assert_lowers(
+            LoweringCase(
+                name="reused_linear_duplicate_matrices",
+                model_factory=ReusedLinearModel,
+                input_factory=lambda: (torch.ones(1, 8),),
+                expected_fragments=("tensor<1x8xf32>",),
+                minimum_matrix_setups=2,
+                duplicate_matrices=True,
+            )
+        )
+
+        set_arrays = re.findall(
+            r"(?m)^\s*(%[\w.]+) = sculptor\.array\.set ", lowered
+        )
+        array_lines = [
+            line
+            for line in lowered.splitlines()
+            if any(
+                operation in line
+                for operation in (
+                    "sculptor.array.load ",
+                    "sculptor.array.execute ",
+                    "sculptor.array.store ",
+                )
+            )
+        ]
+        referenced_arrays = [
+            re.search(r", (%[\w.]+) \{", line).group(1)
+            for line in array_lines
+        ]
+        matrix_ids = {
+            int(re.search(r"sculptor\.matrix_id = (\d+)", line).group(1))
+            for line in array_lines
+        }
+        replica_ids = {
+            int(
+                re.search(
+                    r"sculptor\.matrix_replica_id = (\d+)", line
+                ).group(1)
+            )
+            for line in array_lines
+        }
+
+        self.assertEqual(len(set_arrays), 2)
+        self.assertEqual(len(set(set_arrays)), 2)
+        self.assertEqual(len(array_lines), 6)
+        self.assertEqual(referenced_arrays[:3], [set_arrays[0]] * 3)
+        self.assertEqual(referenced_arrays[3:], [set_arrays[1]] * 3)
+        self.assertEqual(matrix_ids, {0})
+        self.assertEqual(replica_ids, {0, 1})
 
     def test_linear_with_bias(self):
         self.assert_lowers(
