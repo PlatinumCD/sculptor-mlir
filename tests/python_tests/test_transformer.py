@@ -15,6 +15,7 @@ from lowering_harness import (
     LoweringTestCase,
     initialize_parameters,
     lower_to_logical_tile_placement,
+    lower_to_ra_tree,
 )
 
 
@@ -129,6 +130,35 @@ class TransformerLoweringTest(LoweringTestCase):
             ):
                 result.add(int(tile_match.group(1)))
         return result
+
+    def test_expand_digital_work_dissolves_grouped_digital_stages(self):
+        lowered = lower_to_ra_tree(
+            LoweringCase(
+                "transformer_expand_digital_work",
+                lambda: TransformerBlockModel(bias=True),
+                lambda: (torch.ones(1, 4, 384),),
+                array_rows=1024,
+                array_cols=512,
+                external_linalg_lowering=True,
+                duplicate_matrices=True,
+            ),
+            digital_workers=12,
+        )
+
+        self.assertIn(
+            "sculptor.mapping.digital_parallel_workers = 12 : i64", lowered
+        )
+        self.assertRegex(
+            lowered,
+            r"sculptor\.mapping\.expanded_digital_operation_count = [1-9][0-9]*",
+        )
+        self.assertIn("sculptor.mapping.expanded_digital_work =", lowered)
+        self.assertNotIn(
+            'sculptor.mapping.stage_kind = "digital_stage"', lowered
+        )
+        self.assertIn(
+            'sculptor.mapping.stage_kind = "physical_mvm"', lowered
+        )
 
     @staticmethod
     def placement_case():

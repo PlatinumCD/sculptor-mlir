@@ -135,7 +135,7 @@ def export_linalg(case: LoweringCase) -> str:
     return result.stdout
 
 
-def lower_to_ra_tree(case: LoweringCase) -> str:
+def lower_to_ra_tree(case: LoweringCase, digital_workers: int | None = None) -> str:
     """Run the complete pre-placement pivot lowering for one model."""
 
     sculptor_opt = Path(os.environ.get("SCULPTOR_MLIR_OPT", DEFAULT_SCULPTOR_OPT))
@@ -155,6 +155,11 @@ def lower_to_ra_tree(case: LoweringCase) -> str:
     ]
     if case.duplicate_matrices:
         command.append("--sculptor-duplicate-matrices")
+    if digital_workers is not None:
+        command.append(
+            "--sculptor-expand-digital-work="
+            f"parallel-workers={digital_workers} require-change"
+        )
     command.append("--sculptor-build-ra-tree")
     result = subprocess.run(
         command,

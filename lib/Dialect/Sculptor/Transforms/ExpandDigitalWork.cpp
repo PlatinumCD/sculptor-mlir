@@ -52,6 +52,19 @@ std::optional<int64_t> getStaticValue(OpFoldResult value) {
   return getConstantIntValue(value);
 }
 
+void dissolveDigitalMappingStages(func::FuncOp function) {
+  function.walk([](Operation *operation) {
+    auto stageKind =
+        operation->getAttrOfType<StringAttr>(kStageKindAttrName);
+    if (!stageKind || stageKind.getValue() != kDigitalStageKind)
+      return;
+
+    operation->removeAttr(kStageIdAttrName);
+    operation->removeAttr(kStageKindAttrName);
+    operation->removeAttr(kStageNameAttrName);
+  });
+}
+
 FailureOr<SmallVector<MappingWorkUnitAttr>>
 buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
                int64_t &nextWorkUnitId, OpBuilder &builder) {
@@ -185,6 +198,7 @@ void ExpandDigitalWorkPass::runOnOperation() {
     function.walk([](Operation *operation) {
       operation->removeAttr(mapping::kExpandedDigitalWorkAttrName);
     });
+    dissolveDigitalMappingStages(function);
     function->removeAttr("sculptor.mapping.digital_parallel_workers");
     function->removeAttr("sculptor.mapping.expanded_digital_operation_count");
     function->removeAttr("sculptor.mapping.expanded_digital_work_unit_count");
