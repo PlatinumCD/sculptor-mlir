@@ -257,7 +257,11 @@ def _run_sculptor_stage(command: list[str], stage: str) -> None:
         )
 
 
-def lower_to_tile_object(case: LoweringCase, output_dir: Path | None = None) -> Path:
+def lower_to_tile_object(
+    case: LoweringCase,
+    output_dir: Path | None = None,
+    digital_workers: int | None = None,
+) -> Path:
     """Lower one Python fixture through the pivot tile ABI to a RISC-V object.
 
     The compiler owns the MLIR-to-object path. ELF linking remains a platform
@@ -311,6 +315,11 @@ def lower_to_tile_object(case: LoweringCase, output_dir: Path | None = None) -> 
     ]
     if case.duplicate_matrices:
         ra_command.append("--sculptor-duplicate-matrices")
+    if digital_workers is not None:
+        ra_command.append(
+            "--sculptor-expand-digital-work="
+            f"parallel-workers={digital_workers}"
+        )
     ra_command.extend(["--sculptor-build-ra-tree", "-o", path("01-ra.mlir")])
     _run_sculptor_stage(
         ra_command,

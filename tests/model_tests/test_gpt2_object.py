@@ -32,7 +32,8 @@ class GPT2ObjectLoweringTest(unittest.TestCase):
                 array_rows=1024,
                 array_cols=512,
                 external_linalg_lowering=True,
-            )
+            ),
+            digital_workers=1,
         )
         self.assertEqual(output.read_bytes()[:4], b"\x7fELF")
 

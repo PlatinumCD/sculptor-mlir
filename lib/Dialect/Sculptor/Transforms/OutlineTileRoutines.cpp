@@ -534,6 +534,12 @@ LogicalResult addEndpoint(std::map<EndpointKey, EndpointPlan> &endpoints,
     for (Operation *member : operation.members)
       if (member->hasAttr(kStageIdAttrName))
         endpoint.mappedOperations.push_back(member);
+
+    // Digital expansion removes stage identities before exposing independent
+    // structured operations. An operation that cannot be split still has a
+    // valid mapping endpoint and must be outlined as its original root.
+    if (endpoint.mappedOperations.empty())
+      endpoint.mappedOperations.push_back(operation.operation);
   }
   endpoints.emplace(key, std::move(endpoint));
   ++operationCoverage[assignment.operationId];
