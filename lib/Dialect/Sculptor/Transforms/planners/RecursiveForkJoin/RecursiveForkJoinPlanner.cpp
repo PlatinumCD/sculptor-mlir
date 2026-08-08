@@ -80,10 +80,11 @@ public:
         return failure();
       tree.rootId = *fallback;
       tree.usedConservativeFallback = true;
-      return std::move(tree);
+    } else {
+      tree.rootId = *parsed.rootId;
     }
 
-    tree.rootId = *parsed.rootId;
+    formParallelMVMWaveCohorts(tree.rootId);
     return std::move(tree);
   }
 
@@ -404,6 +405,110 @@ private:
     }
     return {/*valid=*/true,
             addCompound(ComputeRegionKind::Sequence, children)};
+  }
+
+  bool isMVMBodyRegion(int64_t regionId, int64_t &atomId) const {
+    if (regionId < 0 || regionId >= static_cast<int64_t>(tree.regions.size()))
+      return false;
+    const ComputeRegion &region = tree.regions[regionId];
+    if (region.kind != ComputeRegionKind::Atom || region.atomId < 0 ||
+        region.atomId >= static_cast<int64_t>(tree.atoms.size()) ||
+        tree.atoms[region.atomId].kind != ComputeAtomKind::MVMBody)
+      return false;
+    atomId = region.atomId;
+    return true;
+  }
+
+  static bool containsSameNodes(ArrayRef<int64_t> left,
+                                ArrayRef<int64_t> right) {
+    if (left.size() != right.size())
+      return false;
+    return llvm::all_of(left, [&](int64_t nodeId) {
+      return llvm::is_contained(right, nodeId);
+    });
+  }
+
+  bool haveMatchingExternalFrontiers(int64_t leftAtomId,
+                                     int64_t rightAtomId) const {
+    return containsSameNodes(predecessors[leftAtomId],
+                             predecessors[rightAtomId]) &&
+           containsSameNodes(successors[leftAtomId], successors[rightAtomId]);
+  }
+
+  bool reaches(int64_t sourceId, int64_t targetId) const {
+    if (sourceId == targetId)
+      return true;
+    llvm::BitVector visited(successors.size());
+    SmallVector<int64_t> worklist{sourceId};
+    visited.set(sourceId);
+    while (!worklist.empty()) {
+      int64_t currentId = worklist.pop_back_val();
+      for (int64_t successorId : successors[currentId]) {
+        if (successorId == targetId)
+          return true;
+        if (visited.test(successorId))
+          continue;
+        visited.set(successorId);
+        worklist.push_back(successorId);
+      }
+    }
+    return false;
+  }
+
+  bool canJoinMVMWaveCohort(int64_t candidateAtomId,
+                            ArrayRef<int64_t> cohortAtomIds) const {
+    if (cohortAtomIds.empty() ||
+        !haveMatchingExternalFrontiers(cohortAtomIds.front(), candidateAtomId))
+      return false;
+    return llvm::all_of(cohortAtomIds, [&](int64_t memberAtomId) {
+      return !reaches(memberAtomId, candidateAtomId) &&
+             !reaches(candidateAtomId, memberAtomId);
+    });
+  }
+
+  // Recover parallel wave bodies when overlapping multi-exit branches forced
+  // the general fork/join parser to retain a conservative sequence.
+  void formParallelMVMWaveCohorts(int64_t regionId) {
+    if (regionId < 0 || regionId >= static_cast<int64_t>(tree.regions.size()))
+      return;
+
+    SmallVector<int64_t> originalChildren = tree.regions[regionId].childIds;
+    for (int64_t childId : originalChildren)
+      formParallelMVMWaveCohorts(childId);
+
+    if (tree.regions[regionId].kind != ComputeRegionKind::Sequence)
+      return;
+
+    SmallVector<int64_t> groupedChildren;
+    for (size_t index = 0; index < originalChildren.size();) {
+      int64_t firstAtomId = -1;
+      if (!isMVMBodyRegion(originalChildren[index], firstAtomId)) {
+        groupedChildren.push_back(originalChildren[index++]);
+        continue;
+      }
+
+      SmallVector<int64_t> cohortRegions{originalChildren[index]};
+      SmallVector<int64_t> cohortAtoms{firstAtomId};
+      size_t nextIndex = index + 1;
+      while (nextIndex < originalChildren.size()) {
+        int64_t candidateAtomId = -1;
+        if (!isMVMBodyRegion(originalChildren[nextIndex], candidateAtomId) ||
+            !canJoinMVMWaveCohort(candidateAtomId, cohortAtoms))
+          break;
+        cohortRegions.push_back(originalChildren[nextIndex]);
+        cohortAtoms.push_back(candidateAtomId);
+        ++nextIndex;
+      }
+
+      if (cohortRegions.size() == 1) {
+        groupedChildren.push_back(cohortRegions.front());
+      } else {
+        groupedChildren.push_back(
+            *addCompound(ComputeRegionKind::Parallel, cohortRegions));
+      }
+      index = nextIndex;
+    }
+    tree.regions[regionId].childIds = std::move(groupedChildren);
   }
 
   RegionParseResult parseFork(int64_t forkId, int64_t outerStopId) {

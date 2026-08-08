@@ -40,6 +40,22 @@ lane count.
 Both policies preserve matrix-setup lane bindings. The policy affects logical
 tile formation, not physical mesh placement.
 
+## Setup Binding Policy
+
+`--sculptor-plan-mapping` also accepts
+`setup-binding-policy=global|consumer-anchored` and defaults to `global`.
+
+- `global` preserves the original behavior: persistent analog bindings are
+  available to unrelated digital work throughout logical-tile realization.
+- `consumer-anchored` reserves each setup-bound tile for its MVM body. After
+  realization, it orders active logical-tile identities by their first
+  non-setup RA-tree use. Matrix setup still executes during initialization,
+  but its lane appears at the point where its MVM consumer enters the S-T
+  flow.
+
+The setup policy is independent of `mvm-body-policy`. It changes the logical
+RA-tree-to-S-T realization and does not perform physical mesh placement.
+
 ## Logical Tiles
 
 The applied mapping plan creates logical tiles. A logical tile owns:

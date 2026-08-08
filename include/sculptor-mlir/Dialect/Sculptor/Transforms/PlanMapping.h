@@ -42,6 +42,12 @@ struct PlanMappingPass
       llvm::cl::desc("MVM body realization policy: packed or spread"),
       llvm::cl::init("spread")};
 
+  Option<std::string> setupBindingPolicy{
+      *this, "setup-binding-policy",
+      llvm::cl::desc("Matrix setup lane-binding policy: global or "
+                     "consumer-anchored"),
+      llvm::cl::init("global")};
+
   Option<bool> balanceDigitalWork{
       *this, "balance-digital-work",
       llvm::cl::desc("Balance weighted digital work across logical cores "
@@ -125,6 +131,7 @@ struct PlanMappingPass
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;
     mvmBodyPolicy = pass.mvmBodyPolicy;
+    setupBindingPolicy = pass.setupBindingPolicy;
     balanceDigitalWork = pass.balanceDigitalWork;
     arrayRows = pass.arrayRows;
     arrayCols = pass.arrayCols;

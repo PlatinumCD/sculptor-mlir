@@ -458,6 +458,7 @@ def Sculptor_MappingPlanAttr
     "StringAttr":$planner,
     EnumParameter<Sculptor_MappingPlanObjective>:$objective,
     "StringAttr":$mvmBodyPolicy,
+    "StringAttr":$setupBindingPolicy,
     "StringAttr":$raTreeFingerprint,
     "BoolAttr":$feasible,
     "FloatAttr":$estimatedLatencyNs,

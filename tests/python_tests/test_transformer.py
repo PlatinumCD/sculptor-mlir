@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Python-backed Transformer block lowering test."""
 
+import json
+import os
+from pathlib import Path
 import re
+import subprocess
+import tempfile
 
 import torch
 
@@ -44,7 +49,55 @@ class TransformerBlockModel(torch.nn.Module):
         return self.transformer(value, mask=self.mask, is_causal=True)
 
 
+class DualUseParallelLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.left = torch.nn.Linear(8, 8, bias=False)
+        self.right = torch.nn.Linear(8, 8, bias=False)
+        initialize_parameters(self)
+
+    def forward(self, value):
+        left = self.left(value)
+        right = self.right(value)
+        return left + right, left * right
+
+
 class TransformerLoweringTest(LoweringTestCase):
+    @staticmethod
+    def ra_tree_report(placed_ir: str) -> dict:
+        repository_root = Path(__file__).resolve().parents[2]
+        analog_root = repository_root.parent.parent
+        report_tool = Path(
+            os.environ.get(
+                "SCULPTOR_RA_TREE_REPORT",
+                analog_root
+                / "build"
+                / "sculptor-mlir-pivot"
+                / "bin"
+                / "sculptor-ra-tree-report",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "placed.mlir"
+            json_path = Path(directory) / "report.json"
+            html_path = Path(directory) / "report.html"
+            input_path.write_text(placed_ir)
+            result = subprocess.run(
+                [
+                    str(report_tool),
+                    str(input_path),
+                    f"--json-output={json_path}",
+                    "-o",
+                    str(html_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode:
+                raise AssertionError(f"RA-tree report failed:\n{result.stderr}")
+            return json.loads(json_path.read_text())
+
     @staticmethod
     def stage_operation_id(placed_ir: str, stage_name: str) -> int:
         return TransformerLoweringTest.stage_operation_id_matching(
@@ -191,6 +244,41 @@ class TransformerLoweringTest(LoweringTestCase):
                 lookahead=0,
             )
 
+    def test_recursive_groups_frontier_equivalent_mvm_waves(self):
+        placed_ir = lower_to_logical_tile_placement(
+            LoweringCase(
+                "frontier_equivalent_mvm_waves",
+                DualUseParallelLinearModel,
+                lambda: (torch.ones(1, 8),),
+                array_rows=8,
+                array_cols=8,
+            ),
+            tile_order="priority",
+            priority_mode="max",
+            candidate_scope="frontier",
+            lookahead=1,
+            mapping_strategies="setup-first,recursive-fork-join",
+            mvm_body_policy="spread",
+        )
+        report = self.ra_tree_report(placed_ir)
+        nodes = report["functions"][0]["tree"]["nodes"]
+        nodes_by_id = {node["id"]: node for node in nodes}
+
+        wave_parents = []
+        for wave_id in (0, 1):
+            roots = [
+                node
+                for node in nodes
+                if node["mvm_wave_id"] == wave_id
+                and node["kind"] == "temporal_cut"
+                and nodes_by_id[node["parent_id"]]["mvm_wave_id"] == -1
+            ]
+            self.assertEqual(len(roots), 1)
+            wave_parents.append(nodes_by_id[roots[0]["parent_id"]])
+
+        self.assertEqual(wave_parents[0]["id"], wave_parents[1]["id"])
+        self.assertEqual(wave_parents[0]["kind"], "spatial_cut")
+
     def test_recursive_mvm_body_policies(self):
         case = LoweringCase(
             "transformer_recursive_mvm_body_policy",
@@ -260,9 +348,70 @@ class TransformerLoweringTest(LoweringTestCase):
                     )
                     self.assertEqual(len(recombine_tiles), 1)
                     home_tiles.append(next(iter(recombine_tiles)))
-                    self.assertEqual(len(set(home_tiles)), 1)
-                    self.assertEqual(home_tiles[0], member_tiles[0])
-                    self.assertEqual(len(set(member_tiles)), 3)
+                self.assertEqual(len(set(home_tiles)), 1)
+                self.assertEqual(home_tiles[0], member_tiles[0])
+                self.assertEqual(len(set(member_tiles)), 3)
+
+    def test_consumer_anchored_setup_bindings_follow_ra_flow(self):
+        case = LoweringCase(
+            "transformer_consumer_anchored_setup_bindings",
+            lambda: TransformerBlockModel(bias=True),
+            lambda: (torch.ones(1, 4, 384),),
+            array_rows=1024,
+            array_cols=512,
+            external_linalg_lowering=True,
+            duplicate_matrices=True,
+        )
+        placed_ir = lower_to_logical_tile_placement(
+            case,
+            tile_order="priority",
+            priority_mode="max",
+            candidate_scope="frontier",
+            lookahead=3,
+            mapping_strategies="setup-first,recursive-fork-join",
+            mvm_body_policy="spread",
+            setup_binding_policy="consumer-anchored",
+        )
+        self.assertIn(
+            'sculptor.mapping.setup_binding_policy = "consumer-anchored"',
+            placed_ir,
+        )
+
+        head_recombine_id = self.stage_operation_id(
+            placed_ir, "transformer_block_self_head_recombine"
+        )
+        head_recombine_tiles = self.operation_logical_tiles(
+            placed_ir, head_recombine_id
+        )
+        self.assertTrue(head_recombine_tiles)
+
+        output_body_tiles = []
+        for token in range(4):
+            vector_id = self.stage_operation_id_matching(
+                placed_ir,
+                f"transformer_block_attn_output_b0_s{token}_mvm_"
+                r"[0-9]+_vector_tile_0",
+            )
+            setup_id = self.stage_operation_id_matching(
+                placed_ir,
+                f"transformer_block_attn_output_b0_s{token}_mvm_"
+                r"[0-9]+_array_0_0_matrix_setup_replica_[0-9]+",
+            )
+            mvm_id = self.stage_operation_id_matching(
+                placed_ir,
+                f"transformer_block_attn_output_b0_s{token}_mvm_"
+                r"[0-9]+_array_0_0",
+            )
+            vector_tiles = self.operation_logical_tiles(placed_ir, vector_id)
+            setup_tiles = self.operation_logical_tiles(placed_ir, setup_id)
+            mvm_tiles = self.operation_logical_tiles(placed_ir, mvm_id)
+            self.assertEqual(vector_tiles, setup_tiles)
+            self.assertEqual(vector_tiles, mvm_tiles)
+            self.assertEqual(len(vector_tiles), 1)
+            output_body_tiles.append(next(iter(vector_tiles)))
+
+        self.assertEqual(len(set(output_body_tiles)), 4)
+        self.assertGreater(min(output_body_tiles), max(head_recombine_tiles))
 
     def test_transformer_block_with_bias(self):
         self.assert_lowers(

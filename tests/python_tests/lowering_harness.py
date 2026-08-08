@@ -180,6 +180,7 @@ def lower_to_logical_tile_placement(
     lookahead: int = 1,
     mapping_strategies: str = "setup-first",
     mvm_body_policy: str = "spread",
+    setup_binding_policy: str = "global",
 ) -> str:
     """Lower one model through configurable greedy logical-tile placement."""
 
@@ -206,6 +207,7 @@ def lower_to_logical_tile_placement(
             (
                 f"--sculptor-plan-mapping=strategies={mapping_strategies} "
                 f"mvm-body-policy={mvm_body_policy} "
+                f"setup-binding-policy={setup_binding_policy} "
                 f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
                 f"arrays-per-core={case.arrays_per_core} "
                 f"array-rows={case.array_rows} array-cols={case.array_cols}"

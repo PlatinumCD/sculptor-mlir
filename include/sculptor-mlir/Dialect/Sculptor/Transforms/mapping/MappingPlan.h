@@ -50,6 +50,7 @@ struct MappingPlan {
   std::string plannerName;
   MappingObjective objective;
   MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;
+  SetupBindingPolicy setupBindingPolicy = SetupBindingPolicy::Global;
   ResourceAllocationTree selectedTree;
   MappingEvaluation evaluation;
   SmallVector<MappingCandidateSummary, 0> candidates;

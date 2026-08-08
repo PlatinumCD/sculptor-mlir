@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -127,6 +128,10 @@ public:
     if (!*assignedBindings)
       return realization;
 
+    if (problem.setupBindingPolicy == SetupBindingPolicy::ConsumerAnchored &&
+        failed(initializeConsumerAnchoredReservations(groups)))
+      return failure();
+
     if (failed(discoverUniformSiblingTemplates(tree.rootId)))
       return failure();
 
@@ -148,6 +153,10 @@ public:
       return failure();
     if (!*assigned)
       return realization;
+
+    if (problem.setupBindingPolicy == SetupBindingPolicy::ConsumerAnchored &&
+        failed(canonicalizeConsumerAnchoredTileIds()))
+      return failure();
 
     llvm::sort(realization.nodeAllocations,
                [](const MappingNodeResourceAllocation &left,
@@ -374,6 +383,119 @@ private:
     return getPinnedDigitalTile(operation);
   }
 
+  LogicalResult initializeConsumerAnchoredReservations(
+      ArrayRef<const LaneBindingGroup *> groups) {
+    for (const LaneBindingGroup *group : groups) {
+      auto binding = bindingLanes.find(group->id);
+      if (binding == bindingLanes.end()) {
+        problem.anchor->emitError(
+            "consumer-anchored setup policy cannot resolve lane-binding "
+            "group ")
+            << group->id;
+        return failure();
+      }
+      bool hasPhysicalMVM = llvm::any_of(group->operationIds, [&](int64_t id) {
+        return id >= 0 &&
+               id < static_cast<int64_t>(problem.graph.operations.size()) &&
+               problem.graph.operations[id].kind ==
+                   ComputeOperationKind::PhysicalMVM;
+      });
+      if (!hasPhysicalMVM) {
+        problem.graph.operations[group->setupOperationId].operation->emitError(
+            "consumer-anchored setup has no physical MVM consumer");
+        return failure();
+      }
+      consumerAnchoredReservedTiles.insert(binding->second.tileId);
+    }
+    return success();
+  }
+
+  bool isReservedForConsumer(int64_t tileId) const {
+    return problem.setupBindingPolicy ==
+               SetupBindingPolicy::ConsumerAnchored &&
+           consumerAnchoredReservedTiles.contains(tileId);
+  }
+
+  bool canUseUnpinnedDigitalTile(int64_t tileId) const {
+    return !isReservedForConsumer(tileId);
+  }
+
+  void collectNonSetupLeafOrder(int64_t nodeId,
+                                DenseMap<int64_t, int64_t> &leafOrder,
+                                int64_t &nextOrder) const {
+    const StructuralRATreeNode *node = nodesById.lookup(nodeId);
+    assert(node && "verified RA tree must contain every referenced node");
+    if (node->kind == RATreeNodeKind::Leaf) {
+      if (problem.graph.operations[node->operationId].kind !=
+          ComputeOperationKind::MatrixSetup)
+        leafOrder[node->id] = nextOrder++;
+      return;
+    }
+    for (int64_t childId : node->childIds)
+      collectNonSetupLeafOrder(childId, leafOrder, nextOrder);
+  }
+
+  LogicalResult canonicalizeConsumerAnchoredTileIds() {
+    DenseMap<int64_t, int64_t> leafOrder;
+    int64_t nextOrder = 0;
+    collectNonSetupLeafOrder(tree.rootId, leafOrder, nextOrder);
+
+    DenseSet<int64_t> activeTileSet;
+    DenseMap<int64_t, int64_t> firstUse;
+    for (const MappingLeafAssignment &assignment :
+         realization.leafAssignments) {
+      activeTileSet.insert(assignment.tileId);
+      auto order = leafOrder.find(assignment.leafId);
+      if (order == leafOrder.end())
+        continue;
+      auto current = firstUse.find(assignment.tileId);
+      if (current == firstUse.end() || order->second < current->second)
+        firstUse[assignment.tileId] = order->second;
+    }
+
+    SmallVector<int64_t> targetTileIds(activeTileSet.begin(),
+                                       activeTileSet.end());
+    llvm::sort(targetTileIds);
+    SmallVector<int64_t> tilesByConsumer(targetTileIds.begin(),
+                                         targetTileIds.end());
+    llvm::sort(tilesByConsumer, [&](int64_t left, int64_t right) {
+      int64_t leftUse = firstUse.contains(left)
+                            ? firstUse.lookup(left)
+                            : std::numeric_limits<int64_t>::max();
+      int64_t rightUse = firstUse.contains(right)
+                             ? firstUse.lookup(right)
+                             : std::numeric_limits<int64_t>::max();
+      return std::pair(leftUse, left) < std::pair(rightUse, right);
+    });
+
+    DenseMap<int64_t, int64_t> remap;
+    for (auto [index, oldTileId] : llvm::enumerate(tilesByConsumer))
+      remap[oldTileId] = targetTileIds[index];
+
+    auto remapTile = [&](int64_t tileId) {
+      auto mapped = remap.find(tileId);
+      return mapped == remap.end() ? tileId : mapped->second;
+    };
+    for (MappingLeafAssignment &assignment : realization.leafAssignments)
+      assignment.tileId = remapTile(assignment.tileId);
+    for (MappingNodeResourceAllocation &allocation :
+         realization.nodeAllocations) {
+      for (int64_t &tileId : allocation.digitalTileIds)
+        tileId = remapTile(tileId);
+      for (MappingAnalogLaneRef &lane : allocation.analogLanes)
+        lane.tileId = remapTile(lane.tileId);
+      sortAndUnique(allocation.digitalTileIds);
+      sortAnalogLanes(allocation.analogLanes);
+    }
+
+    SmallVector<int64_t> remappedWork = realization.digitalWorkPerTile;
+    for (int64_t oldTileId : targetTileIds)
+      remappedWork[remapTile(oldTileId)] =
+          realization.digitalWorkPerTile[oldTileId];
+    realization.digitalWorkPerTile = std::move(remappedWork);
+    return success();
+  }
+
   std::string getSubtreeShapeSignature(int64_t nodeId) {
     auto cached = subtreeShapeSignatures.find(nodeId);
     if (cached != subtreeShapeSignatures.end())
@@ -544,9 +666,22 @@ private:
       return result;
     };
     int64_t selected = pool.digitalTileIds.front();
+    auto firstCandidate = llvm::find_if(pool.digitalTileIds, [&](int64_t id) {
+      return canUseUnpinnedDigitalTile(id);
+    });
+    if (firstCandidate == pool.digitalTileIds.end()) {
+      realization = makeInfeasible(
+          problem, (Twine("digital co-location group ") + Twine(groupId) +
+                    " has no consumer-unreserved core")
+                       .str());
+      return std::optional<int64_t>{};
+    }
+    selected = *firstCandidate;
     auto selectedScore =
         digitalTileScore(selected, affinity(selected), phaseWork);
-    for (int64_t tileId : ArrayRef(pool.digitalTileIds).drop_front()) {
+    for (int64_t tileId : pool.digitalTileIds) {
+      if (!canUseUnpinnedDigitalTile(tileId))
+        continue;
       auto score = digitalTileScore(tileId, affinity(tileId), phaseWork);
       if (score < selectedScore) {
         selected = tileId;
@@ -1173,6 +1308,10 @@ private:
     }
 
     SmallVector<int64_t> digitalCandidates = parentPool.digitalTileIds;
+    llvm::erase_if(digitalCandidates, [&](int64_t tileId) {
+      return isReservedForConsumer(tileId) &&
+             !llvm::is_contained(demand->requiredDigitalTileIds, tileId);
+    });
     DenseMap<int64_t, int64_t> candidateAffinities;
     candidateAffinities.reserve(digitalCandidates.size());
     for (int64_t tileId : digitalCandidates)
@@ -1266,12 +1405,24 @@ private:
         }
         assignment.tileId = *pinnedTile;
       } else {
-        assignment.tileId = pool.digitalTileIds.front();
+        auto firstCandidate = llvm::find_if(
+            pool.digitalTileIds,
+            [&](int64_t tileId) { return canUseUnpinnedDigitalTile(tileId); });
+        if (firstCandidate == pool.digitalTileIds.end()) {
+          realization = makeInfeasible(
+              problem, (Twine("digital leaf ") + Twine(node.id) +
+                        " has no consumer-unreserved core")
+                           .str());
+          return false;
+        }
+        assignment.tileId = *firstCandidate;
         auto selectedScore = digitalTileScore(
             assignment.tileId,
             tileAffinity(node.operationId, assignment.tileId, node.workUnitId),
             phaseWork);
-        for (int64_t tileId : ArrayRef(pool.digitalTileIds).drop_front()) {
+        for (int64_t tileId : pool.digitalTileIds) {
+          if (!canUseUnpinnedDigitalTile(tileId))
+            continue;
           auto score = digitalTileScore(
               tileId, tileAffinity(node.operationId, tileId, node.workUnitId),
               phaseWork);
@@ -1377,6 +1528,7 @@ private:
   DenseMap<int64_t, SmallVector<LeafEndpoint>> subtreeEndpoints;
   DenseMap<int64_t, std::string> subtreeShapeSignatures;
   DenseMap<int64_t, MappingAnalogLaneRef> bindingLanes;
+  DenseSet<int64_t> consumerAnchoredReservedTiles;
   DenseMap<int64_t, int64_t> waveTiles;
   std::map<std::pair<int64_t, int64_t>, int64_t> waveMemberTiles;
   std::map<LeafEndpoint, int64_t> digitalColocationGroupByEndpoint;

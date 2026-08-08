@@ -617,6 +617,9 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
     json.attribute("planner", plan.getPlanner().getValue());
     json.attribute("objective",
                    stringifyMappingPlanObjective(plan.getObjective()));
+    json.attribute("mvm_body_policy", plan.getMvmBodyPolicy().getValue());
+    json.attribute("setup_binding_policy",
+                   plan.getSetupBindingPolicy().getValue());
     json.attribute("ra_tree_fingerprint",
                    plan.getRaTreeFingerprint().getValue());
     json.attribute("feasible", plan.getFeasible().getValue());

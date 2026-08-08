@@ -124,10 +124,13 @@ void PlanMappingPass::runOnOperation() {
       mapping::parseMappingObjective(objective, module);
   FailureOr<mapping::MVMBodyPolicy> parsedMVMBodyPolicy =
       mapping::parseMVMBodyPolicy(mvmBodyPolicy, module);
+  FailureOr<mapping::SetupBindingPolicy> parsedSetupBindingPolicy =
+      mapping::parseSetupBindingPolicy(setupBindingPolicy, module);
   FailureOr<SmallVector<std::string>> strategyNames =
       parseStrategyPipeline(strategies, module);
   if (failed(hardware) || failed(parsedObjective) ||
-      failed(parsedMVMBodyPolicy) || failed(strategyNames)) {
+      failed(parsedMVMBodyPolicy) || failed(parsedSetupBindingPolicy) ||
+      failed(strategyNames)) {
     signalPassFailure();
     return;
   }
@@ -178,6 +181,7 @@ void PlanMappingPass::runOnOperation() {
                                       *logicalTileShape,
                                       *parsedObjective,
                                       *parsedMVMBodyPolicy,
+                                      *parsedSetupBindingPolicy,
                                       balanceDigitalWork,
                                       isFinalPlanner,
                                       func};
@@ -208,6 +212,7 @@ void PlanMappingPass::runOnOperation() {
     mapping::MappingPlan plan = std::move(*lastStagePlan);
     plan.plannerName = llvm::join(*strategyNames, ",");
     plan.mvmBodyPolicy = *parsedMVMBodyPolicy;
+    plan.setupBindingPolicy = *parsedSetupBindingPolicy;
     plan.selectedTree = std::move(currentTree);
     if (strategyNames->size() > 1) {
       plan.candidates.clear();
@@ -299,6 +304,10 @@ void PlanMappingPass::runOnOperation() {
     func->setAttr("sculptor.mapping.mvm_body_policy",
                   StringAttr::get(&getContext(), mapping::stringifyMVMBodyPolicy(
                                                     *parsedMVMBodyPolicy)));
+    func->setAttr(
+        "sculptor.mapping.setup_binding_policy",
+        StringAttr::get(&getContext(), mapping::stringifySetupBindingPolicy(
+                                          *parsedSetupBindingPolicy)));
     if (balanceDigitalWork) {
       func->setAttr("sculptor.mapping.digital_work_balancing",
                     BoolAttr::get(&getContext(), true));

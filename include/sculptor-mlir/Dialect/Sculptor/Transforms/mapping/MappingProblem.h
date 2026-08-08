@@ -17,6 +17,7 @@ struct MappingProblem {
   LogicalTileShape logicalTileShape;
   MappingObjective objective;
   MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;
+  SetupBindingPolicy setupBindingPolicy = SetupBindingPolicy::Global;
   bool balanceDigitalWork = false;
   /// Intermediate refinements need costs and structural feasibility, but only
   /// the final tree needs a concrete logical-tile realization.

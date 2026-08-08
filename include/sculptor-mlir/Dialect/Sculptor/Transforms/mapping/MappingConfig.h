@@ -15,6 +15,7 @@ enum class AnalogIOPolicy { Shared };
 enum class AnalogArrayExecutionPolicy { Concurrent };
 enum class NetworkContentionModel { None, LinkSerialized };
 enum class MVMBodyPolicy { Packed, Spread };
+enum class SetupBindingPolicy { Global, ConsumerAnchored };
 
 struct MappingObjective {
   MappingObjectiveKind kind = MappingObjectiveKind::Latency;
@@ -54,10 +55,13 @@ FailureOr<NetworkContentionModel>
 parseNetworkContentionModel(StringRef value, Operation *anchor);
 FailureOr<MVMBodyPolicy> parseMVMBodyPolicy(StringRef value,
                                             Operation *anchor);
+FailureOr<SetupBindingPolicy> parseSetupBindingPolicy(StringRef value,
+                                                      Operation *anchor);
 
 StringRef stringifyMappingObjective(MappingObjectiveKind objective);
 StringRef stringifyNetworkContentionModel(NetworkContentionModel model);
 StringRef stringifyMVMBodyPolicy(MVMBodyPolicy policy);
+StringRef stringifySetupBindingPolicy(SetupBindingPolicy policy);
 
 } // namespace mapping
 } // namespace sculptor

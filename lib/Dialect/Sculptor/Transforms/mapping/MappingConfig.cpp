@@ -94,6 +94,17 @@ FailureOr<MVMBodyPolicy> parseMVMBodyPolicy(StringRef value,
   return failure();
 }
 
+FailureOr<SetupBindingPolicy> parseSetupBindingPolicy(StringRef value,
+                                                      Operation *anchor) {
+  if (value == "global")
+    return SetupBindingPolicy::Global;
+  if (value == "consumer-anchored")
+    return SetupBindingPolicy::ConsumerAnchored;
+  anchor->emitError("unknown setup binding policy '")
+      << value << "'; expected 'global' or 'consumer-anchored'";
+  return failure();
+}
+
 StringRef stringifyMappingObjective(MappingObjectiveKind objective) {
   switch (objective) {
   case MappingObjectiveKind::Latency:
@@ -120,6 +131,16 @@ StringRef stringifyMVMBodyPolicy(MVMBodyPolicy policy) {
     return "spread";
   }
   llvm_unreachable("unknown MVM body policy");
+}
+
+StringRef stringifySetupBindingPolicy(SetupBindingPolicy policy) {
+  switch (policy) {
+  case SetupBindingPolicy::Global:
+    return "global";
+  case SetupBindingPolicy::ConsumerAnchored:
+    return "consumer-anchored";
+  }
+  llvm_unreachable("unknown setup binding policy");
 }
 
 } // namespace mapping

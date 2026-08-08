@@ -3193,7 +3193,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       document.querySelector("#plan-summary-title").textContent =
         `${plan.planner} · ${plan.objective}`;
       document.querySelector("#plan-summary-detail").textContent =
-        `${formatNanoseconds(plan.estimated_latency_ns)} · ${plan.pipeline_stages} pipeline stages · ${plan.required_resource_units} resource units`;
+        `${formatNanoseconds(plan.estimated_latency_ns)} · ${plan.pipeline_stages} pipeline stages · ${plan.required_resource_units} resource units · ${plan.mvm_body_policy} MVM · ${plan.setup_binding_policy} setup`;
 
       const selected = plan.candidates.find(candidate => candidate.selected);
       document.querySelector("#plan-candidates").innerHTML = plan.candidates.map(candidate => {
