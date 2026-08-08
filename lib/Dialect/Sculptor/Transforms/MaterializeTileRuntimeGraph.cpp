@@ -505,7 +505,6 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
     if (!group.empty()) {
       TileRoutineRouteAttr first = group.front();
       if (first.getByteSize() != route.getByteSize() ||
-          first.getTensorId() != route.getTensorId() ||
           first.getSourceTile() != route.getSourceTile()) {
         return module.emitError(
             "coalesced outgoing routes have inconsistent payload metadata");
@@ -662,7 +661,11 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
   }
   std::map<int64_t, Value> outgoingResources;
   for (const auto &[key, routes] : outgoingGroups) {
-    TileRoutineRouteAttr canonicalRoute = routes.front();
+    TileRoutineRouteAttr canonicalRoute = *std::min_element(
+        routes.begin(), routes.end(),
+        [](TileRoutineRouteAttr lhs, TileRoutineRouteAttr rhs) {
+          return lhs.getId().getInt() < rhs.getId().getInt();
+        });
     Value resource = createResource<TaskGraphRouteOutputOp>(
         builder, module.getLoc(), graph, outgoingGroupTypes.at(key),
         canonicalRoute.getResourceId().getInt());
