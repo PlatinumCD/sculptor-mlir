@@ -261,6 +261,11 @@ def lower_to_tile_object(
     case: LoweringCase,
     output_dir: Path | None = None,
     digital_workers: int | None = None,
+    mapping_strategies: str = "setup-first",
+    mvm_body_policy: str = "spread",
+    setup_binding_policy: str = "global",
+    balance_digital_work: bool = False,
+    compile_all_active_tiles: bool = False,
 ) -> Path:
     """Lower one Python fixture through the pivot tile ABI to a RISC-V object.
 
@@ -325,14 +330,21 @@ def lower_to_tile_object(
         ra_command,
         f"{case.name} RA-tree lowering",
     )
+    plan_options = (
+        f"strategies={mapping_strategies} "
+        f"mvm-body-policy={mvm_body_policy} "
+        f"setup-binding-policy={setup_binding_policy} "
+        f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
+        f"arrays-per-core={case.arrays_per_core} "
+        f"array-rows={case.array_rows} array-cols={case.array_cols}"
+    )
+    if balance_digital_work:
+        plan_options += " balance-digital-work"
     _run_sculptor_stage(
         [
             str(sculptor_opt),
             path("01-ra.mlir"),
-            "--sculptor-plan-mapping=strategies=setup-first "
-            f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
-            f"arrays-per-core={case.arrays_per_core} "
-            f"array-rows={case.array_rows} array-cols={case.array_cols}",
+            f"--sculptor-plan-mapping={plan_options}",
             "-o",
             path("02-plan.mlir"),
         ],
@@ -362,109 +374,131 @@ def lower_to_tile_object(
         ],
         f"{case.name} routine outlining",
     )
-    _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            path("04-outlined.mlir"),
-            "--sculptor-extract-tile-module=tile-id=0",
-            "-o",
-            path("05-extracted.mlir"),
-        ],
-        f"{case.name} tile extraction",
-    )
-    _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            path("05-extracted.mlir"),
-            "--sculptor-materialize-tile-runtime-graph",
-            "-o",
-            path("06-runtime.mlir"),
-        ],
-        f"{case.name} runtime graph materialization",
-    )
-    _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            path("06-runtime.mlir"),
-            "--sculptor-finalize-tile-runtime-graph",
-            "-o",
-            path("07-finalized.mlir"),
-        ],
-        f"{case.name} tile resource finalization",
-    )
-    _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            path("07-finalized.mlir"),
-            "--sculptor-lower-golem-to-llvm-shims",
-            "--canonicalize",
-            "--cse",
-            "--empty-tensor-to-alloc-tensor",
-            "--one-shot-bufferize=bufferize-function-boundaries "
-            "function-boundary-type-conversion=identity-layout-map",
-            "--buffer-results-to-out-params=hoist-static-allocs",
-            "--convert-bufferization-to-memref",
-            "--buffer-hoisting",
-            "--buffer-loop-hoisting",
-            "--buffer-deallocation-pipeline",
-            "--optimize-allocation-liveness",
-            "--convert-linalg-to-loops",
-            "--lower-affine",
-            "--convert-scf-to-cf",
-            "--convert-vector-to-llvm",
-            "--convert-math-to-libm",
-            "--convert-math-to-llvm",
-            "--expand-strided-metadata",
-            "--lower-affine",
-            "--convert-arith-to-llvm",
-            "--convert-index-to-llvm",
-            "--convert-cf-to-llvm",
-            "--finalize-memref-to-llvm",
-            "--convert-func-to-llvm",
-            "--reconcile-unrealized-casts",
-            "-o",
-            path("08-llvm.mlir"),
-        ],
-        f"{case.name} LLVM dialect lowering",
-    )
-    _run_sculptor_stage(
-        [
-            str(sculptor_opt),
-            path("08-llvm.mlir"),
-            "--sculptor-emit-golem-tile-abi",
-            "--sculptor-finalize-golem-intrinsics",
-            "-o",
-            path("09-abi.mlir"),
-        ],
-        f"{case.name} Golem tile ABI emission",
-    )
-    _run_sculptor_stage(
-        [str(translate), "--mlir-to-llvmir", path("09-abi.mlir"), "-o", path("10.ll")],
-        f"{case.name} LLVM translation",
-    )
-
     target = os.environ.get("GOLEM_TARGET", "riscv64-unknown-elf")
     cpu = os.environ.get("GOLEM_CPU", "golem-analog")
     abi = os.environ.get("GOLEM_ABI", "lp64d")
-    object_path = output_dir / "core-0.o"
-    _run_sculptor_stage(
-        [
-            str(clang),
-            f"--target={target}",
-            f"-mcpu={cpu}",
-            f"-mabi={abi}",
-            "-mcmodel=medany",
-            "-ffreestanding",
-            "-fno-stack-protector",
-            "-O3",
-            "-c",
-            path("10.ll"),
-            "-o",
-            str(object_path),
-        ],
-        f"{case.name} RISC-V object compilation",
-    )
-    return object_path
+    tile_ids = [0]
+    if compile_all_active_tiles:
+        outlined = Path(path("04-outlined.mlir")).read_text()
+        tile_ids = sorted(
+            {
+                int(tile_id)
+                for tile_id in re.findall(
+                    r"(?m)^\s*module @tile_(\d+)(?:\s|$)", outlined
+                )
+            }
+        )
+        if not tile_ids:
+            raise AssertionError(f"{case.name} deployment has no active tiles")
+
+    for tile_id in tile_ids:
+        suffix = "" if tile_id == 0 else f"-tile-{tile_id}"
+        extracted = path(f"05-extracted{suffix}.mlir")
+        runtime = path(f"06-runtime{suffix}.mlir")
+        finalized = path(f"07-finalized{suffix}.mlir")
+        llvm_dialect = path(f"08-llvm{suffix}.mlir")
+        tile_abi = path(f"09-abi{suffix}.mlir")
+        llvm_ir = path(f"10{suffix}.ll")
+        object_path = output_dir / f"core-{tile_id}.o"
+
+        _run_sculptor_stage(
+            [
+                str(sculptor_opt),
+                path("04-outlined.mlir"),
+                f"--sculptor-extract-tile-module=tile-id={tile_id}",
+                "-o",
+                extracted,
+            ],
+            f"{case.name} tile {tile_id} extraction",
+        )
+        _run_sculptor_stage(
+            [
+                str(sculptor_opt),
+                extracted,
+                "--sculptor-materialize-tile-runtime-graph",
+                "-o",
+                runtime,
+            ],
+            f"{case.name} tile {tile_id} runtime graph materialization",
+        )
+        _run_sculptor_stage(
+            [
+                str(sculptor_opt),
+                runtime,
+                "--sculptor-finalize-tile-runtime-graph",
+                "-o",
+                finalized,
+            ],
+            f"{case.name} tile {tile_id} resource finalization",
+        )
+        _run_sculptor_stage(
+            [
+                str(sculptor_opt),
+                finalized,
+                "--sculptor-lower-golem-to-llvm-shims",
+                "--canonicalize",
+                "--cse",
+                "--empty-tensor-to-alloc-tensor",
+                "--one-shot-bufferize=bufferize-function-boundaries "
+                "function-boundary-type-conversion=identity-layout-map",
+                "--buffer-results-to-out-params=hoist-static-allocs",
+                "--convert-bufferization-to-memref",
+                "--buffer-hoisting",
+                "--buffer-loop-hoisting",
+                "--buffer-deallocation-pipeline",
+                "--optimize-allocation-liveness",
+                "--convert-linalg-to-loops",
+                "--lower-affine",
+                "--convert-scf-to-cf",
+                "--convert-vector-to-llvm",
+                "--convert-math-to-libm",
+                "--convert-math-to-llvm",
+                "--expand-strided-metadata",
+                "--lower-affine",
+                "--convert-arith-to-llvm",
+                "--convert-index-to-llvm",
+                "--convert-cf-to-llvm",
+                "--finalize-memref-to-llvm",
+                "--convert-func-to-llvm",
+                "--reconcile-unrealized-casts",
+                "-o",
+                llvm_dialect,
+            ],
+            f"{case.name} tile {tile_id} LLVM dialect lowering",
+        )
+        _run_sculptor_stage(
+            [
+                str(sculptor_opt),
+                llvm_dialect,
+                "--sculptor-emit-golem-tile-abi",
+                "--sculptor-finalize-golem-intrinsics",
+                "-o",
+                tile_abi,
+            ],
+            f"{case.name} tile {tile_id} Golem tile ABI emission",
+        )
+        _run_sculptor_stage(
+            [str(translate), "--mlir-to-llvmir", tile_abi, "-o", llvm_ir],
+            f"{case.name} tile {tile_id} LLVM translation",
+        )
+        _run_sculptor_stage(
+            [
+                str(clang),
+                f"--target={target}",
+                f"-mcpu={cpu}",
+                f"-mabi={abi}",
+                "-mcmodel=medany",
+                "-ffreestanding",
+                "-fno-stack-protector",
+                "-O3",
+                "-c",
+                llvm_ir,
+                "-o",
+                str(object_path),
+            ],
+            f"{case.name} tile {tile_id} RISC-V object compilation",
+        )
+    return output_dir / "core-0.o"
 
 
 class LoweringTestCase(unittest.TestCase):

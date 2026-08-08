@@ -23,6 +23,7 @@
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -138,33 +139,14 @@ struct LocalBindingRecord {
   int64_t byteSize = -1;
 };
 
-class DisjointSet {
-public:
-  explicit DisjointSet(unsigned size) : parent(size), rank(size, 0) {
-    std::iota(parent.begin(), parent.end(), 0);
-  }
+enum class RoutineDependencyKind { Route, LocalBinding };
 
-  unsigned find(unsigned value) {
-    if (parent[value] != value)
-      parent[value] = find(parent[value]);
-    return parent[value];
-  }
-
-  void unite(unsigned lhs, unsigned rhs) {
-    lhs = find(lhs);
-    rhs = find(rhs);
-    if (lhs == rhs)
-      return;
-    if (rank[lhs] < rank[rhs])
-      std::swap(lhs, rhs);
-    parent[rhs] = lhs;
-    if (rank[lhs] == rank[rhs])
-      ++rank[lhs];
-  }
-
-private:
-  SmallVector<unsigned> parent;
-  SmallVector<unsigned> rank;
+struct RoutineDependencyEdge {
+  unsigned sourceRoutine = 0;
+  unsigned destinationRoutine = 0;
+  RoutineDependencyKind kind = RoutineDependencyKind::LocalBinding;
+  int64_t id = -1;
+  int64_t byteSize = -1;
 };
 
 SmallVector<Attribute> getI64Attrs(OpBuilder &builder,
@@ -778,97 +760,22 @@ flattenEndpoints(std::map<EndpointKey, EndpointPlan> &&orderedEndpoints,
 }
 
 FailureOr<SmallVector<RoutinePlan, 0>>
-buildRoutineRegions(ArrayRef<EndpointPlan> endpoints,
-                    const LogicalTileGraph &tileGraph, Operation *anchor) {
-  std::map<EndpointKey, unsigned> indexByEndpoint;
-  for (auto [index, endpoint] : llvm::enumerate(endpoints))
-    indexByEndpoint[endpoint.key] = index;
-
-  DisjointSet components(endpoints.size());
-  for (const LogicalTile &tile : tileGraph.tiles) {
-    for (const LogicalTileDependency &dependency : tile.internalDependencies) {
-      auto resolve = [&](int64_t operationId, int64_t workUnitId) {
-        SmallVector<unsigned> matches;
-        auto exact = indexByEndpoint.find({operationId, workUnitId});
-        if (exact != indexByEndpoint.end())
-          matches.push_back(exact->second);
-        if (workUnitId >= 0 || !matches.empty())
-          return matches;
-        for (auto [index, endpoint] : llvm::enumerate(endpoints)) {
-          if (endpoint.key.first == operationId &&
-              endpoint.logicalTileId == tile.id)
-            matches.push_back(index);
-        }
-        return matches;
-      };
-      SmallVector<unsigned> sources =
-          resolve(dependency.sourceOperationId, dependency.sourceWorkUnitId);
-      SmallVector<unsigned> targets =
-          resolve(dependency.targetOperationId, dependency.targetWorkUnitId);
-      if (sources.empty() || targets.empty()) {
-        return anchor->emitError("internal logical-tile dependency references "
-                                 "an unknown mapping "
-                                 "endpoint: source (")
-               << dependency.sourceOperationId << ", "
-               << dependency.sourceWorkUnitId << "), target ("
-               << dependency.targetOperationId << ", "
-               << dependency.targetWorkUnitId << ") on logical tile "
-               << tile.id;
-      }
-      for (unsigned source : sources) {
-        for (unsigned target : targets) {
-          const EndpointPlan &sourceEndpoint = endpoints[source];
-          const EndpointPlan &targetEndpoint = endpoints[target];
-          if (sourceEndpoint.logicalTileId != tile.id ||
-              targetEndpoint.logicalTileId != tile.id) {
-            return anchor->emitError(
-                "internal logical-tile dependency crosses logical tiles");
-          }
-          if (sourceEndpoint.operationKind ==
-                  ComputeOperationKind::MatrixSetup ||
-              targetEndpoint.operationKind == ComputeOperationKind::MatrixSetup)
-            continue;
-          components.unite(source, target);
-        }
-      }
-    }
-  }
-
-  std::map<unsigned, unsigned> routineByRoot;
+buildRoutineRegions(ArrayRef<EndpointPlan> endpoints) {
   SmallVector<RoutinePlan, 0> routines;
+  routines.reserve(endpoints.size());
   for (unsigned index = 0; index < endpoints.size(); ++index) {
-    unsigned root = components.find(index);
-    auto [found, inserted] =
-        routineByRoot.emplace(root, static_cast<unsigned>(routines.size()));
-    if (inserted)
-      routines.emplace_back();
-    RoutinePlan &routine = routines[found->second];
     const EndpointPlan &endpoint = endpoints[index];
-    if (routine.endpointIndices.empty()) {
-      routine.physicalTileId = endpoint.location.physicalTileId;
-      routine.tileRow = endpoint.location.row;
-      routine.tileCol = endpoint.location.column;
-    } else if (routine.physicalTileId != endpoint.location.physicalTileId) {
-      return anchor->emitError(
-          "one routine region spans multiple physical tiles");
-    }
+    RoutinePlan routine;
+    routine.physicalTileId = endpoint.location.physicalTileId;
+    routine.tileRow = endpoint.location.row;
+    routine.tileCol = endpoint.location.column;
     routine.endpointIndices.push_back(index);
     appendUnique(routine.logicalTileIds, endpoint.logicalTileId);
     appendUnique(routine.sourceLeafIds, endpoint.leafId);
-    routine.boot |= endpoint.operationKind == ComputeOperationKind::MatrixSetup;
+    routine.boot = endpoint.operationKind == ComputeOperationKind::MatrixSetup;
     for (Operation *operation : endpoint.mappedOperations)
       routine.selectedOperations.insert(operation);
-  }
-
-  for (RoutinePlan &routine : routines) {
-    if (!routine.boot)
-      continue;
-    if (routine.endpointIndices.size() != 1 ||
-        endpoints[routine.endpointIndices.front()].operationKind !=
-            ComputeOperationKind::MatrixSetup) {
-      return anchor->emitError(
-          "each matrix setup must form one independent boot routine");
-    }
+    routines.push_back(std::move(routine));
   }
   return routines;
 }
@@ -1197,6 +1104,115 @@ LogicalResult assignResourcesAndConnections(
   return success();
 }
 
+LogicalResult
+verifyRoutineDependencyDAG(Operation *anchor, ArrayRef<RoutinePlan> routines,
+                           ArrayRef<RouteRecord> routes,
+                           ArrayRef<LocalBindingRecord> localBindings) {
+  SmallVector<RoutineDependencyEdge> edges;
+  edges.reserve(routes.size() + localBindings.size());
+  for (const RouteRecord &route : routes) {
+    edges.push_back({route.sourceRoutine, route.destinationRoutine,
+                     RoutineDependencyKind::Route, route.id, route.byteSize});
+  }
+  for (auto [bindingId, binding] : llvm::enumerate(localBindings)) {
+    edges.push_back({binding.sourceRoutine, binding.destinationRoutine,
+                     RoutineDependencyKind::LocalBinding,
+                     static_cast<int64_t>(bindingId), binding.byteSize});
+  }
+
+  for (const RoutineDependencyEdge &edge : edges) {
+    if (edge.sourceRoutine >= routines.size() ||
+        edge.destinationRoutine >= routines.size()) {
+      return anchor->emitError(
+          "outlined runtime dependency references an unknown routine");
+    }
+  }
+  llvm::sort(edges, [&](const RoutineDependencyEdge &lhs,
+                        const RoutineDependencyEdge &rhs) {
+    return std::tuple<int64_t, int64_t, unsigned, int64_t>{
+               routines[lhs.sourceRoutine].globalId,
+               routines[lhs.destinationRoutine].globalId,
+               static_cast<unsigned>(lhs.kind),
+               lhs.id} < std::tuple<int64_t, int64_t, unsigned, int64_t>{
+                             routines[rhs.sourceRoutine].globalId,
+                             routines[rhs.destinationRoutine].globalId,
+                             static_cast<unsigned>(rhs.kind), rhs.id};
+  });
+
+  SmallVector<SmallVector<unsigned>> outgoing(routines.size());
+  for (auto [edgeIndex, edge] : llvm::enumerate(edges))
+    outgoing[edge.sourceRoutine].push_back(edgeIndex);
+
+  SmallVector<unsigned> traversalOrder(routines.size());
+  std::iota(traversalOrder.begin(), traversalOrder.end(), 0);
+  llvm::sort(traversalOrder, [&](unsigned lhs, unsigned rhs) {
+    return routines[lhs].globalId < routines[rhs].globalId;
+  });
+
+  SmallVector<uint8_t> state(routines.size(), 0);
+  SmallVector<std::optional<unsigned>> parentEdge(routines.size());
+  SmallVector<unsigned> cycle;
+  std::function<bool(unsigned)> visit = [&](unsigned routineIndex) {
+    state[routineIndex] = 1;
+    for (unsigned edgeIndex : outgoing[routineIndex]) {
+      const RoutineDependencyEdge &edge = edges[edgeIndex];
+      unsigned destination = edge.destinationRoutine;
+      if (state[destination] == 0) {
+        parentEdge[destination] = edgeIndex;
+        if (visit(destination))
+          return true;
+        continue;
+      }
+      if (state[destination] != 1)
+        continue;
+
+      SmallVector<unsigned> reversedPath;
+      unsigned cursor = routineIndex;
+      while (cursor != destination) {
+        if (!parentEdge[cursor])
+          return false;
+        unsigned pathEdge = *parentEdge[cursor];
+        reversedPath.push_back(pathEdge);
+        cursor = edges[pathEdge].sourceRoutine;
+      }
+      cycle.assign(reversedPath.rbegin(), reversedPath.rend());
+      cycle.push_back(edgeIndex);
+      return true;
+    }
+    state[routineIndex] = 2;
+    return false;
+  };
+
+  for (unsigned routineIndex : traversalOrder) {
+    if (state[routineIndex] == 0 && visit(routineIndex))
+      break;
+  }
+  if (cycle.empty())
+    return success();
+
+  InFlightDiagnostic diagnostic =
+      anchor->emitError("outlined runtime dependency cycle:");
+  for (unsigned edgeIndex : cycle) {
+    const RoutineDependencyEdge &edge = edges[edgeIndex];
+    const RoutinePlan &source = routines[edge.sourceRoutine];
+    const RoutinePlan &destination = routines[edge.destinationRoutine];
+    diagnostic << "\n  routine " << source.globalId << " on tile "
+               << source.physicalTileId << " --";
+    if (edge.kind == RoutineDependencyKind::Route) {
+      diagnostic << "route " << edge.id;
+    } else if (source.boot) {
+      diagnostic << "boot dependency " << edge.id;
+    } else if (edge.byteSize == 0) {
+      diagnostic << "zero-byte synchronization " << edge.id;
+    } else {
+      diagnostic << "local binding " << edge.id;
+    }
+    diagnostic << "--> routine " << destination.globalId << " on tile "
+               << destination.physicalTileId;
+  }
+  return failure();
+}
+
 ArrayAttr buildRouteAttrs(OpBuilder &builder, ArrayRef<RouteRecord> routes,
                           ArrayRef<RoutinePlan> routines,
                           function_ref<bool(const RouteRecord &)> predicate) {
@@ -1494,6 +1510,7 @@ LogicalResult attachDeploymentManifest(
 LogicalResult
 verifyOutlinedDeployment(ModuleOp outer, ArrayRef<RoutinePlan> routines,
                          ArrayRef<RouteRecord> routes,
+                         ArrayRef<LocalBindingRecord> localBindings,
                          const DenseMap<Value, int64_t> &resourceIdByValue,
                          DenseMap<int64_t, ModuleOp> &tileModules) {
   llvm::SmallDenseSet<int64_t> routineIds;
@@ -1511,7 +1528,12 @@ verifyOutlinedDeployment(ModuleOp outer, ArrayRef<RoutinePlan> routines,
   }
   llvm::SmallDenseSet<int64_t> routeIds;
   for (const RouteRecord &route : routes) {
-    if (!routeIds.insert(route.id).second)
+    if (route.sourceRoutine >= routines.size() ||
+        route.destinationRoutine >= routines.size()) {
+      return outer.emitError(
+          "remote route references an unknown outlined routine");
+    }
+    if (route.id < 0 || !routeIds.insert(route.id).second)
       return outer.emitError("duplicate deployment route ID ") << route.id;
     if (routines[route.sourceRoutine].physicalTileId ==
         routines[route.destinationRoutine].physicalTileId)
@@ -1519,12 +1541,36 @@ verifyOutlinedDeployment(ModuleOp outer, ArrayRef<RoutinePlan> routines,
     if (route.byteSize <= 0)
       return outer.emitError("remote route requires a positive byte size");
   }
+  for (const LocalBindingRecord &binding : localBindings) {
+    if (binding.sourceRoutine >= routines.size() ||
+        binding.destinationRoutine >= routines.size()) {
+      return outer.emitError(
+          "local binding references an unknown outlined routine");
+    }
+    if (routines[binding.sourceRoutine].physicalTileId !=
+        routines[binding.destinationRoutine].physicalTileId) {
+      return outer.emitError("local binding crosses physical tiles");
+    }
+    if (binding.byteSize < 0)
+      return outer.emitError("local binding requires a non-negative byte size");
+  }
   llvm::SmallDenseSet<int64_t> resourceIds;
   for (const auto &entry : resourceIdByValue) {
     if (entry.second < 0 || !resourceIds.insert(entry.second).second)
       return outer.emitError("duplicate or invalid global resource ID");
   }
-  return success();
+  for (const RouteRecord &route : routes) {
+    if (!resourceIds.contains(route.resourceId))
+      return outer.emitError("remote route references an unknown resource ID ")
+             << route.resourceId;
+  }
+  for (const LocalBindingRecord &binding : localBindings) {
+    if (!resourceIds.contains(binding.resourceId)) {
+      return outer.emitError("local binding references an unknown resource ID ")
+             << binding.resourceId;
+    }
+  }
+  return verifyRoutineDependencyDAG(outer, routines, routes, localBindings);
 }
 
 LogicalResult outlineFunction(ModuleOp outer, func::FuncOp source) {
@@ -1583,7 +1629,7 @@ LogicalResult outlineFunction(ModuleOp outer, func::FuncOp source) {
   if (failed(endpoints))
     return failure();
   FailureOr<SmallVector<RoutinePlan, 0>> routines =
-      buildRoutineRegions(*endpoints, *tileGraph, source);
+      buildRoutineRegions(*endpoints);
   if (failed(routines))
     return failure();
 
@@ -1614,7 +1660,7 @@ LogicalResult outlineFunction(ModuleOp outer, func::FuncOp source) {
           outer, source, *routines, routes, localBindings, modelOutputs,
           modelInputTensorIds, modelOutputTensorIds, resourceIdByValue,
           *placement, tileModules)) ||
-      failed(verifyOutlinedDeployment(outer, *routines, routes,
+      failed(verifyOutlinedDeployment(outer, *routines, routes, localBindings,
                                       resourceIdByValue, tileModules)))
     return failure();
 
