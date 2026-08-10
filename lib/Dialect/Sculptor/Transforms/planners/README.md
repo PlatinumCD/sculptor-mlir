@@ -23,11 +23,11 @@ Each planner refines the RA tree that the preceding strategy produced.
   bodies: global region discovery treats each wave as one atom. Independent,
   consecutive wave atoms with identical producer and consumer frontiers form
   one spatial cohort, including multi-exit regions that are not strictly
-  single-entry/single-exit. Under the `packed` policy, vector preparation uses
-  one digital lane before a spatial analog frontier. Under `spread`,
-  branch-specific vector preparation follows each analog branch's dependency
-  region. Recombination and bias remain after the analog frontier. Unstructured
-  regions retain a conservative topological temporal order.
+  single-entry/single-exit. Within each wave, vector preparation uses the
+  logical tile's digital lane before a spatial frontier over that tile's analog
+  lanes. Recombination and bias remain on the same digital lane after the
+  analog frontier. Unstructured regions retain a conservative topological
+  temporal order.
 - `fan-out-cut` exposes independent consumers of a fan-out through a spatial
   cut.
 - `consumer-bound-fill` keeps fill operations with the consumers that use
@@ -78,5 +78,8 @@ tiling and recombination, uses only the tile's digital lane.
 The compute graph also derives deterministic MVM waves from SSA flow. One
 wave contains the vector-tile producers, the independently executable
 physical MVM stages, and the optional tile-recombine stage for one expanded
-MVM. Wave metadata describes available parallelism; it does not assign cores
-or introduce cuts by itself.
+MVM. Optional bias addition is part of the same wave. `packed` fills each
+logical tile's analog lanes before opening another tile; `spread` uses one
+logical tile per physical MVM. Matrix setup and physical MVM work retain one
+persistent lane binding. Branch-specific vector work follows its MVM, while
+shared vector work, recombination, and bias use the wave's home tile.

@@ -58,9 +58,11 @@ class RecursiveRegionBuilder {
 public:
   RecursiveRegionBuilder(const ComputeGraph &graph,
                          ArrayRef<int64_t> includedOperationIds,
-                         Operation *anchor, bool collapseMVMBodies = true)
+                         Operation *anchor,
+                         bool exposeParallelMVMCohorts = true)
       : graph(graph), includedOperationIds(includedOperationIds),
-        anchor(anchor), collapseMVMBodies(collapseMVMBodies) {}
+        anchor(anchor),
+        exposeParallelMVMCohorts(exposeParallelMVMCohorts) {}
 
   FailureOr<ComputeRegionTree> build() {
     if (includedOperationIds.empty()) {
@@ -84,7 +86,9 @@ public:
       tree.rootId = *parsed.rootId;
     }
 
-    formParallelMVMWaveCohorts(tree.rootId);
+    if (exposeParallelMVMCohorts)
+      formParallelMVMWaveCohorts(tree.rootId);
+    serializeSharedLaneBindingGroups(tree.rootId);
     return std::move(tree);
   }
 
@@ -137,7 +141,7 @@ private:
 
     SmallVector<int64_t> operationToWave(operationCount, -1);
     DenseMap<int64_t, SmallVector<int64_t>> waveMembers;
-    if (collapseMVMBodies) {
+    {
       DenseSet<int64_t> knownWaveIds;
       for (const MVMWave &wave : graph.mvmWaves) {
         SmallVector<int64_t> members = getWaveOperationIds(wave);
@@ -511,6 +515,111 @@ private:
     tree.regions[regionId].childIds = std::move(groupedChildren);
   }
 
+  void collectRegionLaneBindingGroups(int64_t regionId,
+                                      DenseSet<int64_t> &groups) const {
+    assert(regionId >= 0 &&
+           regionId < static_cast<int64_t>(tree.regions.size()) &&
+           "compute region must exist");
+    const ComputeRegion &region = tree.regions[regionId];
+    if (region.kind == ComputeRegionKind::Atom) {
+      assert(region.atomId >= 0 &&
+             region.atomId < static_cast<int64_t>(tree.atoms.size()) &&
+             "compute atom must exist");
+      for (int64_t operationId : tree.atoms[region.atomId].memberOperationIds) {
+        const std::optional<int64_t> &bindingGroup =
+            graph.operations[operationId].laneBindingGroup;
+        if (bindingGroup)
+          groups.insert(*bindingGroup);
+      }
+      return;
+    }
+
+    for (int64_t childId : region.childIds)
+      collectRegionLaneBindingGroups(childId, groups);
+  }
+
+  // A programmed analog lane may execute several independent consumers, but
+  // those consumers cannot occupy different resource lanes without cloning
+  // the matrix. Serialize only spatial siblings that share a lane binding and
+  // retain spatial parallelism between all disjoint components.
+  void serializeSharedLaneBindingGroups(int64_t regionId) {
+    assert(regionId >= 0 &&
+           regionId < static_cast<int64_t>(tree.regions.size()) &&
+           "compute region must exist");
+
+    SmallVector<int64_t> children = tree.regions[regionId].childIds;
+    for (int64_t childId : children)
+      serializeSharedLaneBindingGroups(childId);
+
+    if (tree.regions[regionId].kind != ComputeRegionKind::Parallel ||
+        children.size() < 2)
+      return;
+
+    SmallVector<int64_t> parents(children.size());
+    for (auto [index, parent] : llvm::enumerate(parents))
+      parent = static_cast<int64_t>(index);
+
+    auto findRoot = [&](int64_t index) {
+      while (parents[index] != index) {
+        parents[index] = parents[parents[index]];
+        index = parents[index];
+      }
+      return index;
+    };
+    auto unite = [&](int64_t left, int64_t right) {
+      left = findRoot(left);
+      right = findRoot(right);
+      if (left == right)
+        return;
+      if (left > right)
+        std::swap(left, right);
+      parents[right] = left;
+    };
+
+    DenseMap<int64_t, int64_t> firstChildByBindingGroup;
+    for (auto [childIndex, childId] : llvm::enumerate(children)) {
+      DenseSet<int64_t> groups;
+      collectRegionLaneBindingGroups(childId, groups);
+      for (int64_t group : groups) {
+        auto [owner, inserted] = firstChildByBindingGroup.try_emplace(
+            group, static_cast<int64_t>(childIndex));
+        if (!inserted)
+          unite(static_cast<int64_t>(childIndex), owner->second);
+      }
+    }
+
+    DenseMap<int64_t, int64_t> componentIndexByRoot;
+    SmallVector<SmallVector<int64_t>> components;
+    for (auto [childIndex, childId] : llvm::enumerate(children)) {
+      int64_t root = findRoot(static_cast<int64_t>(childIndex));
+      auto [component, inserted] = componentIndexByRoot.try_emplace(
+          root, static_cast<int64_t>(components.size()));
+      if (inserted)
+        components.emplace_back();
+      components[component->second].push_back(childId);
+    }
+
+    if (components.size() == children.size())
+      return;
+    if (components.size() == 1) {
+      tree.regions[regionId].kind = ComputeRegionKind::Sequence;
+      tree.regions[regionId].childIds = std::move(components.front());
+      return;
+    }
+
+    SmallVector<int64_t> legalizedChildren;
+    legalizedChildren.reserve(components.size());
+    for (const SmallVector<int64_t> &component : components) {
+      if (component.size() == 1) {
+        legalizedChildren.push_back(component.front());
+        continue;
+      }
+      legalizedChildren.push_back(
+          *addCompound(ComputeRegionKind::Sequence, component));
+    }
+    tree.regions[regionId].childIds = std::move(legalizedChildren);
+  }
+
   RegionParseResult parseFork(int64_t forkId, int64_t outerStopId) {
     int64_t joinId = immediatePostDominator[forkId];
     if (joinId < 0 || joinId == forkId ||
@@ -617,7 +726,7 @@ private:
   const ComputeGraph &graph;
   ArrayRef<int64_t> includedOperationIds;
   Operation *anchor;
-  bool collapseMVMBodies;
+  bool exposeParallelMVMCohorts;
   ComputeRegionTree tree;
   int64_t virtualSourceId = -1;
   int64_t virtualSinkId = -1;
@@ -823,17 +932,7 @@ private:
   FailureOr<int64_t> buildAtom(const ComputeAtom &atom) {
     if (atom.kind == ComputeAtomKind::Operation)
       return buildOperation(atom.operationId);
-
-    if (problem.mvmBodyPolicy == MVMBodyPolicy::Packed)
-      return buildPackedMVMBody(atom);
-
-    RecursiveRegionBuilder bodyBuilder(
-        problem.graph, atom.memberOperationIds, problem.anchor,
-        /*collapseMVMBodies=*/false);
-    FailureOr<ComputeRegionTree> body = bodyBuilder.build();
-    if (failed(body))
-      return failure();
-    return buildRegion(*body, body->rootId);
+    return buildPackedMVMBody(atom);
   }
 
   FailureOr<int64_t> buildRegion(const ComputeRegionTree &regionTree,
@@ -918,7 +1017,8 @@ RecursiveForkJoinPlanner::refine(const MappingProblem &problem,
     return failure();
 
   RecursiveRegionBuilder regionBuilder(
-      problem.graph, partition->computeOperationIds, problem.anchor);
+      problem.graph, partition->computeOperationIds, problem.anchor,
+      problem.mvmBodyPolicy == MVMBodyPolicy::Spread);
   FailureOr<ComputeRegionTree> regions = regionBuilder.build();
   if (failed(regions))
     return failure();

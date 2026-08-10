@@ -63,6 +63,16 @@ class DualUseParallelLinearModel(torch.nn.Module):
         return left + right, left * right
 
 
+class TenArrayLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(384, 1152, bias=True)
+        initialize_parameters(self)
+
+    def forward(self, value):
+        return self.linear(value)
+
+
 class TransformerLoweringTest(LoweringTestCase):
     @staticmethod
     def ra_tree_report(placed_ir: str) -> dict:
@@ -130,6 +140,79 @@ class TransformerLoweringTest(LoweringTestCase):
             ):
                 result.add(int(tile_match.group(1)))
         return result
+
+    def assert_mvm_waves_follow_policy(
+        self, report: dict, policy: str, arrays_per_core: int
+    ) -> None:
+        operation_tiles = {}
+        for tile in report["logical_tile_graph"]["tiles"]:
+            assignments = list(tile["digital_assignments"])
+            for lane in tile["analog_lanes"]:
+                assignments.extend(lane["assignments"])
+            for assignment in assignments:
+                operation_tiles.setdefault(assignment["operation_id"], set()).add(
+                    tile["id"]
+                )
+
+        operations = {operation["id"]: operation for operation in report["operations"]}
+        for wave in report["mvm_waves"]:
+            physical_tiles = []
+            member_tiles = {}
+            for operation_id in wave["physical_mvm_operation_ids"]:
+                self.assertIn(operation_id, operation_tiles)
+                self.assertEqual(len(operation_tiles[operation_id]), 1)
+                tile_id = next(iter(operation_tiles[operation_id]))
+                physical_tiles.append(tile_id)
+                member = operations[operation_id]["mvm_wave_member"]
+                self.assertGreaterEqual(member, 0)
+                member_tiles[member] = tile_id
+
+            occupancy = {}
+            for tile_id in physical_tiles:
+                occupancy[tile_id] = occupancy.get(tile_id, 0) + 1
+            expected_tiles = (
+                len(physical_tiles)
+                if policy == "spread"
+                else (len(physical_tiles) + arrays_per_core - 1)
+                // arrays_per_core
+            )
+            self.assertEqual(
+                len(occupancy),
+                expected_tiles,
+                f'MVM wave {wave["id"]} has occupancy {occupancy}',
+            )
+            self.assertLessEqual(max(occupancy.values()), arrays_per_core)
+            if policy == "spread":
+                self.assertTrue(all(count == 1 for count in occupancy.values()))
+
+            home_tile = member_tiles[min(member_tiles)]
+            for operation_id in wave["vector_tile_operation_ids"]:
+                self.assertIn(operation_id, operation_tiles)
+                self.assertEqual(len(operation_tiles[operation_id]), 1)
+                member = operations[operation_id]["mvm_wave_member"]
+                expected_tile = (
+                    member_tiles[member] if member >= 0 else home_tile
+                )
+                self.assertEqual(operation_tiles[operation_id], {expected_tile})
+            for operation_id in (
+                wave["recombine_operation_id"],
+                wave["bias_add_operation_id"],
+            ):
+                if operation_id < 0:
+                    continue
+                self.assertEqual(operation_tiles[operation_id], {home_tile})
+
+        for group in report["lane_binding_groups"]:
+            group_tiles = set()
+            for operation_id in group["operation_ids"]:
+                self.assertIn(operation_id, operation_tiles)
+                self.assertEqual(len(operation_tiles[operation_id]), 1)
+                group_tiles.update(operation_tiles[operation_id])
+            self.assertEqual(
+                len(group_tiles),
+                1,
+                f'lane-binding group {group["id"]} spans tiles {group_tiles}',
+            )
 
     def test_expand_digital_work_dissolves_grouped_digital_stages(self):
         lowered = lower_to_ra_tree(
@@ -309,6 +392,62 @@ class TransformerLoweringTest(LoweringTestCase):
         self.assertEqual(wave_parents[0]["id"], wave_parents[1]["id"])
         self.assertEqual(wave_parents[0]["kind"], "spatial_cut")
 
+    def test_recursive_serializes_shared_matrix_consumers_without_duplication(
+        self,
+    ):
+        placed_ir = lower_to_logical_tile_placement(
+            LoweringCase(
+                "transformer_recursive_shared_matrices",
+                lambda: TransformerBlockModel(bias=True),
+                lambda: (torch.ones(1, 4, 384),),
+                array_rows=1024,
+                array_cols=512,
+                external_linalg_lowering=True,
+            ),
+            tile_order="priority",
+            priority_mode="max",
+            candidate_scope="frontier",
+            lookahead=3,
+            mapping_strategies="setup-first,recursive-fork-join",
+            mvm_body_policy="spread",
+            setup_binding_policy="consumer-anchored",
+            digital_workers=8,
+            balance_digital_work=True,
+        )
+        report = self.ra_tree_report(placed_ir)["functions"][0]
+        self.assert_mvm_waves_follow_policy(report, "spread", 4)
+        nodes_by_id = {node["id"]: node for node in report["tree"]["nodes"]}
+        operation_groups = {}
+        for group in report["lane_binding_groups"]:
+            for operation_id in group["operation_ids"]:
+                operation_groups[operation_id] = group["id"]
+
+        self.assertTrue(
+            any(
+                len(group["operation_ids"]) > 2
+                for group in report["lane_binding_groups"]
+            )
+        )
+
+        def subtree_groups(node_id):
+            node = nodes_by_id[node_id]
+            if node["kind"] == "leaf":
+                group = operation_groups.get(node["operation_id"])
+                return set() if group is None else {group}
+            result = set()
+            for child_id in node["child_ids"]:
+                result.update(subtree_groups(child_id))
+            return result
+
+        for node in nodes_by_id.values():
+            if node["kind"] != "spatial_cut":
+                continue
+            seen_groups = set()
+            for child_id in node["child_ids"]:
+                child_groups = subtree_groups(child_id)
+                self.assertTrue(seen_groups.isdisjoint(child_groups))
+                seen_groups.update(child_groups)
+
     def test_recursive_mvm_body_policies(self):
         case = LoweringCase(
             "transformer_recursive_mvm_body_policy",
@@ -334,53 +473,55 @@ class TransformerLoweringTest(LoweringTestCase):
                     f'sculptor.mapping.mvm_body_policy = "{policy}"',
                     placed_ir,
                 )
-                if policy != "spread":
-                    continue
+                report = self.ra_tree_report(placed_ir)["functions"][0]
+                self.assert_mvm_waves_follow_policy(report, policy, 4)
 
-                for token in range(4):
-                    home_names = (
-                        f"transformer_block_mlp_down_token_extract_b0_s{token}",
-                        f"transformer_block_mlp_down_bias_add_b0_s{token}",
-                    )
-                    home_tiles = []
-                    member_tiles = []
-                    for member in range(3):
-                        vector_id = self.stage_operation_id_matching(
-                            placed_ir,
-                            f"transformer_block_mlp_down_b0_s{token}_mvm_"
-                            rf"[0-9]+_vector_tile_{member}",
-                        )
-                        mvm_id = self.stage_operation_id_matching(
-                            placed_ir,
-                            f"transformer_block_mlp_down_b0_s{token}_mvm_"
-                            rf"[0-9]+_array_0_{member}",
-                        )
-                        vector_tiles = self.operation_logical_tiles(
-                            placed_ir, vector_id
-                        )
-                        mvm_tiles = self.operation_logical_tiles(placed_ir, mvm_id)
-                        self.assertEqual(vector_tiles, mvm_tiles)
-                        self.assertEqual(len(vector_tiles), 1)
-                        member_tiles.append(next(iter(vector_tiles)))
+    def test_ten_array_wave_uses_three_packed_or_ten_spread_tiles(self):
+        case = LoweringCase(
+            "ten_array_mvm_wave",
+            TenArrayLinearModel,
+            lambda: (torch.ones(1, 384),),
+            array_rows=256,
+            array_cols=256,
+            mesh_rows=8,
+            mesh_cols=8,
+            arrays_per_core=4,
+            external_linalg_lowering=True,
+        )
+        expected_occupancy = {
+            "packed": [2, 4, 4],
+            "spread": [1] * 10,
+        }
+        for policy in ("packed", "spread"):
+            with self.subTest(policy=policy):
+                placed_ir = lower_to_logical_tile_placement(
+                    case,
+                    tile_order="priority",
+                    priority_mode="max",
+                    candidate_scope="frontier",
+                    lookahead=3,
+                    mapping_strategies="setup-first,recursive-fork-join",
+                    mvm_body_policy=policy,
+                    setup_binding_policy="consumer-anchored",
+                )
+                report = self.ra_tree_report(placed_ir)["functions"][0]
+                self.assertEqual(len(report["mvm_waves"]), 1)
+                wave = report["mvm_waves"][0]
+                self.assertEqual(len(wave["physical_mvm_operation_ids"]), 10)
+                self.assert_mvm_waves_follow_policy(report, policy, 4)
 
-                    for name in home_names:
-                        operation_id = self.stage_operation_id(placed_ir, name)
-                        tiles = self.operation_logical_tiles(placed_ir, operation_id)
-                        self.assertEqual(len(tiles), 1)
-                        home_tiles.append(next(iter(tiles)))
-                    recombine_id = self.stage_operation_id_matching(
-                        placed_ir,
-                        f"transformer_block_mlp_down_b0_s{token}_mvm_"
-                        r"[0-9]+_tile_recombine",
-                    )
-                    recombine_tiles = self.operation_logical_tiles(
-                        placed_ir, recombine_id
-                    )
-                    self.assertEqual(len(recombine_tiles), 1)
-                    home_tiles.append(next(iter(recombine_tiles)))
-                self.assertEqual(len(set(home_tiles)), 1)
-                self.assertEqual(home_tiles[0], member_tiles[0])
-                self.assertEqual(len(set(member_tiles)), 3)
+                operation_tiles = {}
+                for tile in report["logical_tile_graph"]["tiles"]:
+                    for lane in tile["analog_lanes"]:
+                        for assignment in lane["assignments"]:
+                            operation_tiles[assignment["operation_id"]] = tile["id"]
+                occupancy = {}
+                for operation_id in wave["physical_mvm_operation_ids"]:
+                    tile_id = operation_tiles[operation_id]
+                    occupancy[tile_id] = occupancy.get(tile_id, 0) + 1
+                self.assertEqual(
+                    sorted(occupancy.values()), expected_occupancy[policy]
+                )
 
     def test_consumer_anchored_setup_bindings_follow_ra_flow(self):
         case = LoweringCase(

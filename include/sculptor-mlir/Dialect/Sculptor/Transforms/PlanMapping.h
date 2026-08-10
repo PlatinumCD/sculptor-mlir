@@ -39,7 +39,8 @@ struct PlanMappingPass
 
   Option<std::string> mvmBodyPolicy{
       *this, "mvm-body-policy",
-      llvm::cl::desc("MVM body realization policy: packed or spread"),
+      llvm::cl::desc("MVM array placement policy: packed fills each logical "
+                     "tile, spread uses one logical tile per array"),
       llvm::cl::init("spread")};
 
   Option<std::string> setupBindingPolicy{

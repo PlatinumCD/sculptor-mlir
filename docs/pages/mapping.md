@@ -29,16 +29,17 @@ Current strategies include:
 ## MVM Body Policy
 
 `--sculptor-plan-mapping` accepts `mvm-body-policy=packed|spread` and defaults
-to `spread`. Packed plans diagnose MVM bodies wider than the tile's analog
-lane count.
+to `spread`.
 
-- `packed` assigns every physical MVM in one body to analog lanes on one
-  logical tile.
-- `spread` assigns every physical MVM branch in one body to a distinct logical
-  tile.
+- `packed` fills each logical tile up to `arrays-per-core`. A ten-array wave on
+  four-array tiles uses three logical tiles with occupancy `4 + 4 + 2`.
+- `spread` assigns each array in a wave to a different logical tile. The same
+  ten-array wave uses ten logical tiles.
 
-Both policies preserve matrix-setup lane bindings. The policy affects logical
-tile formation, not physical mesh placement.
+Both policies preserve each matrix setup's persistent lane binding. A
+branch-specific vector tile follows its physical MVM. Shared vector work,
+recombination, and bias addition use the wave's deterministic home tile while
+cross-tile dependencies remain explicit in the logical-tile graph.
 
 ## Setup Binding Policy
 

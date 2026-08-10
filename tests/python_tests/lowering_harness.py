@@ -186,6 +186,8 @@ def lower_to_logical_tile_placement(
     mapping_strategies: str = "setup-first",
     mvm_body_policy: str = "spread",
     setup_binding_policy: str = "global",
+    digital_workers: int | None = None,
+    balance_digital_work: bool = False,
 ) -> str:
     """Lower one model through configurable greedy logical-tile placement."""
 
@@ -206,17 +208,25 @@ def lower_to_logical_tile_placement(
     ]
     if case.duplicate_matrices:
         command.append("--sculptor-duplicate-matrices")
+    if digital_workers is not None:
+        command.append(
+            "--sculptor-expand-digital-work="
+            f"parallel-workers={digital_workers} require-change"
+        )
+    plan_options = (
+        f"strategies={mapping_strategies} "
+        f"mvm-body-policy={mvm_body_policy} "
+        f"setup-binding-policy={setup_binding_policy} "
+        f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
+        f"arrays-per-core={case.arrays_per_core} "
+        f"array-rows={case.array_rows} array-cols={case.array_cols}"
+    )
+    if balance_digital_work:
+        plan_options += " balance-digital-work"
     command.extend(
         [
             "--sculptor-build-ra-tree",
-            (
-                f"--sculptor-plan-mapping=strategies={mapping_strategies} "
-                f"mvm-body-policy={mvm_body_policy} "
-                f"setup-binding-policy={setup_binding_policy} "
-                f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
-                f"arrays-per-core={case.arrays_per_core} "
-                f"array-rows={case.array_rows} array-cols={case.array_cols}"
-            ),
+            f"--sculptor-plan-mapping={plan_options}",
             (
                 "--sculptor-place-logical-tiles=schedule=greedy "
                 f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "

@@ -603,17 +603,6 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
       int64_t requiredAnalogLanes =
           isSetupFrontier ? static_cast<int64_t>(subtreeOperations->size())
                           : mvmWaveAnalogLaneCount;
-      if (isMVMWaveFrontier &&
-          context.problem.mvmBodyPolicy == MVMBodyPolicy::Packed &&
-          requiredAnalogLanes > analogLaneCount) {
-        result = makeInfeasible(
-            nodeId, (Twine("MVM wave requires ") + Twine(requiredAnalogLanes) +
-                     " analog lanes on one core but each core provides " +
-                     Twine(analogLaneCount))
-                        .str());
-        context.evaluations[nodeId] = result;
-        return result;
-      }
       result.requiredResourceUnits =
           isMVMWaveFrontier &&
                   context.problem.mvmBodyPolicy == MVMBodyPolicy::Spread

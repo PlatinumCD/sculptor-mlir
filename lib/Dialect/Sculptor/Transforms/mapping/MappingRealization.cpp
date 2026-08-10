@@ -360,18 +360,15 @@ private:
   getPinnedDigitalTile(const ComputeOperation &operation) const {
     if (!operation.mvmWaveId)
       return std::nullopt;
-    if (problem.mvmBodyPolicy == MVMBodyPolicy::Packed) {
-      auto wave = waveTiles.find(*operation.mvmWaveId);
-      return wave == waveTiles.end() ? std::nullopt
-                                     : std::optional<int64_t>{wave->second};
+    if (operation.mvmWaveMember) {
+      auto member = waveMemberTiles.find(
+          {*operation.mvmWaveId, *operation.mvmWaveMember});
+      if (member != waveMemberTiles.end())
+        return member->second;
     }
-    if (!operation.mvmWaveMember)
-      return std::nullopt;
-    auto member =
-        waveMemberTiles.find({*operation.mvmWaveId, *operation.mvmWaveMember});
-    return member == waveMemberTiles.end()
-               ? std::nullopt
-               : std::optional<int64_t>{member->second};
+    auto wave = waveTiles.find(*operation.mvmWaveId);
+    return wave == waveTiles.end() ? std::nullopt
+                                   : std::optional<int64_t>{wave->second};
   }
 
   std::optional<int64_t>
@@ -692,6 +689,51 @@ private:
     return std::optional<int64_t>{selected};
   }
 
+  LogicalResult recordWaveBindingTiles(bool requireDistinctMemberTiles) {
+    for (const MVMWave &wave : problem.graph.mvmWaves) {
+      std::optional<std::pair<int64_t, int64_t>> home;
+      DenseSet<int64_t> memberTiles;
+      for (int64_t operationId : wave.physicalMVMOperationIds) {
+        const ComputeOperation &operation =
+            problem.graph.operations[operationId];
+        if (!operation.laneBindingGroup || !operation.mvmWaveMember) {
+          operation.operation->emitError(
+              "MVM wave contains an unbound or unidentified physical MVM");
+          return failure();
+        }
+        auto binding = bindingLanes.find(*operation.laneBindingGroup);
+        if (binding == bindingLanes.end()) {
+          operation.operation->emitError(
+              "MVM wave cannot resolve its persistent analog binding");
+          return failure();
+        }
+        int64_t tileId = binding->second.tileId;
+        if (requireDistinctMemberTiles && !memberTiles.insert(tileId).second) {
+          operation.operation->emitError(
+              "spread MVM-body policy assigned multiple physical MVMs to "
+              "one logical tile");
+          return failure();
+        }
+        auto [member, inserted] = waveMemberTiles.try_emplace(
+            std::make_pair(wave.id, *operation.mvmWaveMember), tileId);
+        if (!inserted && member->second != tileId) {
+          operation.operation->emitError(
+              "one MVM wave member was assigned to multiple logical tiles");
+          return failure();
+        }
+        std::pair<int64_t, int64_t> candidate{*operation.mvmWaveMember, tileId};
+        if (!home || candidate < *home)
+          home = candidate;
+      }
+      if (!home) {
+        problem.anchor->emitError("MVM wave has no physical MVM members");
+        return failure();
+      }
+      waveTiles[wave.id] = home->second;
+    }
+    return success();
+  }
+
   FailureOr<bool>
   assignPackedBindings(ArrayRef<const LaneBindingGroup *> groups,
                        const ResourcePool &rootPool) {
@@ -705,7 +747,7 @@ private:
       }
     }
 
-    DenseMap<int64_t, SmallVector<int64_t>> colocatedGroups;
+    DenseMap<int64_t, SmallVector<int64_t>> relatedGroups;
     DenseMap<int64_t, SmallVector<int64_t>> wavesByGroup;
     for (const MVMWave &wave : problem.graph.mvmWaves) {
       SmallVector<int64_t> waveBindings;
@@ -714,7 +756,7 @@ private:
             problem.graph.operations[operationId];
         if (!operation.laneBindingGroup) {
           operation.operation->emitError(
-              "co-located MVM wave contains an unbound physical MVM");
+              "packed MVM wave contains an unbound physical MVM");
           return failure();
         }
         if (!knownGroups.contains(*operation.laneBindingGroup)) {
@@ -732,8 +774,8 @@ private:
       if (waveBindings.size() > 1) {
         int64_t first = waveBindings.front();
         for (int64_t groupId : ArrayRef(waveBindings).drop_front()) {
-          colocatedGroups[first].push_back(groupId);
-          colocatedGroups[groupId].push_back(first);
+          relatedGroups[first].push_back(groupId);
+          relatedGroups[groupId].push_back(first);
         }
       }
     }
@@ -756,7 +798,7 @@ private:
         component.groupIds.push_back(groupId);
         component.waveIds.append(wavesByGroup[groupId].begin(),
                                  wavesByGroup[groupId].end());
-        for (int64_t neighbor : colocatedGroups[groupId]) {
+        for (int64_t neighbor : relatedGroups[groupId]) {
           if (visitedGroups.insert(neighbor).second)
             pending.push_back(neighbor);
         }
@@ -786,76 +828,51 @@ private:
 
     std::set<AnalogLaneKey> usedLanes;
     DenseMap<int64_t, int64_t> tileLaneLoads;
-    DenseMap<int64_t, int64_t> tileWaveLoads;
     for (const BindingComponent &component : components) {
-      if (component.groupIds.size() >
-          static_cast<size_t>(problem.hardware.arraysPerCore)) {
-        realization = makeInfeasible(
-            problem, (Twine("MVM-wave binding component requires ") +
-                      Twine(component.groupIds.size()) +
-                      " analog lanes on one core but each core provides " +
-                      Twine(problem.hardware.arraysPerCore))
-                         .str());
-        return false;
-      }
-
-      std::optional<int64_t> selectedTile;
-      for (int64_t tileId : tileIds) {
-        int64_t availableLanes = 0;
-        for (MappingAnalogLaneRef lane : rootPool.analogLanes) {
-          if (lane.tileId == tileId && !usedLanes.contains(getKey(lane)))
-            ++availableLanes;
+      for (size_t offset = 0; offset < component.groupIds.size();) {
+        int64_t chunkSize = std::min<int64_t>(
+            problem.hardware.arraysPerCore,
+            static_cast<int64_t>(component.groupIds.size() - offset));
+        std::optional<int64_t> selectedTile;
+        for (int64_t tileId : tileIds) {
+          // Keep separately derived wave components on separate logical
+          // tiles. They can be concurrent siblings in the RA tree and cannot
+          // share the tile's one digital lane even when analog lanes remain.
+          if (tileLaneLoads.lookup(tileId) != 0)
+            continue;
+          if (!selectedTile || tileId < *selectedTile)
+            selectedTile = tileId;
         }
-        if (availableLanes < static_cast<int64_t>(component.groupIds.size()))
-          continue;
-        auto score =
-            std::tuple(component.waveIds.empty() ? int64_t{0}
-                                                 : tileWaveLoads.lookup(tileId),
-                       tileLaneLoads.lookup(tileId), tileId);
-        if (!selectedTile ||
-            score < std::tuple(component.waveIds.empty()
-                                   ? int64_t{0}
-                                   : tileWaveLoads.lookup(*selectedTile),
-                               tileLaneLoads.lookup(*selectedTile),
-                               *selectedTile))
-          selectedTile = tileId;
-      }
-
-      if (!selectedTile) {
-        realization = makeInfeasible(
-            problem,
-            (Twine(
-                 "cannot place MVM-wave binding component containing group ") +
-             Twine(component.groupIds.front()) + " on one core")
-                .str());
-        return false;
-      }
-
-      for (int64_t groupId : component.groupIds) {
-        auto available =
-            llvm::find_if(rootPool.analogLanes, [&](MappingAnalogLaneRef lane) {
-              return lane.tileId == *selectedTile &&
-                     !usedLanes.contains(getKey(lane));
-            });
-        if (available == rootPool.analogLanes.end()) {
-          problem.anchor->emitError(
-              "MVM-wave colocation exhausted a selected core unexpectedly");
-          return failure();
+        if (!selectedTile) {
+          realization = makeInfeasible(
+              problem,
+              (Twine("cannot compactly place MVM binding chunk containing ") +
+               Twine(chunkSize) + " analog arrays")
+                  .str());
+          return false;
         }
-        bindingLanes[groupId] = *available;
-        usedLanes.insert(getKey(*available));
-      }
-      tileLaneLoads[*selectedTile] += component.groupIds.size();
-      tileWaveLoads[*selectedTile] += component.waveIds.size();
-      for (int64_t waveId : component.waveIds) {
-        auto [entry, inserted] = waveTiles.try_emplace(waveId, *selectedTile);
-        if (!inserted && entry->second != *selectedTile) {
-          problem.anchor->emitError(
-              "one MVM wave was assigned to multiple logical cores");
-          return failure();
+
+        for (int64_t index = 0; index < chunkSize; ++index) {
+          int64_t groupId = component.groupIds[offset + index];
+          auto available = llvm::find_if(
+              rootPool.analogLanes, [&](MappingAnalogLaneRef lane) {
+                return lane.tileId == *selectedTile &&
+                       !usedLanes.contains(getKey(lane));
+              });
+          if (available == rootPool.analogLanes.end()) {
+            problem.anchor->emitError(
+                "packed MVM assignment exhausted a core unexpectedly");
+            return failure();
+          }
+          bindingLanes[groupId] = *available;
+          usedLanes.insert(getKey(*available));
         }
+        tileLaneLoads[*selectedTile] += chunkSize;
+        offset += chunkSize;
       }
     }
+    if (failed(recordWaveBindingTiles(/*requireDistinctMemberTiles=*/false)))
+      return failure();
     return true;
   }
 
@@ -904,8 +921,10 @@ private:
         }
       }
     }
-    for (auto &[groupId, neighbors] : conflicts)
+    for (auto &[groupId, neighbors] : conflicts) {
+      (void)groupId;
       sortAndUnique(neighbors);
+    }
 
     SmallVector<const LaneBindingGroup *> orderedGroups(groups.begin(),
                                                         groups.end());
@@ -942,7 +961,6 @@ private:
             });
         if (!hasFreeLane)
           continue;
-
         bool conflictsOnTile = llvm::any_of(
             conflicts[group->id], [&](int64_t neighborId) {
               auto assigned = groupTiles.find(neighborId);
@@ -972,7 +990,7 @@ private:
           });
       if (available == rootPool.analogLanes.end()) {
         problem.anchor->emitError(
-            "spread MVM-body assignment exhausted a core unexpectedly");
+            "spread MVM assignment exhausted a core unexpectedly");
         return failure();
       }
       bindingLanes[group->id] = *available;
@@ -981,31 +999,8 @@ private:
       ++tileLaneLoads[*selectedTile];
     }
 
-    for (const MVMWave &wave : problem.graph.mvmWaves) {
-      DenseSet<int64_t> distinctTiles;
-      for (int64_t operationId : wave.physicalMVMOperationIds) {
-        const ComputeOperation &operation =
-            problem.graph.operations[operationId];
-        MappingAnalogLaneRef lane =
-            bindingLanes.lookup(*operation.laneBindingGroup);
-        if (!distinctTiles.insert(lane.tileId).second) {
-          realization = makeInfeasible(
-              problem, (Twine("spread policy assigned two branches of MVM "
-                              "body ") +
-                        Twine(wave.id) + " to logical core " +
-                        Twine(lane.tileId))
-                           .str());
-          return false;
-        }
-        auto [member, inserted] = waveMemberTiles.try_emplace(
-            std::make_pair(wave.id, *operation.mvmWaveMember), lane.tileId);
-        if (!inserted && member->second != lane.tileId) {
-          operation.operation->emitError(
-              "one MVM body member was assigned to multiple logical cores");
-          return failure();
-        }
-      }
-    }
+    if (failed(recordWaveBindingTiles(/*requireDistinctMemberTiles=*/true)))
+      return failure();
     return true;
   }
 
@@ -1732,64 +1727,84 @@ LogicalResult verifyMappingRealization(const MappingRealization &realization,
   };
 
   for (const MVMWave &wave : problem.graph.mvmWaves) {
-    if (problem.mvmBodyPolicy == MVMBodyPolicy::Packed) {
-      std::optional<int64_t> packedTile;
-      SmallVector<int64_t> operationIds = wave.vectorTileOperationIds;
-      operationIds.append(wave.physicalMVMOperationIds.begin(),
-                          wave.physicalMVMOperationIds.end());
-      if (wave.recombineOperationId)
-        operationIds.push_back(*wave.recombineOperationId);
-      if (wave.biasAddOperationId)
-        operationIds.push_back(*wave.biasAddOperationId);
-      for (int64_t operationId : operationIds) {
-        FailureOr<std::optional<int64_t>> tile =
-            getOperationTile(operationId);
-        if (failed(tile))
-          return failure();
-        if (!packedTile)
-          packedTile = **tile;
-        else if (*packedTile != **tile) {
-          problem.graph.operations[operationId].operation->emitError(
-              "packed MVM-body policy assigned one body to multiple logical "
-              "tiles");
-          return failure();
-        }
-      }
-      continue;
-    }
-
     DenseMap<int64_t, int64_t> memberTiles;
+    DenseMap<int64_t, int64_t> membersPerTile;
     DenseSet<int64_t> distinctTiles;
+    std::optional<std::pair<int64_t, int64_t>> home;
     for (int64_t operationId : wave.physicalMVMOperationIds) {
       const ComputeOperation &operation = problem.graph.operations[operationId];
       if (!operation.mvmWaveMember) {
         operation.operation->emitError(
-            "spread MVM-body policy requires a wave-member identity");
+            "MVM-body policy requires a physical-MVM wave-member identity");
         return failure();
       }
       FailureOr<std::optional<int64_t>> tile = getOperationTile(operationId);
       if (failed(tile))
         return failure();
-      if (!distinctTiles.insert(**tile).second) {
+      memberTiles[*operation.mvmWaveMember] = **tile;
+      distinctTiles.insert(**tile);
+      int64_t count = ++membersPerTile[**tile];
+      if (count > realization.analogLanesPerTile) {
         operation.operation->emitError(
-            "spread MVM-body policy assigned two analog branches to one "
-            "logical tile");
+            "MVM-body policy overfills a logical tile's analog lanes");
         return failure();
       }
-      memberTiles[*operation.mvmWaveMember] = **tile;
+      std::pair<int64_t, int64_t> candidate{*operation.mvmWaveMember, **tile};
+      if (!home || candidate < *home)
+        home = candidate;
     }
+    if (!home) {
+      problem.anchor->emitError("MVM wave has no realized physical members");
+      return failure();
+    }
+
+    int64_t expectedTileCount =
+        problem.mvmBodyPolicy == MVMBodyPolicy::Spread
+            ? static_cast<int64_t>(wave.physicalMVMOperationIds.size())
+            : llvm::divideCeil(
+                  static_cast<int64_t>(wave.physicalMVMOperationIds.size()),
+                  realization.analogLanesPerTile);
+    if (static_cast<int64_t>(distinctTiles.size()) != expectedTileCount) {
+      problem.anchor->emitError(
+          problem.mvmBodyPolicy == MVMBodyPolicy::Spread
+              ? "spread MVM-body policy must use one logical tile per array"
+              : "packed MVM-body policy did not use the minimum logical-tile "
+                "count");
+      return failure();
+    }
+
     for (int64_t operationId : wave.vectorTileOperationIds) {
       const ComputeOperation &operation = problem.graph.operations[operationId];
-      if (!operation.mvmWaveMember)
-        continue;
       FailureOr<std::optional<int64_t>> tile = getOperationTile(operationId);
       if (failed(tile))
         return failure();
-      auto member = memberTiles.find(*operation.mvmWaveMember);
-      if (member == memberTiles.end() || member->second != **tile) {
+      int64_t expectedTile = home->second;
+      if (operation.mvmWaveMember) {
+        auto member = memberTiles.find(*operation.mvmWaveMember);
+        if (member == memberTiles.end()) {
+          operation.operation->emitError(
+              "vector-tile wave member does not identify a physical MVM");
+          return failure();
+        }
+        expectedTile = member->second;
+      }
+      if (**tile != expectedTile) {
         operation.operation->emitError(
-            "spread MVM-body policy separated branch-specific vector work "
-            "from its analog branch");
+            "vector-tile work is separated from its MVM wave destination");
+        return failure();
+      }
+    }
+
+    for (std::optional<int64_t> operationId :
+         {wave.recombineOperationId, wave.biasAddOperationId}) {
+      if (!operationId)
+        continue;
+      FailureOr<std::optional<int64_t>> tile = getOperationTile(*operationId);
+      if (failed(tile))
+        return failure();
+      if (**tile != home->second) {
+        problem.graph.operations[*operationId].operation->emitError(
+            "MVM wave result processing is separated from its home tile");
         return failure();
       }
     }
