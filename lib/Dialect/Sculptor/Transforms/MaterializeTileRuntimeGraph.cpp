@@ -3,7 +3,9 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/SemanticOperationNames.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
 
@@ -270,12 +272,10 @@ collectModelIO(ModuleOp module, StringRef name, bool input, int64_t tileId) {
   }
   llvm::sort(entries, [](const ModelIOInfo &lhs, const ModelIOInfo &rhs) {
     return std::tuple<int64_t, int64_t, int64_t, int64_t>{
-               lhs.attr.getIndex().getInt(),
-               lhs.attr.getResourceId().getInt(),
+               lhs.attr.getIndex().getInt(), lhs.attr.getResourceId().getInt(),
                lhs.attr.getRoutine().getInt(), lhs.attr.getPort().getInt()} <
            std::tuple<int64_t, int64_t, int64_t, int64_t>{
-               rhs.attr.getIndex().getInt(),
-               rhs.attr.getResourceId().getInt(),
+               rhs.attr.getIndex().getInt(), rhs.attr.getResourceId().getInt(),
                rhs.attr.getRoutine().getInt(), rhs.attr.getPort().getInt()};
   });
   return entries;
@@ -759,6 +759,12 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
       dependencies.push_back(task->second);
     }
 
+    StringRef taskKind = "sculptor.tile_routine";
+    if (routine.boot)
+      taskKind = semantic_operation_names::kMatrixSetupTaskKind;
+    else if (routine.function->hasAttr(
+                 task_graph_attrs::kTaskReductionTreeIdAttrName))
+      taskKind = semantic_operation_names::kReductionTaskKind;
     auto task = builder.create<TaskCreateOp>(
         module.getLoc(), TaskType::get(module.getContext()), graph,
         SymbolRefAttr::get(routine.function),
@@ -766,8 +772,7 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
             routine.boot
                 ? "analog"
                 : (routine.arrayBindings.empty() ? "digital" : "analog")),
-        builder.getStringAttr(routine.boot ? "sculptor.matrix_setup"
-                                           : "sculptor.tile_routine"),
+        builder.getStringAttr(taskKind),
         builder.getStringAttr(routine.function.getSymName()),
         builder.getStringAttr("ra_tile"),
         builder.getI64IntegerAttr(routine.globalId), taskInputs, taskOutputs,
@@ -784,6 +789,14 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
     if (!routine.arrayBindings.empty())
       task->setAttr(tile_runtime_attrs::kTaskArrayBindingsAttrName,
                     builder.getArrayAttr(routine.arrayBindings));
+    for (StringRef attrName :
+         {StringRef(task_graph_attrs::kTaskReductionAttrName),
+          StringRef(task_graph_attrs::kTaskReductionTreeIdAttrName),
+          StringRef(task_graph_attrs::kTaskReductionLevelAttrName),
+          StringRef(task_graph_attrs::kTaskReductionWidthAttrName)}) {
+      if (Attribute value = routine.function->getAttr(attrName))
+        task->setAttr(attrName, value);
+    }
     if (routine.boot) {
       for (StringRef attrName :
            {StringRef(tile_runtime_attrs::kTaskLocalArrayIdAttrName),

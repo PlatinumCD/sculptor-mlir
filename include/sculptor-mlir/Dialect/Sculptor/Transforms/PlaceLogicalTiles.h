@@ -20,6 +20,26 @@ struct PlaceLogicalTilesPass
           "Physical placement schedule: random, snake, greedy, or annealing"),
       llvm::cl::init("greedy")};
 
+  Option<std::string> placementObjective{
+      *this, "objective",
+      llvm::cl::desc("Physical objective: transfer-cost or makespan"),
+      llvm::cl::init("transfer-cost")};
+
+  Option<std::string> networkMode{
+      *this, "network-mode",
+      llvm::cl::desc("Temporal network model: ideal, finite, or full"),
+      llvm::cl::init("finite")};
+
+  Option<std::string> timingScope{
+      *this, "timing-scope",
+      llvm::cl::desc("Temporal timing scope: warm or cold"),
+      llvm::cl::init("warm")};
+
+  Option<int64_t> temporalCandidateLimit{
+      *this, "temporal-candidate-limit",
+      llvm::cl::desc("Maximum greedy candidates evaluated with makespan"),
+      llvm::cl::init(8)};
+
   Option<int64_t> meshRows{*this, "mesh-rows",
                            llvm::cl::desc("Physical mesh row count; zero "
                                           "inherits the logical plan"),
@@ -102,6 +122,10 @@ struct PlaceLogicalTilesPass
   PlaceLogicalTilesPass() = default;
   PlaceLogicalTilesPass(const PlaceLogicalTilesPass &pass) : PassWrapper(pass) {
     schedule = pass.schedule;
+    placementObjective = pass.placementObjective;
+    networkMode = pass.networkMode;
+    timingScope = pass.timingScope;
+    temporalCandidateLimit = pass.temporalCandidateLimit;
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;

@@ -179,15 +179,16 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
     return problem.tileGraph.tiles[lhs].id < problem.tileGraph.tiles[rhs].id;
   });
 
-  auto visitPhysicalNeighbors = [&](int64_t physicalTile,
-                                    bool includeDiagonals, auto &&visitor) {
+  auto visitPhysicalNeighbors = [&](int64_t physicalTile, bool includeDiagonals,
+                                    auto &&visitor) {
     int64_t row = physicalTile / problem.mesh.columns;
     int64_t column = physicalTile % problem.mesh.columns;
     for (int64_t rowOffset = -1; rowOffset <= 1; ++rowOffset) {
       for (int64_t columnOffset = -1; columnOffset <= 1; ++columnOffset) {
         if (rowOffset == 0 && columnOffset == 0)
           continue;
-        if (!includeDiagonals && std::abs(rowOffset) + std::abs(columnOffset) != 1)
+        if (!includeDiagonals &&
+            std::abs(rowOffset) + std::abs(columnOffset) != 1)
           continue;
         int64_t candidateRow = row + rowOffset;
         int64_t candidateColumn = column + columnOffset;
@@ -309,15 +310,14 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
     return candidates;
   };
 
-  auto collectNearestOpenCandidates =
-      [&](const GreedyPlacementState &target) {
+  auto collectNearestOpenCandidates = [&](const GreedyPlacementState &target) {
     SmallVector<int64_t> candidates;
     int64_t nearestDistance = std::numeric_limits<int64_t>::max();
     for (int64_t candidate = 0; candidate < *capacity; ++candidate) {
       if (target.usedPhysicalTiles.contains(candidate))
         continue;
-      int64_t distance =
-          manhattanDistance(target.currentPhysicalTile, candidate, problem.mesh);
+      int64_t distance = manhattanDistance(target.currentPhysicalTile,
+                                           candidate, problem.mesh);
       if (distance < nearestDistance) {
         nearestDistance = distance;
         candidates.clear();
@@ -409,6 +409,22 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
           "greedy logical-tile placement exhausted the physical mesh");
       return failure();
     }
+    if (problem.objective == PlacementObjectiveKind::Makespan &&
+        candidates.size() >
+            static_cast<size_t>(problem.temporalCandidateLimit)) {
+      SmallVector<std::pair<int64_t, int64_t>> ranked;
+      ranked.reserve(candidates.size());
+      for (int64_t candidate : candidates) {
+        FailureOr<int64_t> cost = scoreCandidate(state, tile, candidate);
+        if (failed(cost))
+          return failure();
+        ranked.push_back({*cost, candidate});
+      }
+      llvm::sort(ranked);
+      candidates.clear();
+      for (int64_t index = 0; index < problem.temporalCandidateLimit; ++index)
+        candidates.push_back(ranked[index].second);
+    }
 
     GreedyRolloutResult best;
     bool hasBest = false;
@@ -455,6 +471,29 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
           return failure();
       }
 
+      if (problem.objective == PlacementObjectiveKind::Makespan) {
+        while (simulation.placedCount < tileCount) {
+          size_t futureTile = selectNextLogicalTile(simulation);
+          if (futureTile == tileCount) {
+            problem.anchor->emitError(
+                "temporal greedy completion exhausted logical tiles");
+            return failure();
+          }
+          FailureOr<GreedyPhysicalCandidate> futurePlacement =
+              chooseImmediatePlacement(simulation, futureTile);
+          if (failed(futurePlacement) ||
+              failed(commitPlacement(simulation, futureTile,
+                                     futurePlacement->physicalTile)))
+            return failure();
+        }
+        FailureOr<int64_t> temporalScore =
+            scorePlacementObjective(problem, simulation.physicalByTileIndex);
+        if (failed(temporalScore))
+          return failure();
+        ++evaluations;
+        rolloutCost = *temporalScore;
+      }
+
       GreedyRolloutResult scored{firstPlacement, rolloutCost};
       if (!hasBest ||
           std::tie(scored.totalCost, scored.firstPlacement.incrementalCost,
@@ -468,8 +507,7 @@ buildGreedyPlacement(const LogicalTilePlacementProblem &problem,
       }
     }
 
-    if (failed(
-            commitPlacement(state, tile, best.firstPlacement.physicalTile)))
+    if (failed(commitPlacement(state, tile, best.firstPlacement.physicalTile)))
       return failure();
   }
 
@@ -499,13 +537,13 @@ buildInitialPlacement(const LogicalTilePlacementProblem &problem,
 FailureOr<PlacementSearchResult>
 runAnnealing(const LogicalTilePlacementProblem &problem,
              const LogicalTilePlacementConfig &config) {
-  FailureOr<PlacementSearchResult> initial = buildInitialPlacement(
-      problem, config.annealingInitialSchedule, config.randomSeed,
-      config.greedy);
+  FailureOr<PlacementSearchResult> initial =
+      buildInitialPlacement(problem, config.annealingInitialSchedule,
+                            config.randomSeed, config.greedy);
   if (failed(initial))
     return failure();
   FailureOr<int64_t> initialScore =
-      scoreLogicalTilePlacement(problem, initial->physicalTiles);
+      scorePlacementObjective(problem, initial->physicalTiles);
   if (failed(initialScore))
     return failure();
 
@@ -560,7 +598,7 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
     }
 
     FailureOr<int64_t> candidateScore =
-        scoreLogicalTilePlacement(problem, candidate);
+        scorePlacementObjective(problem, candidate);
     if (failed(candidateScore))
       return failure();
     ++evaluations;
@@ -580,16 +618,14 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
     lastCandidateScore = *candidateScore;
     lastAccepted = accept;
     if (evaluations % config.annealingTraceSampleInterval == 0) {
-      trace.samples.push_back(
-          {evaluations, lastCandidateScore, currentScore, bestScore,
-           lastAccepted});
+      trace.samples.push_back({evaluations, lastCandidateScore, currentScore,
+                               bestScore, lastAccepted});
     }
     temperature = std::max(1.0e-9, temperature * config.annealingCoolingRate);
   }
   if (trace.samples.back().iteration != evaluations) {
-    trace.samples.push_back(
-        {evaluations, lastCandidateScore, currentScore, bestScore,
-         lastAccepted});
+    trace.samples.push_back({evaluations, lastCandidateScore, currentScore,
+                             bestScore, lastAccepted});
   }
   trace.finalScore = bestScore;
   trace.evaluations = evaluations;
@@ -628,7 +664,7 @@ scheduleLogicalTiles(const LogicalTilePlacementProblem &problem,
   if (failed(search))
     return failure();
   FailureOr<int64_t> score =
-      scoreLogicalTilePlacement(problem, search->physicalTiles);
+      scorePlacementObjective(problem, search->physicalTiles);
   if (failed(score))
     return failure();
   int64_t initialScore = config.schedule == LogicalTileScheduleKind::Annealing

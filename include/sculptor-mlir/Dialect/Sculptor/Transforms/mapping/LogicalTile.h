@@ -78,6 +78,7 @@ struct LogicalTileDependency {
   int64_t targetOperationId = -1;
   int64_t targetWorkUnitId = -1;
   int64_t tensorId = -1;
+  int64_t targetOperandNumber = -1;
   int64_t byteSize = 0;
 };
 
@@ -105,7 +106,7 @@ struct LogicalTileEdge {
 };
 
 struct LogicalTileGraph {
-  int64_t version = 2;
+  int64_t version = 3;
   int64_t plannedMeshRows = 0;
   int64_t plannedMeshCols = 0;
   int64_t logicalTileCapacity = 0;
@@ -119,8 +120,7 @@ FailureOr<LogicalTileGraph>
 buildLogicalTileGraph(const ComputeGraph &graph,
                       const ResourceAllocationTree &tree,
                       const MappingRealization &realization,
-                      const MappingHardwareModel &hardware,
-                      Operation *anchor);
+                      const MappingHardwareModel &hardware, Operation *anchor);
 
 LogicalResult verifyLogicalTileGraph(const LogicalTileGraph &tileGraph,
                                      const ComputeGraph &graph,

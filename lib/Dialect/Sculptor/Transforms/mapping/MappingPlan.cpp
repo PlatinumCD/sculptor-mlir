@@ -117,11 +117,13 @@ MappingPlanAttr serializeMappingPlan(MLIRContext *context,
       builder.getArrayAttr(leafAssignments));
 
   return MappingPlanAttr::get(
-      context, builder.getI64IntegerAttr(4),
+      context, builder.getI64IntegerAttr(5),
       builder.getStringAttr(plan.plannerName), objective,
       builder.getStringAttr(stringifyMVMBodyPolicy(plan.mvmBodyPolicy)),
       builder.getStringAttr(
           stringifySetupBindingPolicy(plan.setupBindingPolicy)),
+      builder.getStringAttr(plan.costProfileName),
+      builder.getStringAttr(plan.costProfileHash),
       builder.getStringAttr(computeRATreeFingerprint(plan.selectedTree)),
       builder.getBoolAttr(plan.evaluation.feasible),
       builder.getF64FloatAttr(plan.evaluation.estimatedLatencyNs),

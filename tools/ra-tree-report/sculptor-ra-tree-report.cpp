@@ -6,6 +6,8 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
@@ -239,6 +241,42 @@ FailureOr<ReportFunction> buildReportFunction(func::FuncOp function,
          placementAttr.getMeshCols().getInt(),
          placementAttr.getArraysPerCore().getInt()},
         function};
+    FailureOr<PlacementObjectiveKind> objective = parsePlacementObjective(
+        placementAttr.getObjective().getValue(), function);
+    FailureOr<TemporalNetworkMode> networkMode = parseTemporalNetworkMode(
+        placementAttr.getNetworkMode().getValue(), function);
+    FailureOr<TemporalTimingScope> timingScope = parseTemporalTimingScope(
+        placementAttr.getTimingScope().getValue(), function);
+    if (failed(objective) || failed(networkMode) || failed(timingScope))
+      return failure();
+
+    MappingHardwareModel hardware;
+    hardware.meshRows = problem.mesh.rows;
+    hardware.meshCols = problem.mesh.columns;
+    hardware.arraysPerCore = problem.mesh.arraysPerCore;
+    auto profileAttr =
+        function->getAttrOfType<DictionaryAttr>(kMappingCostProfileAttrName);
+    if (profileAttr) {
+      if (auto clock = profileAttr.getAs<IntegerAttr>("clock_frequency_hz"))
+        hardware.clockFrequencyHz = clock.getInt();
+      if (auto network = profileAttr.getAs<DictionaryAttr>("network")) {
+        if (auto bits = network.getAs<IntegerAttr>("word_bits"))
+          hardware.networkWordBits = bits.getInt();
+      }
+    }
+    FailureOr<MappingCostProfile> profile =
+        profileAttr
+            ? deserializeMappingCostProfile(profileAttr, hardware, function)
+            : FailureOr<MappingCostProfile>(
+                  getLegacyMappingCostProfile(hardware));
+    if (failed(profile))
+      return failure();
+    problem.computeGraph = &*graph;
+    problem.raTree = &*tree;
+    problem.costProfile = &*profile;
+    problem.objective = *objective;
+    problem.networkMode = *networkMode;
+    problem.timingScope = *timingScope;
     FailureOr<LogicalTilePlacementPlan> deserialized =
         deserializeLogicalTilePlacement(placementAttr, problem);
     if (failed(deserialized))
@@ -365,8 +403,8 @@ collectExpandedRealization(ModuleOp expandedModule,
       for (Operation *member : group.members) {
         auto memberOperationId = member->getAttrOfType<IntegerAttr>(
             mapping::kMappingOperationIdAttrName);
-        auto memberLeafId = member->getAttrOfType<IntegerAttr>(
-            mapping::kRALeafIdAttrName);
+        auto memberLeafId =
+            member->getAttrOfType<IntegerAttr>(mapping::kRALeafIdAttrName);
         if (!memberOperationId || memberOperationId.getInt() != id ||
             !memberLeafId || memberLeafId.getInt() != expectedLeaf) {
           member->emitError("expanded stage identity does not match logical "
@@ -381,11 +419,11 @@ collectExpandedRealization(ModuleOp expandedModule,
       stage.operationId = id;
       stage.raLeafId = expectedLeaf;
       stage.stageIndex = nextStageIndex[id]++;
-      if (auto kind = anchor->getAttrOfType<StringAttr>(
-              mapping::kStageKindAttrName))
+      if (auto kind =
+              anchor->getAttrOfType<StringAttr>(mapping::kStageKindAttrName))
         stage.kind = kind.getValue().str();
-      if (auto name = anchor->getAttrOfType<StringAttr>(
-              mapping::kStageNameAttrName))
+      if (auto name =
+              anchor->getAttrOfType<StringAttr>(mapping::kStageNameAttrName))
         stage.name = name.getValue().str();
       stage.location = printLocation(anchor->getLoc());
       stage.mlir = printOperationGroup(group.members);
@@ -576,6 +614,9 @@ void emitTree(llvm::json::OStream &json, const ReportFunction &report) {
           emitI64Array(json, "result_sizes", workUnit.resultSizes);
           emitI64Array(json, "iteration_offsets", workUnit.iterationOffsets);
           emitI64Array(json, "iteration_sizes", workUnit.iterationSizes);
+          json.attribute("shard_group_id", workUnit.shardGroupId);
+          json.attribute("shard_index", workUnit.shardIndex);
+          json.attribute("shard_count", workUnit.shardCount);
         });
       }
     });
@@ -586,6 +627,9 @@ void emitTree(llvm::json::OStream &json, const ReportFunction &report) {
           json.attribute("source_work_unit_id", edge.sourceWorkUnitId);
           json.attribute("target_operation_id", edge.targetOperationId);
           json.attribute("target_work_unit_id", edge.targetWorkUnitId);
+          json.attribute("tensor_id", edge.tensorId);
+          json.attribute("source_result_number", edge.sourceResultNumber);
+          json.attribute("target_operand_number", edge.targetOperandNumber);
           json.attribute("byte_size", edge.byteSize);
         });
       }
@@ -620,6 +664,8 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
     json.attribute("mvm_body_policy", plan.getMvmBodyPolicy().getValue());
     json.attribute("setup_binding_policy",
                    plan.getSetupBindingPolicy().getValue());
+    json.attribute("cost_profile_name", plan.getCostProfileName().getValue());
+    json.attribute("cost_profile_hash", plan.getCostProfileHash().getValue());
     json.attribute("ra_tree_fingerprint",
                    plan.getRaTreeFingerprint().getValue());
     json.attribute("feasible", plan.getFeasible().getValue());
@@ -754,6 +800,16 @@ void emitOperations(llvm::json::OStream &json, const ReportFunction &report) {
         json.attribute("mvm_wave_size", operation.mvmWaveSize
                                             ? *operation.mvmWaveSize
                                             : int64_t{-1});
+        json.attribute("reduction_tree_id",
+                       operation.reductionTreeId.value_or(-1));
+        json.attribute("reduction_node_id",
+                       operation.reductionNodeId.value_or(-1));
+        json.attribute("reduction_level",
+                       operation.reductionLevel.value_or(-1));
+        json.attribute("reduction_ordinal",
+                       operation.reductionOrdinal.value_or(-1));
+        json.attribute("reduction_width",
+                       operation.reductionWidth.value_or(-1));
         json.attribute("member_count", operation.members.size());
         json.attribute("location",
                        printLocation(operation.operation->getLoc()));
@@ -805,6 +861,7 @@ void emitLogicalTileDependency(llvm::json::OStream &json,
     json.attribute("target_operation_id", dependency.targetOperationId);
     json.attribute("target_work_unit_id", dependency.targetWorkUnitId);
     json.attribute("tensor_id", dependency.tensorId);
+    json.attribute("target_operand_number", dependency.targetOperandNumber);
     json.attribute("byte_size", dependency.byteSize);
   });
 }
@@ -881,11 +938,22 @@ void emitLogicalTilePlacement(llvm::json::OStream &json,
   json.attributeObject("physical_placement", [&] {
     json.attribute("version", placement.version);
     json.attribute("schedule", placement.schedule);
+    json.attribute("objective",
+                   stringifyPlacementObjective(placement.objective));
+    json.attribute("network_mode",
+                   stringifyTemporalNetworkMode(placement.networkMode));
+    json.attribute("timing_scope",
+                   stringifyTemporalTimingScope(placement.timingScope));
+    json.attribute("route_policy", placement.routePolicy);
+    json.attribute("cost_profile_name", placement.costProfileName);
+    json.attribute("cost_profile_hash", placement.costProfileHash);
     json.attribute("mesh_rows", placement.mesh.rows);
     json.attribute("mesh_cols", placement.mesh.columns);
     json.attribute("arrays_per_core", placement.mesh.arraysPerCore);
     json.attribute("initial_score", placement.initialScore);
+    json.attribute("objective_score", placement.objectiveScore);
     json.attribute("total_transfer_cost", placement.totalTransferCost);
+    json.attribute("predicted_makespan_ns", placement.predictedMakespanNs);
     json.attribute("evaluations", placement.evaluations);
     json.attributeArray("assignments", [&] {
       for (const LogicalTilePhysicalAssignment &assignment :

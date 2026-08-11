@@ -24,12 +24,13 @@ using namespace mlir::sculptor::mapping;
 using Endpoint = std::pair<int64_t, int64_t>;
 using TilePair = std::pair<int64_t, int64_t>;
 using DependencyKey =
-    std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+    std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
 
 DependencyKey getDependencyKey(const LogicalTileDependency &dependency) {
   return {dependency.sourceOperationId, dependency.sourceWorkUnitId,
           dependency.targetOperationId, dependency.targetWorkUnitId,
-          dependency.tensorId,          dependency.byteSize};
+          dependency.tensorId,          dependency.targetOperandNumber,
+          dependency.byteSize};
 }
 
 FailureOr<int64_t> checkedAddBytes(int64_t current, int64_t increment,
@@ -119,6 +120,7 @@ serializeDependency(Builder &builder, const LogicalTileDependency &dependency) {
       builder.getI64IntegerAttr(dependency.targetOperationId),
       builder.getI64IntegerAttr(dependency.targetWorkUnitId),
       builder.getI64IntegerAttr(dependency.tensorId),
+      builder.getI64IntegerAttr(dependency.targetOperandNumber),
       builder.getI64IntegerAttr(dependency.byteSize));
 }
 
@@ -143,10 +145,13 @@ deserializeAssignment(LogicalTileAssignmentAttr attr, Operation *anchor) {
 }
 
 LogicalTileDependency deserializeDependency(LogicalTileDependencyAttr attr) {
-  return {
-      attr.getSourceOperationId().getInt(), attr.getSourceWorkUnitId().getInt(),
-      attr.getTargetOperationId().getInt(), attr.getTargetWorkUnitId().getInt(),
-      attr.getTensorId().getInt(),          attr.getByteSize().getInt()};
+  return {attr.getSourceOperationId().getInt(),
+          attr.getSourceWorkUnitId().getInt(),
+          attr.getTargetOperationId().getInt(),
+          attr.getTargetWorkUnitId().getInt(),
+          attr.getTensorId().getInt(),
+          attr.getTargetOperandNumber().getInt(),
+          attr.getByteSize().getInt()};
 }
 
 bool assignmentLess(const LogicalTileAssignment &left,
@@ -386,10 +391,15 @@ private:
   }
 
   LogicalResult addDependencies() {
-    std::set<std::pair<int64_t, int64_t>> refinedOperationEdges;
+    std::set<std::pair<int64_t, int64_t>> wildcardRefinedEdges;
+    std::set<std::tuple<int64_t, int64_t, int64_t>> refinedTensorEdges;
     for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
-      refinedOperationEdges.insert(
-          {edge.sourceOperationId, edge.targetOperationId});
+      if (edge.tensorId < 0)
+        wildcardRefinedEdges.insert(
+            {edge.sourceOperationId, edge.targetOperationId});
+      else
+        refinedTensorEdges.insert(
+            {edge.sourceOperationId, edge.targetOperationId, edge.tensorId});
       FailureOr<SmallVector<int64_t>> sourceTiles =
           getTilesForEndpoint(edge.sourceOperationId, edge.sourceWorkUnitId);
       FailureOr<SmallVector<int64_t>> targetTiles =
@@ -399,7 +409,8 @@ private:
       LogicalTileDependency dependency{
           edge.sourceOperationId, edge.sourceWorkUnitId,
           edge.targetOperationId, edge.targetWorkUnitId,
-          /*tensorId=*/-1,        edge.byteSize};
+          edge.tensorId,          edge.targetOperandNumber,
+          edge.byteSize};
       for (int64_t source : *sourceTiles)
         for (int64_t target : *targetTiles)
           if (failed(recordDependency(source, target, dependency)))
@@ -410,7 +421,8 @@ private:
       for (int64_t producer : tensor.producerOperations) {
         for (int64_t consumer : tensor.consumerOperations) {
           if (producer == consumer ||
-              refinedOperationEdges.contains({producer, consumer}))
+              wildcardRefinedEdges.contains({producer, consumer}) ||
+              refinedTensorEdges.contains({producer, consumer, tensor.id}))
             continue;
           FailureOr<SmallVector<int64_t>> sourceTiles =
               getTilesForEndpoint(producer, /*workUnitId=*/-1);
@@ -423,6 +435,7 @@ private:
                                            consumer,
                                            /*targetWorkUnitId=*/-1,
                                            tensor.id,
+                                           /*targetOperandNumber=*/-1,
                                            tensor.byteSize};
           for (int64_t source : *sourceTiles)
             for (int64_t target : *targetTiles)
@@ -471,10 +484,35 @@ LogicalResult verifyDependency(const LogicalTileDependency &dependency,
                             dependency.sourceOperationId) ||
         !llvm::is_contained(tensor.consumerOperations,
                             dependency.targetOperationId) ||
-        tensor.byteSize != dependency.byteSize) {
+        (dependency.targetOperandNumber >= 0 &&
+         (dependency.targetOperandNumber >=
+              static_cast<int64_t>(
+                  graph.operations[dependency.targetOperationId]
+                      .operation->getNumOperands()) ||
+          graph.operations[dependency.targetOperationId].operation->getOperand(
+              dependency.targetOperandNumber) != tensor.value)) ||
+        ((dependency.sourceWorkUnitId < 0 && dependency.targetWorkUnitId < 0)
+             ? tensor.byteSize != dependency.byteSize
+             : dependency.byteSize > tensor.byteSize)) {
       anchor->emitError("logical-tile dependency does not match its compute "
                         "tensor");
       return failure();
+    }
+    if (dependency.sourceWorkUnitId >= 0 || dependency.targetWorkUnitId >= 0) {
+      bool matches = llvm::any_of(tree.workUnitEdges, [&](const auto &edge) {
+        return edge.sourceOperationId == dependency.sourceOperationId &&
+               edge.sourceWorkUnitId == dependency.sourceWorkUnitId &&
+               edge.targetOperationId == dependency.targetOperationId &&
+               edge.targetWorkUnitId == dependency.targetWorkUnitId &&
+               edge.tensorId == dependency.tensorId &&
+               edge.targetOperandNumber == dependency.targetOperandNumber &&
+               edge.byteSize == dependency.byteSize;
+      });
+      if (!matches) {
+        anchor->emitError(
+            "logical-tile shard dependency has no exact RA-tree edge");
+        return failure();
+      }
     }
     return success();
   }
@@ -483,6 +521,8 @@ LogicalResult verifyDependency(const LogicalTileDependency &dependency,
            edge.sourceWorkUnitId == dependency.sourceWorkUnitId &&
            edge.targetOperationId == dependency.targetOperationId &&
            edge.targetWorkUnitId == dependency.targetWorkUnitId &&
+           edge.tensorId == dependency.tensorId &&
+           edge.targetOperandNumber == dependency.targetOperandNumber &&
            edge.byteSize == dependency.byteSize;
   });
   if (!matches) {
@@ -499,16 +539,17 @@ namespace mlir {
 namespace sculptor {
 namespace mapping {
 
-FailureOr<LogicalTileGraph> buildLogicalTileGraph(
-    const ComputeGraph &graph, const ResourceAllocationTree &tree,
-    const MappingRealization &realization,
-    const MappingHardwareModel &hardware, Operation *anchor) {
+FailureOr<LogicalTileGraph>
+buildLogicalTileGraph(const ComputeGraph &graph,
+                      const ResourceAllocationTree &tree,
+                      const MappingRealization &realization,
+                      const MappingHardwareModel &hardware, Operation *anchor) {
   LogicalTileGraphBuilder builder(graph, tree, realization, anchor);
   FailureOr<LogicalTileGraph> tileGraph = builder.build();
   FailureOr<int64_t> coreCount = hardware.getCoreCount(anchor);
   if (failed(tileGraph) || failed(coreCount))
     return failure();
-  tileGraph->version = 2;
+  tileGraph->version = 3;
   tileGraph->plannedMeshRows = hardware.meshRows;
   tileGraph->plannedMeshCols = hardware.meshCols;
   if (tileGraph->logicalTileCapacity != *coreCount ||
@@ -526,13 +567,12 @@ LogicalResult verifyLogicalTileGraph(const LogicalTileGraph &tileGraph,
                                      const ComputeGraph &graph,
                                      const ResourceAllocationTree &tree,
                                      Operation *anchor) {
-  auto plannedCapacity = llvm::checkedMul(tileGraph.plannedMeshRows,
-                                          tileGraph.plannedMeshCols);
-  if (tileGraph.version != 2 || tileGraph.plannedMeshRows <= 0 ||
+  auto plannedCapacity =
+      llvm::checkedMul(tileGraph.plannedMeshRows, tileGraph.plannedMeshCols);
+  if (tileGraph.version != 3 || tileGraph.plannedMeshRows <= 0 ||
       tileGraph.plannedMeshCols <= 0 || !plannedCapacity ||
       *plannedCapacity != tileGraph.logicalTileCapacity ||
-      tileGraph.logicalTileCapacity <= 0 ||
-      tileGraph.analogLanesPerTile <= 0 ||
+      tileGraph.logicalTileCapacity <= 0 || tileGraph.analogLanesPerTile <= 0 ||
       tileGraph.tiles.size() >
           static_cast<size_t>(tileGraph.logicalTileCapacity)) {
     anchor->emitError("invalid logical-tile graph shape or version");

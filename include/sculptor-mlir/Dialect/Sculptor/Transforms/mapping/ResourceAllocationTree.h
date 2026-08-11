@@ -28,6 +28,9 @@ struct MappingWorkUnit {
   SmallVector<int64_t> resultSizes;
   SmallVector<int64_t> iterationOffsets;
   SmallVector<int64_t> iterationSizes;
+  int64_t shardGroupId = -1;
+  int64_t shardIndex = -1;
+  int64_t shardCount = -1;
 };
 
 // An exact dependency refinement for a tiled endpoint. A work-unit ID of -1
@@ -37,6 +40,9 @@ struct MappingWorkUnitEdge {
   int64_t sourceWorkUnitId = -1;
   int64_t targetOperationId = -1;
   int64_t targetWorkUnitId = -1;
+  int64_t tensorId = -1;
+  int64_t sourceResultNumber = -1;
+  int64_t targetOperandNumber = -1;
   int64_t byteSize = -1;
 };
 

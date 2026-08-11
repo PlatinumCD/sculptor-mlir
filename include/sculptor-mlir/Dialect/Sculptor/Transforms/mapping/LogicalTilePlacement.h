@@ -2,6 +2,7 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_MAPPING_LOGICALTILEPLACEMENT_H
 
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/PlacementObjective.h"
 
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
@@ -17,6 +18,10 @@
 namespace mlir {
 namespace sculptor {
 namespace mapping {
+
+struct ComputeGraph;
+struct MappingCostProfile;
+struct ResourceAllocationTree;
 
 inline constexpr StringLiteral kLogicalTilePlacementAttrName =
     "sculptor.mapping.logical_tile_placement";
@@ -41,6 +46,13 @@ struct LogicalTilePlacementProblem {
   const LogicalTileGraph &tileGraph;
   PhysicalMeshGeometry mesh;
   Operation *anchor = nullptr;
+  const ComputeGraph *computeGraph = nullptr;
+  const ResourceAllocationTree *raTree = nullptr;
+  const MappingCostProfile *costProfile = nullptr;
+  PlacementObjectiveKind objective = PlacementObjectiveKind::TransferCost;
+  TemporalNetworkMode networkMode = TemporalNetworkMode::Finite;
+  TemporalTimingScope timingScope = TemporalTimingScope::Warm;
+  int64_t temporalCandidateLimit = 8;
 };
 
 enum class LogicalTileScheduleKind {
@@ -122,11 +134,19 @@ struct LogicalTileAnnealingTrace {
 };
 
 struct LogicalTilePlacementPlan {
-  int64_t version = 1;
+  int64_t version = 2;
   std::string schedule;
+  PlacementObjectiveKind objective = PlacementObjectiveKind::TransferCost;
+  TemporalNetworkMode networkMode = TemporalNetworkMode::Finite;
+  TemporalTimingScope timingScope = TemporalTimingScope::Warm;
+  std::string routePolicy = "xy";
+  std::string costProfileName;
+  std::string costProfileHash;
   PhysicalMeshGeometry mesh;
   int64_t initialScore = 0;
+  int64_t objectiveScore = 0;
   int64_t totalTransferCost = 0;
+  double predictedMakespanNs = 0.0;
   int64_t evaluations = 0;
   SmallVector<LogicalTilePhysicalAssignment, 0> assignments;
   SmallVector<PlacedLogicalTileEdge, 0> edges;

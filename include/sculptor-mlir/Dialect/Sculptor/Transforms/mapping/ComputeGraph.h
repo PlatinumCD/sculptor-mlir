@@ -87,6 +87,12 @@ struct ComputeOperation {
   std::optional<int64_t> mvmWaveId;
   std::optional<int64_t> mvmWaveMember;
   std::optional<int64_t> mvmWaveSize;
+  std::optional<int64_t> reductionTreeId;
+  std::optional<int64_t> reductionNodeId;
+  std::optional<int64_t> reductionLevel;
+  std::optional<int64_t> reductionOrdinal;
+  std::optional<int64_t> reductionWidth;
+  std::string semanticTaskKind;
   std::string stageName;
 };
 
@@ -112,6 +118,7 @@ struct MVMWave {
 
 struct ComputeTensor {
   int64_t id = -1;
+  Value value;
   Type type;
   SmallVector<int64_t> producerOperations;
   SmallVector<int64_t> consumerOperations;

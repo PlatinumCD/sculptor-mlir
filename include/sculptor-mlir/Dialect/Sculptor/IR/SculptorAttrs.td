@@ -73,7 +73,10 @@ def Sculptor_MappingWorkUnitAttr
     "ArrayAttr":$resultOffsets,
     "ArrayAttr":$resultSizes,
     "ArrayAttr":$iterationOffsets,
-    "ArrayAttr":$iterationSizes
+    "ArrayAttr":$iterationSizes,
+    "IntegerAttr":$shardGroupId,
+    "IntegerAttr":$shardIndex,
+    "IntegerAttr":$shardCount
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }
@@ -92,6 +95,9 @@ def Sculptor_MappingWorkUnitEdgeAttr
     "IntegerAttr":$sourceWorkUnitId,
     "IntegerAttr":$targetOperationId,
     "IntegerAttr":$targetWorkUnitId,
+    "IntegerAttr":$tensorId,
+    "IntegerAttr":$sourceResultNumber,
+    "IntegerAttr":$targetOperandNumber,
     "IntegerAttr":$byteSize
   );
   let assemblyFormat = "`<` struct(params) `>`";
@@ -280,6 +286,7 @@ def Sculptor_LogicalTileDependencyAttr
     "IntegerAttr":$targetOperationId,
     "IntegerAttr":$targetWorkUnitId,
     "IntegerAttr":$tensorId,
+    "IntegerAttr":$targetOperandNumber,
     "IntegerAttr":$byteSize
   );
   let assemblyFormat = "`<` struct(params) `>`";
@@ -360,11 +367,19 @@ def Sculptor_LogicalTilePlacementAttr
   let parameters = (ins
     "IntegerAttr":$version,
     "StringAttr":$schedule,
+    "StringAttr":$objective,
+    "StringAttr":$networkMode,
+    "StringAttr":$timingScope,
+    "StringAttr":$routePolicy,
+    "StringAttr":$costProfileName,
+    "StringAttr":$costProfileHash,
     "IntegerAttr":$meshRows,
     "IntegerAttr":$meshCols,
     "IntegerAttr":$arraysPerCore,
     "IntegerAttr":$initialScore,
+    "IntegerAttr":$objectiveScore,
     "IntegerAttr":$totalTransferCost,
+    "FloatAttr":$predictedMakespanNs,
     "IntegerAttr":$evaluations,
     "ArrayAttr":$assignments,
     "ArrayAttr":$edges
@@ -459,6 +474,8 @@ def Sculptor_MappingPlanAttr
     EnumParameter<Sculptor_MappingPlanObjective>:$objective,
     "StringAttr":$mvmBodyPolicy,
     "StringAttr":$setupBindingPolicy,
+    "StringAttr":$costProfileName,
+    "StringAttr":$costProfileHash,
     "StringAttr":$raTreeFingerprint,
     "BoolAttr":$feasible,
     "FloatAttr":$estimatedLatencyNs,

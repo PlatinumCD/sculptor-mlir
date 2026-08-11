@@ -275,9 +275,9 @@ buildTemporalBaselineRATree(const ComputeGraph &graph, Operation *anchor) {
 FailureOr<ResourceAllocationTree>
 deserializeResourceAllocationTree(RATreeAttr attr, const ComputeGraph &graph,
                                   Operation *anchor) {
-  if (attr.getVersion().getInt() != 3) {
+  if (attr.getVersion().getInt() != 4) {
     anchor->emitError("unsupported Resource Allocation Tree version ")
-        << attr.getVersion().getInt() << "; expected version 3";
+        << attr.getVersion().getInt() << "; expected version 4";
     return failure();
   }
   if (attr.getOperationCount().getInt() !=
@@ -331,6 +331,9 @@ deserializeResourceAllocationTree(RATreeAttr attr, const ComputeGraph &graph,
     workUnit.resultSizes = std::move(*resultSizes);
     workUnit.iterationOffsets = std::move(*iterationOffsets);
     workUnit.iterationSizes = std::move(*iterationSizes);
+    workUnit.shardGroupId = workUnitAttr.getShardGroupId().getInt();
+    workUnit.shardIndex = workUnitAttr.getShardIndex().getInt();
+    workUnit.shardCount = workUnitAttr.getShardCount().getInt();
     tree.workUnits.push_back(std::move(workUnit));
   }
   tree.workUnitEdges.reserve(attr.getWorkUnitEdges().size());
@@ -345,6 +348,9 @@ deserializeResourceAllocationTree(RATreeAttr attr, const ComputeGraph &graph,
                                   edgeAttr.getSourceWorkUnitId().getInt(),
                                   edgeAttr.getTargetOperationId().getInt(),
                                   edgeAttr.getTargetWorkUnitId().getInt(),
+                                  edgeAttr.getTensorId().getInt(),
+                                  edgeAttr.getSourceResultNumber().getInt(),
+                                  edgeAttr.getTargetOperandNumber().getInt(),
                                   edgeAttr.getByteSize().getInt()});
   }
   tree.nodes.reserve(attr.getNodes().size());
@@ -550,6 +556,16 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
                                          " iteration tile is invalid");
       }
     }
+    bool hasShardIdentity = workUnit.shardGroupId >= 0 ||
+                            workUnit.shardIndex >= 0 ||
+                            workUnit.shardCount >= 0;
+    if (hasShardIdentity &&
+        (workUnit.shardGroupId < 0 || workUnit.shardIndex < 0 ||
+         workUnit.shardCount <= 0 ||
+         workUnit.shardIndex >= workUnit.shardCount)) {
+      return emitTreeError(anchor, Twine("work unit ") + Twine(workUnit.id) +
+                                       " has incomplete shard identity");
+    }
     workUnitsByOperation[workUnit.operationId].push_back(&workUnit);
   }
 
@@ -569,7 +585,7 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
              llvm::is_contained(tensor.consumerOperations, targetOperationId);
     });
   };
-  std::set<std::tuple<int64_t, int64_t, int64_t, int64_t>> uniqueEdges;
+  std::set<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> uniqueEdges;
   for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
     if (!endpointIsValid(edge.sourceOperationId, edge.sourceWorkUnitId)) {
       return emitTreeError(anchor,
@@ -593,9 +609,36 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
                                Twine(edge.sourceOperationId) + " -> " +
                                Twine(edge.targetOperationId));
     }
-    auto identity =
-        std::make_tuple(edge.sourceOperationId, edge.sourceWorkUnitId,
-                        edge.targetOperationId, edge.targetWorkUnitId);
+    if (edge.sourceResultNumber < 0 ||
+        edge.sourceResultNumber >=
+            static_cast<int64_t>(graph.operations[edge.sourceOperationId]
+                                     .operation->getNumResults()) ||
+        edge.targetOperandNumber < 0 ||
+        edge.targetOperandNumber >=
+            static_cast<int64_t>(graph.operations[edge.targetOperationId]
+                                     .operation->getNumOperands())) {
+      return emitTreeError(
+          anchor, "work-unit edge has invalid result or operand index");
+    }
+    if (edge.tensorId < -1 ||
+        edge.tensorId >= static_cast<int64_t>(graph.tensors.size()))
+      return emitTreeError(anchor, "work-unit edge has an invalid tensor ID");
+    if (edge.tensorId >= 0) {
+      const ComputeTensor &tensor = graph.tensors[edge.tensorId];
+      if (!llvm::is_contained(tensor.producerOperations,
+                              edge.sourceOperationId) ||
+          !llvm::is_contained(tensor.consumerOperations,
+                              edge.targetOperationId) ||
+          graph.operations[edge.targetOperationId].operation->getOperand(
+              edge.targetOperandNumber) != tensor.value ||
+          edge.byteSize > tensor.byteSize) {
+        return emitTreeError(
+            anchor, "work-unit edge does not match its compute tensor");
+      }
+    }
+    auto identity = std::make_tuple(
+        edge.sourceOperationId, edge.sourceWorkUnitId, edge.targetOperationId,
+        edge.targetWorkUnitId, edge.targetOperandNumber);
     if (!uniqueEdges.insert(identity).second)
       return emitTreeError(anchor, "duplicate work-unit edge");
   }
@@ -781,7 +824,7 @@ std::string computeGraphFingerprint(const ComputeGraph &graph) {
 std::string computeRATreeFingerprint(const ResourceAllocationTree &tree) {
   std::string description;
   llvm::raw_string_ostream stream(description);
-  stream << "ra-tree-v3 root " << tree.rootId << '\n';
+  stream << "ra-tree-v4 root " << tree.rootId << '\n';
   for (const MappingWorkUnit &workUnit : tree.workUnits) {
     stream << "work-unit " << workUnit.id << " operation "
            << workUnit.operationId << " result " << workUnit.resultNumber
@@ -797,13 +840,16 @@ std::string computeRATreeFingerprint(const ResourceAllocationTree &tree) {
     stream << " iteration-sizes";
     for (int64_t value : workUnit.iterationSizes)
       stream << ' ' << value;
+    stream << " shard " << workUnit.shardGroupId << ':' << workUnit.shardIndex
+           << '/' << workUnit.shardCount;
     stream << '\n';
   }
   for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
     stream << "work-unit-edge source " << edge.sourceOperationId << ':'
            << edge.sourceWorkUnitId << " target " << edge.targetOperationId
-           << ':' << edge.targetWorkUnitId << " bytes " << edge.byteSize
-           << '\n';
+           << ':' << edge.targetWorkUnitId << " tensor " << edge.tensorId
+           << " source-result " << edge.sourceResultNumber << " target-operand "
+           << edge.targetOperandNumber << " bytes " << edge.byteSize << '\n';
   }
   for (const StructuralRATreeNode &node : tree.nodes) {
     stream << "node " << node.id << " kind " << static_cast<uint32_t>(node.kind)
@@ -843,7 +889,10 @@ RATreeAttr serializeResourceAllocationTree(MLIRContext *context,
         buildI64Array(workUnit.resultOffsets),
         buildI64Array(workUnit.resultSizes),
         buildI64Array(workUnit.iterationOffsets),
-        buildI64Array(workUnit.iterationSizes)));
+        buildI64Array(workUnit.iterationSizes),
+        builder.getI64IntegerAttr(workUnit.shardGroupId),
+        builder.getI64IntegerAttr(workUnit.shardIndex),
+        builder.getI64IntegerAttr(workUnit.shardCount)));
   }
   SmallVector<Attribute> nodeAttrs;
   nodeAttrs.reserve(tree.nodes.size());
@@ -869,10 +918,13 @@ RATreeAttr serializeResourceAllocationTree(MLIRContext *context,
         builder.getI64IntegerAttr(edge.sourceWorkUnitId),
         builder.getI64IntegerAttr(edge.targetOperationId),
         builder.getI64IntegerAttr(edge.targetWorkUnitId),
+        builder.getI64IntegerAttr(edge.tensorId),
+        builder.getI64IntegerAttr(edge.sourceResultNumber),
+        builder.getI64IntegerAttr(edge.targetOperandNumber),
         builder.getI64IntegerAttr(edge.byteSize)));
   }
 
-  return RATreeAttr::get(context, builder.getI64IntegerAttr(3),
+  return RATreeAttr::get(context, builder.getI64IntegerAttr(4),
                          builder.getI64IntegerAttr(tree.rootId),
                          builder.getArrayAttr(nodeAttrs),
                          builder.getArrayAttr(workUnitAttrs),

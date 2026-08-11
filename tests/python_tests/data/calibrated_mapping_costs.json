@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "test-calibrated-v1",
+  "source": "sculptor-extension-regression",
+  "clock_frequency_hz": 1000000000,
+  "digital_fallback": {
+    "fixed_ns": 3.0,
+    "ns_per_work_item": 0.25,
+    "ns_per_input_byte": 0.01,
+    "ns_per_output_byte": 0.02
+  },
+  "digital_task_kinds": {
+    "digital.reduction": {
+      "fixed_ns": 5.0,
+      "ns_per_work_item": 0.5,
+      "ns_per_input_byte": 0.02,
+      "ns_per_output_byte": 0.02
+    }
+  },
+  "analog": {
+    "load_fixed_ns": 2.0,
+    "load_ns_per_byte": 0.125,
+    "execute_ns": 100.0,
+    "store_fixed_ns": 2.0,
+    "store_ns_per_byte": 0.125
+  },
+  "runtime": {
+    "task_dispatch_ns": 4.0,
+    "route_setup_ns": 3.0
+  },
+  "network": {
+    "word_bits": 32,
+    "hop_pipeline_ns": 1.0,
+    "inject_fixed_ns": 2.0,
+    "eject_fixed_ns": 2.0,
+    "dma_ns_per_byte": 0.01
+  }
+}

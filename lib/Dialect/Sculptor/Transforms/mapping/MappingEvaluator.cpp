@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingEvaluator.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/GolemMVMPlanning.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostModel.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingRealization.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -178,9 +179,29 @@ double cyclesToNanoseconds(int64_t cycles,
          static_cast<double>(hardware.clockFrequencyHz);
 }
 
-FailureOr<double>
-estimateTransferNanoseconds(int64_t bytes, const MappingHardwareModel &hardware,
-                            Operation *anchor) {
+FailureOr<double> estimateTransferNanoseconds(int64_t bytes,
+                                              const MappingProblem &problem,
+                                              Operation *anchor) {
+  const MappingHardwareModel &hardware = problem.hardware;
+  if (!problem.costProfile.useLegacyFormula) {
+    FailureOr<int64_t> bits =
+        checkedMulI64(bytes, int64_t{8}, anchor, "mapping transfer bit count");
+    if (failed(bits))
+      return failure();
+    int64_t words =
+        llvm::divideCeil(*bits, problem.costProfile.network.wordBits);
+    double result = problem.costProfile.runtime.routeSetupNs +
+                    problem.costProfile.network.injectFixedNs +
+                    problem.costProfile.network.ejectFixedNs +
+                    problem.costProfile.network.hopPipelineNs * words +
+                    problem.costProfile.network.dmaNsPerByte * bytes;
+    if (!std::isfinite(result) || result < 0.0) {
+      anchor->emitError(
+          "mapping transfer estimate is not finite and nonnegative");
+      return failure();
+    }
+    return result;
+  }
   FailureOr<int64_t> bits =
       checkedMulI64(bytes, int64_t{8}, anchor, "mapping transfer bit count");
   if (failed(bits))
@@ -191,6 +212,32 @@ estimateTransferNanoseconds(int64_t bytes, const MappingHardwareModel &hardware,
   if (failed(cycles))
     return failure();
   return cyclesToNanoseconds(*cycles, hardware);
+}
+
+FailureOr<int64_t> sumTensorBytes(const MappingProblem &problem,
+                                  ArrayRef<int64_t> tensorIds,
+                                  StringRef description) {
+  int64_t total = 0;
+  for (int64_t tensorId : tensorIds) {
+    if (tensorId < 0 ||
+        tensorId >= static_cast<int64_t>(problem.graph.tensors.size())) {
+      problem.anchor->emitError("mapping cost cannot resolve tensor ")
+          << tensorId;
+      return failure();
+    }
+    int64_t bytes = problem.graph.tensors[tensorId].byteSize;
+    if (bytes < 0) {
+      problem.anchor->emitError(
+          "calibrated mapping cost requires static tensor byte sizes");
+      return failure();
+    }
+    FailureOr<int64_t> next =
+        checkedAddI64(total, bytes, problem.anchor, description);
+    if (failed(next))
+      return failure();
+    total = *next;
+  }
+  return total;
 }
 
 FailureOr<std::map<ChildEdge, int64_t>>
@@ -343,6 +390,47 @@ evaluateAnalogMVMLeaf(const MappingProblem &problem,
             .str());
   }
 
+  if (!problem.costProfile.useLegacyFormula) {
+    int64_t arraysOnBusiestCore =
+        std::min(plan->arrayCount, problem.hardware.arraysPerCore);
+    FailureOr<int64_t> loadElements = checkedMulI64(
+        arraysOnBusiestCore, problem.hardware.arrayCols, problem.anchor,
+        "analog MVM calibrated load element count");
+    FailureOr<int64_t> storeElements = checkedMulI64(
+        arraysOnBusiestCore, problem.hardware.arrayRows, problem.anchor,
+        "analog MVM calibrated store element count");
+    if (failed(loadElements) || failed(storeElements))
+      return failure();
+    FailureOr<int64_t> loadBytes =
+        checkedMulI64(*loadElements, int64_t{4}, problem.anchor,
+                      "analog MVM calibrated load byte count");
+    FailureOr<int64_t> storeBytes =
+        checkedMulI64(*storeElements, int64_t{4}, problem.anchor,
+                      "analog MVM calibrated store byte count");
+    if (failed(loadBytes) || failed(storeBytes))
+      return failure();
+    FailureOr<TaskCostEstimate> analog =
+        estimateAnalogTaskCost(problem.costProfile, *loadBytes, *storeBytes,
+                               node.workGroupCount, operation.operation);
+    if (failed(analog))
+      return failure();
+    TaskCostFeatures supportFeatures;
+    supportFeatures.operationId = operation.id;
+    supportFeatures.workUnitId = node.workUnitId;
+    supportFeatures.semanticTaskKind = "digital.tile_recombine";
+    supportFeatures.workItems = plan->recombinationAddOps;
+    FailureOr<TaskCostEstimate> support = estimateDigitalTaskCost(
+        problem.costProfile, supportFeatures, operation.operation);
+    if (failed(support))
+      return failure();
+    MappingNodeEvaluation result;
+    result.nodeId = node.id;
+    result.requiredResourceUnits = requiredCores;
+    result.pipelineStages = 1;
+    result.estimatedLatencyNs = analog->totalNs + support->totalNs;
+    return result;
+  }
+
   // Cores transfer concurrently. The shared I/O limit applies to the arrays
   // resident on one core, so the busiest core determines leaf I/O latency.
   int64_t arraysOnBusiestCore =
@@ -394,6 +482,28 @@ evaluatePhysicalMVMLeaf(const MappingProblem &problem,
     operation.operation->emitError(
         "physical MVM compute record is missing array geometry");
     return failure();
+  }
+
+  if (!problem.costProfile.useLegacyFormula) {
+    FailureOr<int64_t> loadBytes = checkedMulI64(
+        operation.analogMVM->inputColumns, int64_t{4}, problem.anchor,
+        "physical MVM calibrated load byte count");
+    FailureOr<int64_t> storeBytes = checkedMulI64(
+        operation.analogMVM->outputRows, int64_t{4}, problem.anchor,
+        "physical MVM calibrated store byte count");
+    if (failed(loadBytes) || failed(storeBytes))
+      return failure();
+    FailureOr<TaskCostEstimate> estimate =
+        estimateAnalogTaskCost(problem.costProfile, *loadBytes, *storeBytes,
+                               node.workGroupCount, operation.operation);
+    if (failed(estimate))
+      return failure();
+    MappingNodeEvaluation result;
+    result.nodeId = node.id;
+    result.requiredResourceUnits = 1;
+    result.pipelineStages = 1;
+    result.estimatedLatencyNs = estimate->totalNs;
+    return result;
   }
 
   FailureOr<int64_t> ioElements = checkedAddI64(
@@ -461,6 +571,36 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
         estimateLeafWork(context.problem, context.tree, *node);
     if (failed(workItems))
       return failure();
+    if (!context.problem.costProfile.useLegacyFormula) {
+      FailureOr<int64_t> inputBytes =
+          sumTensorBytes(context.problem, operation.inputTensors,
+                         "mapping digital input byte count");
+      FailureOr<int64_t> outputBytes =
+          sumTensorBytes(context.problem, operation.outputTensors,
+                         "mapping digital output byte count");
+      if (failed(inputBytes) || failed(outputBytes))
+        return failure();
+      FailureOr<int64_t> groupedWork = checkedMulI64(
+          *workItems, node->workGroupCount, context.problem.anchor,
+          "mapping calibrated grouped work count");
+      if (failed(groupedWork))
+        return failure();
+      TaskCostFeatures features;
+      features.operationId = operation.id;
+      features.workUnitId = node->workUnitId;
+      features.semanticTaskKind = operation.semanticTaskKind;
+      features.workItems = *groupedWork;
+      features.inputBytes = *inputBytes;
+      features.outputBytes = *outputBytes;
+      FailureOr<TaskCostEstimate> estimate = estimateDigitalTaskCost(
+          context.problem.costProfile, features, operation.operation);
+      if (failed(estimate))
+        return failure();
+      result.estimatedLatencyNs = estimate->totalNs;
+      result.requiredResourceUnits = 1;
+      context.evaluations[nodeId] = result;
+      return result;
+    }
     int64_t vectorWidth =
         context.problem.hardware.digitalVectorBitsPerCycle / 32;
     int64_t effectiveOpsPerCycle =
@@ -645,7 +785,7 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
       predecessors[destination].push_back(source);
       ++indegree[destination];
       FailureOr<double> transfer = estimateTransferNanoseconds(
-          bytes, context.problem.hardware, context.problem.anchor);
+          bytes, context.problem, context.problem.anchor);
       if (failed(transfer))
         return failure();
       transferNs[edge] = *transfer;

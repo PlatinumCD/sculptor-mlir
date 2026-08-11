@@ -2,6 +2,8 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ShardDataflow.h"
 
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/TilingInterface.h"
@@ -20,13 +22,12 @@ void chooseWorkerFactors(ArrayRef<ComputeIterationDimension> domain,
                          int64_t parallelWorkers, size_t dimension,
                          int64_t currentProduct,
                          SmallVectorImpl<int64_t> &current,
-                         SmallVectorImpl<int64_t> &best,
-                         int64_t &bestProduct) {
+                         SmallVectorImpl<int64_t> &best, int64_t &bestProduct) {
   if (dimension == domain.size()) {
     if (currentProduct > bestProduct ||
         (currentProduct == bestProduct &&
-         std::lexicographical_compare(best.begin(), best.end(),
-                                      current.begin(), current.end()))) {
+         std::lexicographical_compare(best.begin(), best.end(), current.begin(),
+                                      current.end()))) {
       bestProduct = currentProduct;
       best.assign(current.begin(), current.end());
     }
@@ -54,8 +55,7 @@ std::optional<int64_t> getStaticValue(OpFoldResult value) {
 
 void dissolveDigitalMappingStages(func::FuncOp function) {
   function.walk([](Operation *operation) {
-    auto stageKind =
-        operation->getAttrOfType<StringAttr>(kStageKindAttrName);
+    auto stageKind = operation->getAttrOfType<StringAttr>(kStageKindAttrName);
     if (!stageKind || stageKind.getValue() != kDigitalStageKind)
       return;
 
@@ -117,8 +117,7 @@ buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
       int64_t remainder = extent % factor;
       int64_t coordinate = coordinates[dimension];
       int64_t size = baseSize + (coordinate < remainder ? 1 : 0);
-      int64_t offset =
-          coordinate * baseSize + std::min(coordinate, remainder);
+      int64_t offset = coordinate * baseSize + std::min(coordinate, remainder);
       iterationOffsets.push_back(offset);
       iterationSizes.push_back(size);
       foldedOffsets.push_back(builder.getIndexAttr(offset));
@@ -152,11 +151,12 @@ buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
 
     result.push_back(MappingWorkUnitAttr::get(
         builder.getContext(), builder.getI64IntegerAttr(nextWorkUnitId++),
-        builder.getI64IntegerAttr(operation.id),
-        builder.getI64IntegerAttr(0), builder.getI64ArrayAttr(resultOffsets),
+        builder.getI64IntegerAttr(operation.id), builder.getI64IntegerAttr(0),
+        builder.getI64ArrayAttr(resultOffsets),
         builder.getI64ArrayAttr(resultSizes),
         builder.getI64ArrayAttr(iterationOffsets),
-        builder.getI64ArrayAttr(iterationSizes)));
+        builder.getI64ArrayAttr(iterationSizes), builder.getI64IntegerAttr(-1),
+        builder.getI64IntegerAttr(-1), builder.getI64IntegerAttr(-1)));
   }
   return result;
 }
@@ -166,8 +166,7 @@ buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
 namespace mlir {
 namespace sculptor {
 
-ExpandDigitalWorkPass::ExpandDigitalWorkPass(
-    const ExpandDigitalWorkPass &pass)
+ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
     : PassWrapper(pass),
       parallelWorkers(
           *this, "parallel-workers",
@@ -176,9 +175,39 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(
       requireChange(
           *this, "require-change",
           llvm::cl::desc("Fail when no digital operation can be expanded"),
-          llvm::cl::init(false)) {
+          llvm::cl::init(false)),
+      dataflow(*this, "dataflow",
+               llvm::cl::desc("Digital dataflow mode: bulk or sharded"),
+               llvm::cl::init("bulk")),
+      shardPropagationDepth(
+          *this, "shard-propagation-depth",
+          llvm::cl::desc("Maximum shard propagation depth; zero is unbounded"),
+          llvm::cl::init(0)),
+      requireCompleteShardChain(
+          *this, "require-complete-shard-chain",
+          llvm::cl::desc(
+              "Fail when an eligible shard chain reaches a boundary"),
+          llvm::cl::init(false)),
+      reductionTree(
+          *this, "reduction-tree",
+          llvm::cl::desc("Associative reduction policy: none or balanced"),
+          llvm::cl::init("none")),
+      reductionFanIn(
+          *this, "reduction-fan-in",
+          llvm::cl::desc("Maximum reduction fan-in; only two is supported"),
+          llvm::cl::init(2)),
+      reductionMinimumWidth(
+          *this, "reduction-min-width",
+          llvm::cl::desc("Minimum number of leaves for reduction balancing"),
+          llvm::cl::init(3)) {
   parallelWorkers = pass.parallelWorkers;
   requireChange = pass.requireChange;
+  dataflow = pass.dataflow;
+  shardPropagationDepth = pass.shardPropagationDepth;
+  requireCompleteShardChain = pass.requireCompleteShardChain;
+  reductionTree = pass.reductionTree;
+  reductionFanIn = pass.reductionFanIn;
+  reductionMinimumWidth = pass.reductionMinimumWidth;
 }
 
 void ExpandDigitalWorkPass::runOnOperation() {
@@ -188,12 +217,30 @@ void ExpandDigitalWorkPass::runOnOperation() {
     signalPassFailure();
     return;
   }
+  FailureOr<mapping::DigitalDataflowMode> parsedDataflow =
+      mapping::parseDigitalDataflowMode(dataflow, module);
+  FailureOr<mapping::ReductionTreePolicy> parsedReductionTree =
+      mapping::parseReductionTreePolicy(reductionTree, module);
+  if (failed(parsedDataflow) || failed(parsedReductionTree) ||
+      shardPropagationDepth < 0) {
+    if (succeeded(parsedDataflow))
+      module.emitError("shard-propagation-depth must be nonnegative");
+    signalPassFailure();
+    return;
+  }
 
   int64_t expandedOperations = 0;
   int64_t expandedWorkUnits = 0;
+  int64_t reductionTreeCount = 0;
+  int64_t reductionNodeCount = 0;
+  int64_t maximumReductionFanIn = 0;
+  int64_t shardGroupCount = 0;
+  int64_t shardEdgeCount = 0;
+  int64_t assemblyBoundaryCount = 0;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal())
       continue;
+    OpBuilder builder(&getContext());
 
     function.walk([](Operation *operation) {
       operation->removeAttr(mapping::kExpandedDigitalWorkAttrName);
@@ -202,6 +249,31 @@ void ExpandDigitalWorkPass::runOnOperation() {
     function->removeAttr("sculptor.mapping.digital_parallel_workers");
     function->removeAttr("sculptor.mapping.expanded_digital_operation_count");
     function->removeAttr("sculptor.mapping.expanded_digital_work_unit_count");
+    function->removeAttr(mapping::kShardWorkUnitEdgesAttrName);
+
+    FailureOr<int64_t> functionReductionTrees = mapping::buildReductionTrees(
+        function, *parsedReductionTree, reductionFanIn, reductionMinimumWidth);
+    if (failed(functionReductionTrees)) {
+      signalPassFailure();
+      return;
+    }
+    function->setAttr(
+        mapping::kReductionTreePolicyAttrName,
+        StringAttr::get(&getContext(), mapping::stringifyReductionTreePolicy(
+                                           *parsedReductionTree)));
+    function->setAttr("sculptor.mapping.reduction_tree_count",
+                      builder.getI64IntegerAttr(*functionReductionTrees));
+    reductionTreeCount += *functionReductionTrees;
+    reductionNodeCount += function
+                              ->getAttrOfType<IntegerAttr>(
+                                  "sculptor.mapping.reduction_node_count")
+                              .getInt();
+    maximumReductionFanIn =
+        std::max(maximumReductionFanIn,
+                 function
+                     ->getAttrOfType<IntegerAttr>(
+                         "sculptor.mapping.maximum_reduction_fan_in")
+                     .getInt());
 
     FailureOr<mapping::ComputeGraph> graph =
         mapping::buildComputeGraph(function);
@@ -210,13 +282,12 @@ void ExpandDigitalWorkPass::runOnOperation() {
       return;
     }
 
-    OpBuilder builder(&getContext());
     int64_t nextWorkUnitId = 0;
     int64_t functionOperations = 0;
     int64_t functionWorkUnits = 0;
     for (const mapping::ComputeOperation &operation : graph->operations) {
-      FailureOr<SmallVector<MappingWorkUnitAttr>> workUnits = buildWorkUnits(
-          operation, parallelWorkers, nextWorkUnitId, builder);
+      FailureOr<SmallVector<MappingWorkUnitAttr>> workUnits =
+          buildWorkUnits(operation, parallelWorkers, nextWorkUnitId, builder);
       if (failed(workUnits)) {
         signalPassFailure();
         return;
@@ -233,12 +304,31 @@ void ExpandDigitalWorkPass::runOnOperation() {
     if (functionOperations > 0) {
       function->setAttr("sculptor.mapping.digital_parallel_workers",
                         builder.getI64IntegerAttr(parallelWorkers));
-      function->setAttr(
-          "sculptor.mapping.expanded_digital_operation_count",
-          builder.getI64IntegerAttr(functionOperations));
+      function->setAttr("sculptor.mapping.expanded_digital_operation_count",
+                        builder.getI64IntegerAttr(functionOperations));
       function->setAttr("sculptor.mapping.expanded_digital_work_unit_count",
                         builder.getI64IntegerAttr(functionWorkUnits));
     }
+    if (failed(mapping::planShardDataflow(function, *graph, *parsedDataflow,
+                                          shardPropagationDepth,
+                                          requireCompleteShardChain))) {
+      signalPassFailure();
+      return;
+    }
+    function->setAttr(
+        mapping::kShardDataflowModeAttrName,
+        StringAttr::get(&getContext(), mapping::stringifyDigitalDataflowMode(
+                                           *parsedDataflow)));
+    shardGroupCount +=
+        function->getAttrOfType<IntegerAttr>(mapping::kShardGroupCountAttrName)
+            .getInt();
+    shardEdgeCount +=
+        function->getAttrOfType<IntegerAttr>(mapping::kShardEdgeCountAttrName)
+            .getInt();
+    assemblyBoundaryCount += function
+                                 ->getAttrOfType<IntegerAttr>(
+                                     mapping::kAssemblyBoundaryCountAttrName)
+                                 .getInt();
     expandedOperations += functionOperations;
     expandedWorkUnits += functionWorkUnits;
   }
@@ -251,9 +341,35 @@ void ExpandDigitalWorkPass::runOnOperation() {
   module->setAttr("sculptor.mapping.expanded_digital_operation_count",
                   IntegerAttr::get(IntegerType::get(&getContext(), 64),
                                    expandedOperations));
-  module->setAttr("sculptor.mapping.expanded_digital_work_unit_count",
+  module->setAttr(
+      "sculptor.mapping.expanded_digital_work_unit_count",
+      IntegerAttr::get(IntegerType::get(&getContext(), 64), expandedWorkUnits));
+  module->setAttr("sculptor.mapping.reduction_tree_count",
                   IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                                   expandedWorkUnits));
+                                   reductionTreeCount));
+  module->setAttr(
+      mapping::kReductionTreePolicyAttrName,
+      StringAttr::get(&getContext(), mapping::stringifyReductionTreePolicy(
+                                         *parsedReductionTree)));
+  module->setAttr("sculptor.mapping.reduction_node_count",
+                  IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                   reductionNodeCount));
+  module->setAttr("sculptor.mapping.maximum_reduction_fan_in",
+                  IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                   maximumReductionFanIn));
+  module->setAttr(
+      mapping::kShardDataflowModeAttrName,
+      StringAttr::get(&getContext(),
+                      mapping::stringifyDigitalDataflowMode(*parsedDataflow)));
+  module->setAttr(
+      mapping::kShardGroupCountAttrName,
+      IntegerAttr::get(IntegerType::get(&getContext(), 64), shardGroupCount));
+  module->setAttr(
+      mapping::kShardEdgeCountAttrName,
+      IntegerAttr::get(IntegerType::get(&getContext(), 64), shardEdgeCount));
+  module->setAttr(mapping::kAssemblyBoundaryCountAttrName,
+                  IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                   assemblyBoundaryCount));
 }
 
 void registerExpandDigitalWorkPass() {

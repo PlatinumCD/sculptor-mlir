@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ShardDataflow.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
@@ -53,7 +54,12 @@ public:
       return failure();
     tree.rootId = *root;
     tree.nodes[tree.rootId].parentId = -1;
-    if (failed(buildDestinationStyleEdges()))
+    auto dataflowMode =
+        anchor->getAttrOfType<StringAttr>(kShardDataflowModeAttrName);
+    if (dataflowMode && dataflowMode.getValue() == "sharded") {
+      if (failed(buildDeclaredShardEdges()))
+        return failure();
+    } else if (failed(buildDestinationStyleEdges()))
       return failure();
     return std::move(tree);
   }
@@ -119,6 +125,9 @@ private:
     workUnit.resultSizes = std::move(*resultSizes);
     workUnit.iterationOffsets = std::move(*iterationOffsets);
     workUnit.iterationSizes = std::move(*iterationSizes);
+    workUnit.shardGroupId = attribute.getShardGroupId().getInt();
+    workUnit.shardIndex = attribute.getShardIndex().getInt();
+    workUnit.shardCount = attribute.getShardCount().getInt();
     return workUnit;
   }
 
@@ -237,11 +246,37 @@ private:
                 "work-unit dependency");
             return failure();
           }
-          tree.workUnitEdges.push_back({producer.id, source->id,
-                                        operationId->second, target->id,
-                                        *byteSize});
+          tree.workUnitEdges.push_back(
+              {producer.id, source->id, operationId->second, target->id,
+               /*tensorId=*/-1, /*sourceResultNumber=*/0,
+               /*targetOperandNumber=*/use.getOperandNumber(), *byteSize});
         }
       }
+    }
+    return success();
+  }
+
+  LogicalResult buildDeclaredShardEdges() {
+    auto attributes =
+        anchor->getAttrOfType<ArrayAttr>(kShardWorkUnitEdgesAttrName);
+    if (!attributes) {
+      anchor->emitError("sharded dataflow is missing declared work-unit edges");
+      return failure();
+    }
+    for (Attribute value : attributes) {
+      auto edge = dyn_cast<MappingWorkUnitEdgeAttr>(value);
+      if (!edge) {
+        anchor->emitError("shard work-unit edges must be typed");
+        return failure();
+      }
+      tree.workUnitEdges.push_back({edge.getSourceOperationId().getInt(),
+                                    edge.getSourceWorkUnitId().getInt(),
+                                    edge.getTargetOperationId().getInt(),
+                                    edge.getTargetWorkUnitId().getInt(),
+                                    edge.getTensorId().getInt(),
+                                    edge.getSourceResultNumber().getInt(),
+                                    edge.getTargetOperandNumber().getInt(),
+                                    edge.getByteSize().getInt()});
     }
     return success();
   }

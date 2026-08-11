@@ -24,6 +24,11 @@ struct PlanMappingPass
       llvm::cl::desc("Mapping objective (latency only for now)"),
       llvm::cl::init("latency")};
 
+  Option<std::string> costProfile{
+      *this, "cost-profile",
+      llvm::cl::desc("JSON mapping cost profile; empty selects legacy-v1"),
+      llvm::cl::init("")};
+
   Option<int64_t> meshRows{*this, "mesh-rows",
                            llvm::cl::desc("Number of mesh rows"),
                            llvm::cl::init(1)};
@@ -128,6 +133,7 @@ struct PlanMappingPass
   PlanMappingPass(const PlanMappingPass &pass) : PassWrapper(pass) {
     strategies = pass.strategies;
     objective = pass.objective;
+    costProfile = pass.costProfile;
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;

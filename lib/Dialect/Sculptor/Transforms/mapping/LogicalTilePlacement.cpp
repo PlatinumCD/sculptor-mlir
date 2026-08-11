@@ -1,10 +1,13 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
+
 #include "mlir/IR/Builders.h"
 
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <set>
 
@@ -266,16 +269,25 @@ buildLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
                               ArrayRef<int64_t> physicalTileByLogicalTileIndex,
                               StringRef schedule, int64_t initialScore,
                               int64_t evaluations) {
-  FailureOr<int64_t> score =
-      scoreLogicalTilePlacement(problem, physicalTileByLogicalTileIndex);
-  if (failed(score))
+  FailureOr<PlacementObjectiveEvaluation> objective =
+      evaluatePlacementObjective(problem, physicalTileByLogicalTileIndex);
+  if (failed(objective))
     return failure();
 
   LogicalTilePlacementPlan plan;
   plan.schedule = schedule.str();
+  plan.objective = problem.objective;
+  plan.networkMode = problem.networkMode;
+  plan.timingScope = problem.timingScope;
+  if (problem.costProfile) {
+    plan.costProfileName = problem.costProfile->name;
+    plan.costProfileHash = problem.costProfile->contentHash;
+  }
   plan.mesh = problem.mesh;
   plan.initialScore = initialScore;
-  plan.totalTransferCost = *score;
+  plan.objectiveScore = objective->score;
+  plan.totalTransferCost = objective->transferCost;
+  plan.predictedMakespanNs = objective->makespanNs;
   plan.evaluations = evaluations;
   plan.assignments.reserve(problem.tileGraph.tiles.size());
   for (auto indexedTile : llvm::enumerate(problem.tileGraph.tiles)) {
@@ -314,12 +326,19 @@ verifyLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
                                const LogicalTilePlacementPlan &plan) {
   if (failed(validateLogicalTilePlacementProblem(problem)))
     return failure();
-  if (plan.version != 1 || plan.schedule.empty() ||
+  if (plan.version != 2 || plan.schedule.empty() ||
+      plan.objective != problem.objective ||
+      plan.networkMode != problem.networkMode ||
+      plan.timingScope != problem.timingScope || plan.routePolicy != "xy" ||
+      (problem.costProfile &&
+       (plan.costProfileName != problem.costProfile->name ||
+        plan.costProfileHash != problem.costProfile->contentHash)) ||
       plan.mesh.rows != problem.mesh.rows ||
       plan.mesh.columns != problem.mesh.columns ||
       plan.mesh.arraysPerCore != problem.mesh.arraysPerCore ||
-      plan.initialScore < 0 || plan.totalTransferCost < 0 ||
-      plan.evaluations < 0 ||
+      plan.initialScore < 0 || plan.objectiveScore < 0 ||
+      plan.totalTransferCost < 0 || !std::isfinite(plan.predictedMakespanNs) ||
+      plan.predictedMakespanNs < 0.0 || plan.evaluations < 0 ||
       plan.assignments.size() != problem.tileGraph.tiles.size() ||
       plan.edges.size() != problem.tileGraph.edges.size()) {
     problem.anchor->emitError("invalid logical-tile placement plan metadata");
@@ -384,6 +403,27 @@ verifyLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
         "logical-tile placement total does not match its edges");
     return failure();
   }
+  if (plan.objective == PlacementObjectiveKind::TransferCost &&
+      (plan.objectiveScore != plan.totalTransferCost ||
+       plan.predictedMakespanNs != 0.0)) {
+    problem.anchor->emitError(
+        "transfer-cost placement has inconsistent objective metadata");
+    return failure();
+  }
+  if (plan.objective == PlacementObjectiveKind::Makespan) {
+    FailureOr<PlacementObjectiveEvaluation> objective =
+        evaluatePlacementObjective(problem, [&]() {
+          SmallVector<int64_t> physical;
+          physical.reserve(problem.tileGraph.tiles.size());
+          for (const LogicalTile &tile : problem.tileGraph.tiles)
+            physical.push_back(locations.lookup(tile.id).physicalTileId);
+          return physical;
+        }());
+    if (failed(objective) || objective->score != plan.objectiveScore ||
+        objective->makespanNs != plan.predictedMakespanNs)
+      return problem.anchor->emitError(
+          "makespan placement has inconsistent objective metadata");
+  }
   return success();
 }
 
@@ -414,11 +454,19 @@ serializeLogicalTilePlacement(MLIRContext *context,
   return LogicalTilePlacementAttr::get(
       context, builder.getI64IntegerAttr(plan.version),
       builder.getStringAttr(plan.schedule),
+      builder.getStringAttr(stringifyPlacementObjective(plan.objective)),
+      builder.getStringAttr(stringifyTemporalNetworkMode(plan.networkMode)),
+      builder.getStringAttr(stringifyTemporalTimingScope(plan.timingScope)),
+      builder.getStringAttr(plan.routePolicy),
+      builder.getStringAttr(plan.costProfileName),
+      builder.getStringAttr(plan.costProfileHash),
       builder.getI64IntegerAttr(plan.mesh.rows),
       builder.getI64IntegerAttr(plan.mesh.columns),
       builder.getI64IntegerAttr(plan.mesh.arraysPerCore),
       builder.getI64IntegerAttr(plan.initialScore),
+      builder.getI64IntegerAttr(plan.objectiveScore),
       builder.getI64IntegerAttr(plan.totalTransferCost),
+      builder.getF64FloatAttr(plan.predictedMakespanNs),
       builder.getI64IntegerAttr(plan.evaluations),
       builder.getArrayAttr(assignments), builder.getArrayAttr(edges));
 }
@@ -429,10 +477,28 @@ deserializeLogicalTilePlacement(LogicalTilePlacementAttr attr,
   LogicalTilePlacementPlan plan;
   plan.version = attr.getVersion().getInt();
   plan.schedule = attr.getSchedule().getValue().str();
+  FailureOr<PlacementObjectiveKind> objective =
+      parsePlacementObjective(attr.getObjective().getValue(), problem.anchor);
+  if (failed(objective))
+    return failure();
+  plan.objective = *objective;
+  FailureOr<TemporalNetworkMode> networkMode = parseTemporalNetworkMode(
+      attr.getNetworkMode().getValue(), problem.anchor);
+  FailureOr<TemporalTimingScope> timingScope = parseTemporalTimingScope(
+      attr.getTimingScope().getValue(), problem.anchor);
+  if (failed(networkMode) || failed(timingScope))
+    return failure();
+  plan.networkMode = *networkMode;
+  plan.timingScope = *timingScope;
+  plan.routePolicy = attr.getRoutePolicy().getValue().str();
+  plan.costProfileName = attr.getCostProfileName().getValue().str();
+  plan.costProfileHash = attr.getCostProfileHash().getValue().str();
   plan.mesh = {attr.getMeshRows().getInt(), attr.getMeshCols().getInt(),
                attr.getArraysPerCore().getInt()};
   plan.initialScore = attr.getInitialScore().getInt();
+  plan.objectiveScore = attr.getObjectiveScore().getInt();
   plan.totalTransferCost = attr.getTotalTransferCost().getInt();
+  plan.predictedMakespanNs = attr.getPredictedMakespanNs().getValueAsDouble();
   plan.evaluations = attr.getEvaluations().getInt();
   for (Attribute value : attr.getAssignments()) {
     auto assignmentAttr = dyn_cast<PhysicalTileAssignmentAttr>(value);
@@ -518,7 +584,7 @@ deserializeLogicalTileAnnealingTrace(LogicalTileAnnealingTraceAttr attr,
 
   if (trace.version != 1 || plan.schedule != "annealing" ||
       trace.initialScore != plan.initialScore ||
-      trace.finalScore != plan.totalTransferCost ||
+      trace.finalScore != plan.objectiveScore ||
       trace.evaluations != plan.evaluations || trace.evaluations < 0 ||
       trace.samples.empty() || trace.samples.front().iteration != 0 ||
       trace.samples.back().iteration != trace.evaluations) {
@@ -548,17 +614,15 @@ deserializeLogicalTileAnnealingTrace(LogicalTileAnnealingTraceAttr attr,
       }
       continue;
     }
-    bool consecutive =
-        sample.iteration ==
-        trace.samples[indexedSample.index() - 1].iteration + 1;
+    bool consecutive = sample.iteration ==
+                       trace.samples[indexedSample.index() - 1].iteration + 1;
     int64_t expectedCurrent =
         sample.accepted ? sample.candidateScore : previousCurrent;
     int64_t expectedBest = std::min(previousBest, expectedCurrent);
     if ((consecutive && (sample.currentScore != expectedCurrent ||
                          sample.bestScore != expectedBest)) ||
-        (!consecutive &&
-         (sample.bestScore > previousBest ||
-          sample.bestScore > sample.currentScore))) {
+        (!consecutive && (sample.bestScore > previousBest ||
+                          sample.bestScore > sample.currentScore))) {
       anchor->emitError("annealing score trajectory is inconsistent");
       return failure();
     }

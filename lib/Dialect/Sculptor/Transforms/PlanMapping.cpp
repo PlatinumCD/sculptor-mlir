@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingEvaluator.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingProblem.h"
@@ -134,6 +135,12 @@ void PlanMappingPass::runOnOperation() {
     signalPassFailure();
     return;
   }
+  FailureOr<mapping::MappingCostProfile> resolvedCostProfile =
+      mapping::loadMappingCostProfile(costProfile, *hardware, module);
+  if (failed(resolvedCostProfile)) {
+    signalPassFailure();
+    return;
+  }
 
   SmallVector<std::unique_ptr<mapping::MappingPlanner>> planners;
   planners.reserve(strategyNames->size());
@@ -178,6 +185,7 @@ void PlanMappingPass::runOnOperation() {
       mapping::MappingProblem problem{*graph,
                                       currentTree,
                                       *hardware,
+                                      *resolvedCostProfile,
                                       *logicalTileShape,
                                       *parsedObjective,
                                       *parsedMVMBodyPolicy,
@@ -213,6 +221,8 @@ void PlanMappingPass::runOnOperation() {
     plan.plannerName = llvm::join(*strategyNames, ",");
     plan.mvmBodyPolicy = *parsedMVMBodyPolicy;
     plan.setupBindingPolicy = *parsedSetupBindingPolicy;
+    plan.costProfileName = resolvedCostProfile->name;
+    plan.costProfileHash = resolvedCostProfile->contentHash;
     plan.selectedTree = std::move(currentTree);
     if (strategyNames->size() > 1) {
       plan.candidates.clear();
@@ -296,18 +306,27 @@ void PlanMappingPass::runOnOperation() {
             &getContext(), plan.selectedTree, *graph, graphFingerprint));
     func->setAttr(mapping::kMappingPlanAttrName,
                   mapping::serializeMappingPlan(&getContext(), plan));
+    func->setAttr(mapping::kMappingCostProfileAttrName,
+                  mapping::serializeMappingCostProfile(&getContext(),
+                                                       *resolvedCostProfile));
+    func->setAttr(mapping::kMappingCostProfileNameAttrName,
+                  StringAttr::get(&getContext(), resolvedCostProfile->name));
+    func->setAttr(
+        mapping::kMappingCostProfileHashAttrName,
+        StringAttr::get(&getContext(), resolvedCostProfile->contentHash));
     func->setAttr(
         mapping::kLogicalTileGraphAttrName,
         mapping::serializeLogicalTileGraph(&getContext(), *logicalTileGraph));
     func->removeAttr(mapping::kLogicalTilePlacementAttrName);
     func->removeAttr(mapping::kLogicalTileAnnealingTraceAttrName);
-    func->setAttr("sculptor.mapping.mvm_body_policy",
-                  StringAttr::get(&getContext(), mapping::stringifyMVMBodyPolicy(
-                                                    *parsedMVMBodyPolicy)));
+    func->setAttr(
+        "sculptor.mapping.mvm_body_policy",
+        StringAttr::get(&getContext(),
+                        mapping::stringifyMVMBodyPolicy(*parsedMVMBodyPolicy)));
     func->setAttr(
         "sculptor.mapping.setup_binding_policy",
         StringAttr::get(&getContext(), mapping::stringifySetupBindingPolicy(
-                                          *parsedSetupBindingPolicy)));
+                                           *parsedSetupBindingPolicy)));
     if (balanceDigitalWork) {
       func->setAttr("sculptor.mapping.digital_work_balancing",
                     BoolAttr::get(&getContext(), true));

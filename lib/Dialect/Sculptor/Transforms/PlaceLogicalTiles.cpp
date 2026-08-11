@@ -3,6 +3,8 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
@@ -21,6 +23,12 @@ void PlaceLogicalTilesPass::runOnOperation() {
   ModuleOp module = getOperation();
   FailureOr<mapping::LogicalTileScheduleKind> parsedSchedule =
       mapping::parseLogicalTileSchedule(schedule, module);
+  FailureOr<mapping::PlacementObjectiveKind> parsedObjective =
+      mapping::parsePlacementObjective(placementObjective, module);
+  FailureOr<mapping::TemporalNetworkMode> parsedNetworkMode =
+      mapping::parseTemporalNetworkMode(networkMode, module);
+  FailureOr<mapping::TemporalTimingScope> parsedTimingScope =
+      mapping::parseTemporalTimingScope(timingScope, module);
   FailureOr<mapping::LogicalTileScheduleKind> parsedInitial =
       mapping::parseLogicalTileSchedule(annealingInitialSchedule, module,
                                         /*allowAnnealing=*/false);
@@ -30,9 +38,10 @@ void PlaceLogicalTilesPass::runOnOperation() {
       mapping::parseGreedyPriorityMode(greedyPriorityMode, module);
   FailureOr<mapping::GreedyCandidateScope> parsedGreedyCandidateScope =
       mapping::parseGreedyCandidateScope(greedyCandidateScope, module);
-  if (failed(parsedSchedule) || failed(parsedInitial) ||
-      failed(parsedGreedyTileOrder) || failed(parsedGreedyPriorityMode) ||
-      failed(parsedGreedyCandidateScope)) {
+  if (failed(parsedSchedule) || failed(parsedObjective) ||
+      failed(parsedNetworkMode) || failed(parsedTimingScope) ||
+      failed(parsedInitial) || failed(parsedGreedyTileOrder) ||
+      failed(parsedGreedyPriorityMode) || failed(parsedGreedyCandidateScope)) {
     signalPassFailure();
     return;
   }
@@ -48,12 +57,15 @@ void PlaceLogicalTilesPass::runOnOperation() {
       signalPassFailure();
       return;
     }
-    *summary << "function,schedule,mesh_rows,mesh_cols,arrays_per_core,"
+    *summary << "function,schedule,objective,network_mode,timing_scope,"
+                "cost_profile_name,cost_profile_hash,"
+                "mesh_rows,mesh_cols,arrays_per_core,"
                 "greedy_tile_order,greedy_priority_mode,"
                 "greedy_candidate_scope,greedy_lookahead,digital_workers,"
                 "matrix_duplication,matrix_setups,logical_tiles,logical_edges,"
                 "initial_score,"
-                "total_transfer_cost,evaluations,estimated_latency_ns,"
+                "objective_score,total_transfer_cost,predicted_makespan_ns,"
+                "evaluations,estimated_latency_ns,"
                 "crossing_bytes,estimated_communication_ns,"
                 "required_resource_units,pipeline_stages\n";
   }
@@ -108,6 +120,37 @@ void PlaceLogicalTilesPass::runOnOperation() {
         *tileGraph,
         {resolvedMeshRows, resolvedMeshCols, resolvedArraysPerCore},
         function};
+    mapping::MappingHardwareModel temporalHardware;
+    temporalHardware.meshRows = resolvedMeshRows;
+    temporalHardware.meshCols = resolvedMeshCols;
+    temporalHardware.arraysPerCore = resolvedArraysPerCore;
+    auto profileAttr = function->getAttrOfType<DictionaryAttr>(
+        mapping::kMappingCostProfileAttrName);
+    if (profileAttr) {
+      if (auto clock = profileAttr.getAs<IntegerAttr>("clock_frequency_hz"))
+        temporalHardware.clockFrequencyHz = clock.getInt();
+      if (auto network = profileAttr.getAs<DictionaryAttr>("network")) {
+        if (auto wordBits = network.getAs<IntegerAttr>("word_bits"))
+          temporalHardware.networkWordBits = wordBits.getInt();
+      }
+    }
+    FailureOr<mapping::MappingCostProfile> resolvedProfile =
+        profileAttr
+            ? mapping::deserializeMappingCostProfile(profileAttr,
+                                                     temporalHardware, function)
+            : FailureOr<mapping::MappingCostProfile>(
+                  mapping::getLegacyMappingCostProfile(temporalHardware));
+    if (failed(resolvedProfile)) {
+      signalPassFailure();
+      return;
+    }
+    problem.computeGraph = &*graph;
+    problem.raTree = &*tree;
+    problem.costProfile = &*resolvedProfile;
+    problem.objective = *parsedObjective;
+    problem.networkMode = *parsedNetworkMode;
+    problem.timingScope = *parsedTimingScope;
+    problem.temporalCandidateLimit = temporalCandidateLimit;
     mapping::LogicalTilePlacementConfig config;
     config.schedule = *parsedSchedule;
     config.greedy.tileOrder = *parsedGreedyTileOrder;
@@ -139,23 +182,19 @@ void PlaceLogicalTilesPass::runOnOperation() {
     if (usesGreedy) {
       function->setAttr(
           mapping::kLogicalTileGreedyTileOrderAttrName,
-          StringAttr::get(&getContext(),
-                          mapping::stringifyGreedyTileOrder(
-                              *parsedGreedyTileOrder)));
+          StringAttr::get(&getContext(), mapping::stringifyGreedyTileOrder(
+                                             *parsedGreedyTileOrder)));
       function->setAttr(
           mapping::kLogicalTileGreedyPriorityModeAttrName,
-          StringAttr::get(&getContext(),
-                          mapping::stringifyGreedyPriorityMode(
-                              *parsedGreedyPriorityMode)));
+          StringAttr::get(&getContext(), mapping::stringifyGreedyPriorityMode(
+                                             *parsedGreedyPriorityMode)));
       function->setAttr(
           mapping::kLogicalTileGreedyCandidateScopeAttrName,
-          StringAttr::get(&getContext(),
-                          mapping::stringifyGreedyCandidateScope(
-                              *parsedGreedyCandidateScope)));
-      function->setAttr(
-          mapping::kLogicalTileGreedyLookaheadAttrName,
-          IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                           greedyLookahead));
+          StringAttr::get(&getContext(), mapping::stringifyGreedyCandidateScope(
+                                             *parsedGreedyCandidateScope)));
+      function->setAttr(mapping::kLogicalTileGreedyLookaheadAttrName,
+                        IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                         greedyLookahead));
     } else {
       function->removeAttr(mapping::kLogicalTileGreedyTileOrderAttrName);
       function->removeAttr(mapping::kLogicalTileGreedyPriorityModeAttrName);
@@ -184,20 +223,23 @@ void PlaceLogicalTilesPass::runOnOperation() {
           mapping::kMappingPlanAttrName);
       *summary
           << function.getSymName() << ',' << placement->schedule << ','
-          << placement->mesh.rows << ',' << placement->mesh.columns << ','
-          << placement->mesh.arraysPerCore << ','
+          << mapping::stringifyPlacementObjective(placement->objective) << ','
+          << mapping::stringifyTemporalNetworkMode(*parsedNetworkMode) << ','
+          << mapping::stringifyTemporalTimingScope(*parsedTimingScope) << ','
+          << placement->costProfileName << ',' << placement->costProfileHash
+          << ',' << placement->mesh.rows << ',' << placement->mesh.columns
+          << ',' << placement->mesh.arraysPerCore << ','
           << mapping::stringifyGreedyTileOrder(*parsedGreedyTileOrder) << ','
           << mapping::stringifyGreedyPriorityMode(*parsedGreedyPriorityMode)
           << ','
-          << mapping::stringifyGreedyCandidateScope(
-                 *parsedGreedyCandidateScope)
-          << ','
-          << greedyLookahead << ','
-          << (digitalWorkers ? digitalWorkers.getInt() : 1)
-          << ',' << (matrixDuplication ? "on" : "off") << ','
-          << matrixSetupCount << ',' << tileGraph->tiles.size() << ','
-          << tileGraph->edges.size() << ',' << placement->initialScore << ','
-          << placement->totalTransferCost << ',' << placement->evaluations
+          << mapping::stringifyGreedyCandidateScope(*parsedGreedyCandidateScope)
+          << ',' << greedyLookahead << ','
+          << (digitalWorkers ? digitalWorkers.getInt() : 1) << ','
+          << (matrixDuplication ? "on" : "off") << ',' << matrixSetupCount
+          << ',' << tileGraph->tiles.size() << ',' << tileGraph->edges.size()
+          << ',' << placement->initialScore << ',' << placement->objectiveScore
+          << ',' << placement->totalTransferCost << ','
+          << placement->predictedMakespanNs << ',' << placement->evaluations
           << ','
           << (mappingPlan
                   ? mappingPlan.getEstimatedLatencyNs().getValueAsDouble()

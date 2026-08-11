@@ -1,11 +1,13 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/OutlineTileRoutines.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -780,6 +782,75 @@ buildRoutineRegions(ArrayRef<EndpointPlan> endpoints) {
   return routines;
 }
 
+LogicalResult copyReductionMetadata(func::FuncOp function,
+                                    const RoutinePlan &routine) {
+  static constexpr StringLiteral mappingNames[] = {
+      kReductionTreeIdAttrName, kReductionNodeIdAttrName,
+      kReductionLevelAttrName, kReductionOrdinalAttrName,
+      kReductionWidthAttrName};
+  static constexpr StringLiteral taskNames[] = {
+      task_graph_attrs::kTaskReductionTreeIdAttrName,
+      task_graph_attrs::kTaskReductionLevelAttrName,
+      task_graph_attrs::kTaskReductionWidthAttrName};
+
+  DenseMap<StringRef, Attribute> values;
+  for (Operation *operation : routine.selectedOperations) {
+    for (StringRef name : mappingNames) {
+      Attribute value = operation->getAttr(name);
+      if (!value)
+        continue;
+      auto [found, inserted] = values.try_emplace(name, value);
+      if (!inserted && found->second != value) {
+        return operation->emitError(
+                   "outlined routine contains conflicting reduction metadata '")
+               << name << "'";
+      }
+    }
+    for (StringRef name : taskNames) {
+      Attribute value = operation->getAttr(name);
+      if (!value)
+        continue;
+      auto [found, inserted] = values.try_emplace(name, value);
+      if (!inserted && found->second != value) {
+        return operation->emitError(
+                   "outlined routine contains conflicting reduction metadata '")
+               << name << "'";
+      }
+    }
+    Attribute reduction =
+        operation->getAttr(task_graph_attrs::kTaskReductionAttrName);
+    if (reduction) {
+      auto [found, inserted] = values.try_emplace(
+          task_graph_attrs::kTaskReductionAttrName, reduction);
+      if (!inserted && found->second != reduction) {
+        return operation->emitError(
+            "outlined routine contains conflicting reduction kinds");
+      }
+    }
+  }
+
+  bool hasReduction = values.contains(kReductionTreeIdAttrName);
+  if (!hasReduction)
+    return success();
+  for (StringRef name : mappingNames) {
+    if (!values.contains(name))
+      return function.emitError("outlined reduction routine is missing '")
+             << name << "'";
+  }
+  for (StringRef name : taskNames) {
+    if (!values.contains(name))
+      return function.emitError("outlined reduction routine is missing '")
+             << name << "'";
+  }
+  if (!values.contains(task_graph_attrs::kTaskReductionAttrName)) {
+    return function.emitError(
+        "outlined reduction routine is missing reduction semantics");
+  }
+  for (const auto &entry : values)
+    function->setAttr(entry.first, entry.second);
+  return success();
+}
+
 SmallVector<Value> getExternalValuesUsedBy(Operation *root) {
   SmallVector<Value> values;
   auto isDefinedInside = [&](Value value) {
@@ -1337,6 +1408,8 @@ LogicalResult createRoutineFunctions(
                       getI64Array(builder, routine.logicalTileIds));
     function->setAttr(kDeploymentSourceLeafIdsAttr,
                       getI64Array(builder, routine.sourceLeafIds));
+    if (failed(copyReductionMetadata(function, routine)))
+      return failure();
     if (routine.boot) {
       const EndpointPlan &endpoint = endpoints[routine.endpointIndices.front()];
       int64_t physicalArrayId =

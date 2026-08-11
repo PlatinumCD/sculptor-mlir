@@ -6,9 +6,15 @@ set(SCULPTOR_MAPPING_SOURCES
   mapping/LogicalTilePlacement.cpp
   mapping/LogicalTileSchedulers.cpp
   mapping/MappingConfig.cpp
+  mapping/MappingCostModel.cpp
+  mapping/MappingCostProfile.cpp
   mapping/MappingEvaluator.cpp
   mapping/MappingPlan.cpp
   mapping/MappingRealization.cpp
+  mapping/PlacementObjective.cpp
+  mapping/ReductionTree.cpp
   mapping/ResourceAllocationTree.cpp
+  mapping/ShardDataflow.cpp
+  mapping/TemporalPlacementModel.cpp
   PARENT_SCOPE
 )

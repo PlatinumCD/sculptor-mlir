@@ -4,6 +4,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
 namespace mlir {
@@ -14,6 +15,7 @@ struct MappingProblem {
   const ComputeGraph &graph;
   const ResourceAllocationTree &currentTree;
   const MappingHardwareModel &hardware;
+  const MappingCostProfile &costProfile;
   LogicalTileShape logicalTileShape;
   MappingObjective objective;
   MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;

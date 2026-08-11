@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
 
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/IR/Diagnostics.h"
@@ -217,6 +218,98 @@ LogicalResult populateIterationDomain(ComputeOperation &computeOperation) {
     computeOperation.iterationDomain.push_back(
         {static_cast<int64_t>(index), kind, staticExtents[index]});
   }
+  return success();
+}
+
+LogicalResult populateSemanticTaskKind(ComputeOperation &operation) {
+  std::optional<StringRef> semanticSection;
+  for (Operation *member : operation.members) {
+    auto section =
+        member->getAttrOfType<StringAttr>("sculptor.semantic.section");
+    if (!section)
+      continue;
+    if (semanticSection && *semanticSection != section.getValue()) {
+      return operation.operation->emitError(
+          "mapping operation contains conflicting sculptor.semantic.section "
+          "values");
+    }
+    semanticSection = section.getValue();
+  }
+  if (semanticSection) {
+    operation.semanticTaskKind = semanticSection->str();
+    return success();
+  }
+
+  switch (operation.kind) {
+  case ComputeOperationKind::LogicalMVM:
+  case ComputeOperationKind::PhysicalMVM:
+    operation.semanticTaskKind = "sculptor.mvm";
+    break;
+  case ComputeOperationKind::MatrixSetup:
+    operation.semanticTaskKind = "sculptor.matrix_setup";
+    break;
+  case ComputeOperationKind::VectorTile:
+    operation.semanticTaskKind = "digital.vector_tile";
+    break;
+  case ComputeOperationKind::TileRecombine:
+    operation.semanticTaskKind = "digital.tile_recombine";
+    break;
+  case ComputeOperationKind::DigitalStage:
+    operation.semanticTaskKind = "digital.compute";
+    break;
+  case ComputeOperationKind::Structured:
+    operation.semanticTaskKind =
+        operation.operation->getName().getStringRef().str();
+    break;
+  }
+  return success();
+}
+
+LogicalResult populateReductionIdentity(ComputeOperation &operation) {
+  struct ReductionIdentity {
+    int64_t treeId;
+    int64_t nodeId;
+    int64_t level;
+    int64_t ordinal;
+    int64_t width;
+
+    bool operator==(const ReductionIdentity &) const = default;
+  };
+  std::optional<ReductionIdentity> identity;
+  for (Operation *member : operation.members) {
+    auto treeId = member->getAttrOfType<IntegerAttr>(kReductionTreeIdAttrName);
+    auto nodeId = member->getAttrOfType<IntegerAttr>(kReductionNodeIdAttrName);
+    auto level = member->getAttrOfType<IntegerAttr>(kReductionLevelAttrName);
+    auto ordinal =
+        member->getAttrOfType<IntegerAttr>(kReductionOrdinalAttrName);
+    auto width = member->getAttrOfType<IntegerAttr>(kReductionWidthAttrName);
+    bool hasAny = treeId || nodeId || level || ordinal || width;
+    if (!hasAny)
+      continue;
+    if (!treeId || !nodeId || !level || !ordinal || !width) {
+      return member->emitError(
+          "reduction mapping operation has incomplete node identity");
+    }
+    ReductionIdentity candidate{treeId.getInt(), nodeId.getInt(),
+                                level.getInt(), ordinal.getInt(),
+                                width.getInt()};
+    if (candidate.treeId < 0 || candidate.nodeId < 0 || candidate.level < 0 ||
+        candidate.ordinal < 0 || candidate.width < 2) {
+      return member->emitError("reduction mapping identity is out of range");
+    }
+    if (identity && *identity != candidate) {
+      return member->emitError(
+          "one mapping stage contains conflicting reduction identities");
+    }
+    identity = candidate;
+  }
+  if (!identity)
+    return success();
+  operation.reductionTreeId = identity->treeId;
+  operation.reductionNodeId = identity->nodeId;
+  operation.reductionLevel = identity->level;
+  operation.reductionOrdinal = identity->ordinal;
+  operation.reductionWidth = identity->width;
   return success();
 }
 
@@ -454,7 +547,8 @@ LogicalResult buildMVMWaves(ComputeGraph &graph) {
     SmallVector<int64_t> outputConsumers;
     bool outputIsFunctionResult = false;
     for (int64_t outputOperationId : waveOutputOperationIds) {
-      for (int64_t tensorId : graph.operations[outputOperationId].outputTensors) {
+      for (int64_t tensorId :
+           graph.operations[outputOperationId].outputTensors) {
         const ComputeTensor &tensor = graph.tensors[tensorId];
         outputIsFunctionResult |= tensor.isFunctionOutput;
         for (int64_t consumerId : tensor.consumerOperations)
@@ -628,6 +722,10 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
 
   for (ComputeOperation &operation : graph.operations) {
     operation.requiredLane = classifyLogicalLaneRequirement(operation.kind);
+    if (failed(populateSemanticTaskKind(operation)))
+      return failure();
+    if (failed(populateReductionIdentity(operation)))
+      return failure();
     if (failed(populateIterationDomain(operation)))
       return failure();
   }
@@ -646,6 +744,7 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
 
     ComputeTensor tensor;
     tensor.id = static_cast<int64_t>(graph.tensors.size());
+    tensor.value = value;
     tensor.type = value.getType();
     tensor.byteSize = getStaticTensorByteSize(tensor.type);
     tensor.isLogicalArray = isa<sculptor::LogicalArrayType>(tensor.type);
