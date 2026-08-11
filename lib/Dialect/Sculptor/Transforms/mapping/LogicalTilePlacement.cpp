@@ -1,5 +1,6 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 
 #include "mlir/IR/Builders.h"
@@ -74,6 +75,69 @@ FailureOr<int64_t> checkedAddCost(int64_t current, int64_t increment,
 namespace mlir {
 namespace sculptor {
 namespace mapping {
+
+LogicalResult initializeLogicalTilePlacementProblem(
+    const ComputeGraph &computeGraph,
+    const ResourceAllocationTree &resourceAllocationTree,
+    MappingCostProfile &costProfileStorage,
+    LogicalTilePlacementProblem &problem) {
+  if (!problem.anchor)
+    return failure();
+
+  MappingHardwareModel hardware;
+  hardware.meshRows = problem.mesh.rows;
+  hardware.meshCols = problem.mesh.columns;
+  hardware.arraysPerCore = problem.mesh.arraysPerCore;
+  auto profileAttr = problem.anchor->getAttrOfType<DictionaryAttr>(
+      kMappingCostProfileAttrName);
+  if (profileAttr) {
+    if (auto clock = profileAttr.getAs<IntegerAttr>("clock_frequency_hz"))
+      hardware.clockFrequencyHz = clock.getInt();
+    if (auto network = profileAttr.getAs<DictionaryAttr>("network")) {
+      if (auto wordBits = network.getAs<IntegerAttr>("word_bits"))
+        hardware.networkWordBits = wordBits.getInt();
+    }
+  }
+
+  FailureOr<MappingCostProfile> resolvedProfile =
+      profileAttr
+          ? deserializeMappingCostProfile(profileAttr, hardware, problem.anchor)
+          : FailureOr<MappingCostProfile>(
+                getLegacyMappingCostProfile(hardware));
+  if (failed(resolvedProfile))
+    return failure();
+
+  costProfileStorage = std::move(*resolvedProfile);
+  problem.computeGraph = &computeGraph;
+  problem.raTree = &resourceAllocationTree;
+  problem.costProfile = &costProfileStorage;
+  return success();
+}
+
+LogicalResult initializeLogicalTilePlacementProblemFromPlan(
+    LogicalTilePlacementAttr placementAttr, const ComputeGraph &computeGraph,
+    const ResourceAllocationTree &resourceAllocationTree,
+    MappingCostProfile &costProfileStorage,
+    LogicalTilePlacementProblem &problem) {
+  problem.mesh = {placementAttr.getMeshRows().getInt(),
+                  placementAttr.getMeshCols().getInt(),
+                  placementAttr.getArraysPerCore().getInt()};
+  FailureOr<PlacementObjectiveKind> objective = parsePlacementObjective(
+      placementAttr.getObjective().getValue(), problem.anchor);
+  FailureOr<TemporalNetworkMode> networkMode = parseTemporalNetworkMode(
+      placementAttr.getNetworkMode().getValue(), problem.anchor);
+  FailureOr<TemporalTimingScope> timingScope = parseTemporalTimingScope(
+      placementAttr.getTimingScope().getValue(), problem.anchor);
+  if (failed(objective) || failed(networkMode) || failed(timingScope) ||
+      failed(initializeLogicalTilePlacementProblem(
+          computeGraph, resourceAllocationTree, costProfileStorage, problem)))
+    return failure();
+
+  problem.objective = *objective;
+  problem.networkMode = *networkMode;
+  problem.timingScope = *timingScope;
+  return success();
+}
 
 FailureOr<LogicalTileScheduleKind>
 parseLogicalTileSchedule(StringRef value, Operation *anchor,
@@ -326,24 +390,80 @@ verifyLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
                                const LogicalTilePlacementPlan &plan) {
   if (failed(validateLogicalTilePlacementProblem(problem)))
     return failure();
-  if (plan.version != 2 || plan.schedule.empty() ||
-      plan.objective != problem.objective ||
-      plan.networkMode != problem.networkMode ||
-      plan.timingScope != problem.timingScope || plan.routePolicy != "xy" ||
-      (problem.costProfile &&
-       (plan.costProfileName != problem.costProfile->name ||
-        plan.costProfileHash != problem.costProfile->contentHash)) ||
-      plan.mesh.rows != problem.mesh.rows ||
-      plan.mesh.columns != problem.mesh.columns ||
-      plan.mesh.arraysPerCore != problem.mesh.arraysPerCore ||
-      plan.initialScore < 0 || plan.objectiveScore < 0 ||
-      plan.totalTransferCost < 0 || !std::isfinite(plan.predictedMakespanNs) ||
-      plan.predictedMakespanNs < 0.0 || plan.evaluations < 0 ||
-      plan.assignments.size() != problem.tileGraph.tiles.size() ||
-      plan.edges.size() != problem.tileGraph.edges.size()) {
-    problem.anchor->emitError("invalid logical-tile placement plan metadata");
-    return failure();
-  }
+  if (plan.version != 2)
+    return problem.anchor->emitError(
+               "logical-tile placement version mismatch: ")
+           << plan.version << " versus 2";
+  if (plan.schedule.empty())
+    return problem.anchor->emitError(
+        "logical-tile placement schedule must not be empty");
+  if (plan.objective != problem.objective)
+    return problem.anchor->emitError(
+               "logical-tile placement objective mismatch: '")
+           << stringifyPlacementObjective(plan.objective) << "' versus '"
+           << stringifyPlacementObjective(problem.objective) << "'";
+  if (plan.networkMode != problem.networkMode)
+    return problem.anchor->emitError(
+               "logical-tile placement network mode mismatch: '")
+           << stringifyTemporalNetworkMode(plan.networkMode) << "' versus '"
+           << stringifyTemporalNetworkMode(problem.networkMode) << "'";
+  if (plan.timingScope != problem.timingScope)
+    return problem.anchor->emitError(
+               "logical-tile placement timing scope mismatch: '")
+           << stringifyTemporalTimingScope(plan.timingScope) << "' versus '"
+           << stringifyTemporalTimingScope(problem.timingScope) << "'";
+  if (plan.routePolicy != "xy")
+    return problem.anchor->emitError(
+               "logical-tile placement route policy mismatch: '")
+           << plan.routePolicy << "' versus 'xy'";
+  if (problem.costProfile && plan.costProfileName != problem.costProfile->name)
+    return problem.anchor->emitError(
+               "logical-tile placement cost profile name mismatch: '")
+           << plan.costProfileName << "' versus '" << problem.costProfile->name
+           << "'";
+  if (problem.costProfile &&
+      plan.costProfileHash != problem.costProfile->contentHash)
+    return problem.anchor->emitError(
+        "logical-tile placement cost profile hash mismatch");
+  if (plan.mesh.rows != problem.mesh.rows)
+    return problem.anchor->emitError(
+               "logical-tile placement mesh-row mismatch: ")
+           << plan.mesh.rows << " versus " << problem.mesh.rows;
+  if (plan.mesh.columns != problem.mesh.columns)
+    return problem.anchor->emitError(
+               "logical-tile placement mesh-column mismatch: ")
+           << plan.mesh.columns << " versus " << problem.mesh.columns;
+  if (plan.mesh.arraysPerCore != problem.mesh.arraysPerCore)
+    return problem.anchor->emitError(
+               "logical-tile placement arrays-per-core mismatch: ")
+           << plan.mesh.arraysPerCore << " versus "
+           << problem.mesh.arraysPerCore;
+  if (plan.initialScore < 0)
+    return problem.anchor->emitError(
+        "logical-tile placement initial score must be nonnegative");
+  if (plan.objectiveScore < 0)
+    return problem.anchor->emitError(
+        "logical-tile placement objective score must be nonnegative");
+  if (plan.totalTransferCost < 0)
+    return problem.anchor->emitError(
+        "logical-tile placement transfer cost must be nonnegative");
+  if (!std::isfinite(plan.predictedMakespanNs) ||
+      plan.predictedMakespanNs < 0.0)
+    return problem.anchor->emitError(
+        "logical-tile placement predicted makespan must be finite and "
+        "nonnegative");
+  if (plan.evaluations < 0)
+    return problem.anchor->emitError(
+        "logical-tile placement evaluation count must be nonnegative");
+  if (plan.assignments.size() != problem.tileGraph.tiles.size())
+    return problem.anchor->emitError(
+               "logical-tile placement assignment-count mismatch: ")
+           << plan.assignments.size() << " versus "
+           << problem.tileGraph.tiles.size();
+  if (plan.edges.size() != problem.tileGraph.edges.size())
+    return problem.anchor->emitError(
+               "logical-tile placement edge-count mismatch: ")
+           << plan.edges.size() << " versus " << problem.tileGraph.edges.size();
 
   FailureOr<int64_t> capacity =
       getPhysicalTileCapacity(problem.mesh, problem.anchor);

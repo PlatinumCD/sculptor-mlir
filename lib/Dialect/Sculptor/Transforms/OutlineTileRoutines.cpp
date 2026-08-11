@@ -7,6 +7,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
@@ -1669,11 +1670,11 @@ LogicalResult outlineFunction(ModuleOp outer, func::FuncOp source) {
       deserializeLogicalTileGraph(tileGraphAttr, *graph, *tree, source);
   if (failed(tileGraph))
     return failure();
-  LogicalTilePlacementProblem placementProblem{*tileGraph,
-                                               {tileGraph->plannedMeshRows,
-                                                tileGraph->plannedMeshCols,
-                                                tileGraph->analogLanesPerTile},
-                                               source};
+  LogicalTilePlacementProblem placementProblem{*tileGraph, {}, source};
+  MappingCostProfile resolvedProfile;
+  if (failed(initializeLogicalTilePlacementProblemFromPlan(
+          placementAttr, *graph, *tree, resolvedProfile, placementProblem)))
+    return failure();
   FailureOr<LogicalTilePlacementPlan> placement =
       deserializeLogicalTilePlacement(placementAttr, placementProblem);
   if (failed(placement) ||

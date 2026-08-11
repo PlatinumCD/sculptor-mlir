@@ -56,6 +56,27 @@ def run_pipeline(case: LoweringCase, passes: list[str]) -> str:
     return result.stdout
 
 
+def run_serialized_pipeline(
+    case: LoweringCase, producing_passes: list[str], consuming_passes: list[str]
+) -> str:
+    produced = run_pipeline(case, producing_passes)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "placed.mlir"
+        path.write_text(produced)
+        result = subprocess.run(
+            [str(DEFAULT_SCULPTOR_OPT), str(path), *consuming_passes],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    if result.returncode:
+        raise AssertionError(
+            f"{case.name} failed after serialization with exit code "
+            f"{result.returncode}:\n{result.stderr}"
+        )
+    return result.stdout
+
+
 def linear_prefix(array_cols: int = 2) -> list[str]:
     return [
         "--sculptor-canonicalize-layers",
@@ -171,6 +192,138 @@ class MappingExtensionTest(unittest.TestCase):
         self.assertIn('dataflow_mode = "bulk"', lowered)
         self.assertIn('reduction_tree_policy = "none"', lowered)
         self.assertRegex(lowered, r"predictedMakespanNs = 0(?:\.0+)?")
+
+    def test_temporal_placement_survives_serialization_before_outlining(self):
+        for index, (network_mode, timing_scope) in enumerate(
+            (network, scope)
+            for network in ("ideal", "finite", "full")
+            for scope in ("warm", "cold")
+        ):
+            with self.subTest(
+                dataflow="bulk",
+                network_mode=network_mode,
+                timing_scope=timing_scope,
+            ):
+                outlined = run_serialized_pipeline(
+                    self.linear_case,
+                    [
+                        *linear_prefix(),
+                        "--sculptor-build-ra-tree",
+                        (
+                            "--sculptor-plan-mapping="
+                            "strategies=setup-first mesh-rows=4 mesh-cols=4 "
+                            "arrays-per-core=4 array-rows=8 array-cols=2 "
+                            f"cost-profile={COST_PROFILE}"
+                        ),
+                        (
+                            "--sculptor-place-logical-tiles="
+                            "schedule=greedy objective=makespan "
+                            f"network-mode={network_mode} "
+                            f"timing-scope={timing_scope} "
+                            f"temporal-candidate-limit={1 + index} "
+                            "mesh-rows=4 mesh-cols=4 arrays-per-core=4"
+                        ),
+                    ],
+                    ["--sculptor-outline-tile-routines"],
+                )
+                self.assertIn("module @tile_", outlined)
+
+        sharded_case = LoweringCase(
+            name="serialized_sharded_elementwise_chain",
+            model_factory=ElementwiseChain,
+            input_factory=lambda: (torch.ones(4, 8), torch.ones(4, 8)),
+            minimum_matrix_setups=0,
+        )
+        outlined = run_serialized_pipeline(
+            sharded_case,
+            [
+                "--sculptor-expand-digital-work="
+                "parallel-workers=4 dataflow=sharded",
+                "--sculptor-build-ra-tree",
+                (
+                    "--sculptor-plan-mapping="
+                    "strategies=recursive-fork-join "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4 "
+                    "array-rows=8 array-cols=2 "
+                    f"cost-profile={COST_PROFILE}"
+                ),
+                (
+                    "--sculptor-place-logical-tiles="
+                    "schedule=greedy objective=makespan network-mode=full "
+                    "timing-scope=warm temporal-candidate-limit=4 "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4"
+                ),
+            ],
+            ["--sculptor-outline-tile-routines"],
+        )
+        self.assertIn("module @tile_", outlined)
+
+        outlined = run_serialized_pipeline(
+            self.linear_case,
+            [
+                *linear_prefix(),
+                (
+                    "--sculptor-expand-digital-work="
+                    "parallel-workers=1 dataflow=sharded "
+                    "reduction-tree=balanced reduction-fan-in=2 "
+                    "reduction-min-width=3"
+                ),
+                "--sculptor-build-ra-tree",
+                (
+                    "--sculptor-plan-mapping="
+                    "strategies=setup-first,recursive-fork-join "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4 "
+                    "array-rows=8 array-cols=2 "
+                    f"cost-profile={COST_PROFILE}"
+                ),
+                (
+                    "--sculptor-place-logical-tiles="
+                    "schedule=greedy objective=makespan network-mode=finite "
+                    "timing-scope=cold temporal-candidate-limit=4 "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4"
+                ),
+            ],
+            ["--sculptor-outline-tile-routines"],
+        )
+        self.assertIn("sculptor.task.reduction_tree_id", outlined)
+
+    def test_temporal_placement_reports_specific_metadata_mismatch(self):
+        placed = run_pipeline(
+            self.linear_case,
+            [
+                *linear_prefix(),
+                "--sculptor-build-ra-tree",
+                (
+                    "--sculptor-plan-mapping="
+                    "strategies=setup-first mesh-rows=4 mesh-cols=4 "
+                    "arrays-per-core=4 array-rows=8 array-cols=2 "
+                    f"cost-profile={COST_PROFILE}"
+                ),
+                (
+                    "--sculptor-place-logical-tiles="
+                    "schedule=greedy objective=makespan network-mode=full "
+                    "timing-scope=warm mesh-rows=4 mesh-cols=4 "
+                    "arrays-per-core=4"
+                ),
+            ],
+        )
+        corrupted = placed.replace(
+            'costProfileName = "test-calibrated-v1"',
+            'costProfileName = "incorrect-profile"',
+            1,
+        )
+        self.assertNotEqual(corrupted, placed)
+        result = subprocess.run(
+            [str(DEFAULT_SCULPTOR_OPT), "-", "--sculptor-outline-tile-routines"],
+            input=corrupted,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "logical-tile placement cost profile name mismatch", result.stderr
+        )
 
     def test_sharded_elementwise_chain_has_exact_edges(self):
         case = LoweringCase(

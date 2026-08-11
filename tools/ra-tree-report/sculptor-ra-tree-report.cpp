@@ -235,48 +235,11 @@ FailureOr<ReportFunction> buildReportFunction(func::FuncOp function,
           "physical logical-tile placement has no logical-tile graph");
       return failure();
     }
-    LogicalTilePlacementProblem problem{
-        *logicalTileGraph,
-        {placementAttr.getMeshRows().getInt(),
-         placementAttr.getMeshCols().getInt(),
-         placementAttr.getArraysPerCore().getInt()},
-        function};
-    FailureOr<PlacementObjectiveKind> objective = parsePlacementObjective(
-        placementAttr.getObjective().getValue(), function);
-    FailureOr<TemporalNetworkMode> networkMode = parseTemporalNetworkMode(
-        placementAttr.getNetworkMode().getValue(), function);
-    FailureOr<TemporalTimingScope> timingScope = parseTemporalTimingScope(
-        placementAttr.getTimingScope().getValue(), function);
-    if (failed(objective) || failed(networkMode) || failed(timingScope))
+    LogicalTilePlacementProblem problem{*logicalTileGraph, {}, function};
+    MappingCostProfile profile;
+    if (failed(initializeLogicalTilePlacementProblemFromPlan(
+            placementAttr, *graph, *tree, profile, problem)))
       return failure();
-
-    MappingHardwareModel hardware;
-    hardware.meshRows = problem.mesh.rows;
-    hardware.meshCols = problem.mesh.columns;
-    hardware.arraysPerCore = problem.mesh.arraysPerCore;
-    auto profileAttr =
-        function->getAttrOfType<DictionaryAttr>(kMappingCostProfileAttrName);
-    if (profileAttr) {
-      if (auto clock = profileAttr.getAs<IntegerAttr>("clock_frequency_hz"))
-        hardware.clockFrequencyHz = clock.getInt();
-      if (auto network = profileAttr.getAs<DictionaryAttr>("network")) {
-        if (auto bits = network.getAs<IntegerAttr>("word_bits"))
-          hardware.networkWordBits = bits.getInt();
-      }
-    }
-    FailureOr<MappingCostProfile> profile =
-        profileAttr
-            ? deserializeMappingCostProfile(profileAttr, hardware, function)
-            : FailureOr<MappingCostProfile>(
-                  getLegacyMappingCostProfile(hardware));
-    if (failed(profile))
-      return failure();
-    problem.computeGraph = &*graph;
-    problem.raTree = &*tree;
-    problem.costProfile = &*profile;
-    problem.objective = *objective;
-    problem.networkMode = *networkMode;
-    problem.timingScope = *timingScope;
     FailureOr<LogicalTilePlacementPlan> deserialized =
         deserializeLogicalTilePlacement(placementAttr, problem);
     if (failed(deserialized))

@@ -120,33 +120,12 @@ void PlaceLogicalTilesPass::runOnOperation() {
         *tileGraph,
         {resolvedMeshRows, resolvedMeshCols, resolvedArraysPerCore},
         function};
-    mapping::MappingHardwareModel temporalHardware;
-    temporalHardware.meshRows = resolvedMeshRows;
-    temporalHardware.meshCols = resolvedMeshCols;
-    temporalHardware.arraysPerCore = resolvedArraysPerCore;
-    auto profileAttr = function->getAttrOfType<DictionaryAttr>(
-        mapping::kMappingCostProfileAttrName);
-    if (profileAttr) {
-      if (auto clock = profileAttr.getAs<IntegerAttr>("clock_frequency_hz"))
-        temporalHardware.clockFrequencyHz = clock.getInt();
-      if (auto network = profileAttr.getAs<DictionaryAttr>("network")) {
-        if (auto wordBits = network.getAs<IntegerAttr>("word_bits"))
-          temporalHardware.networkWordBits = wordBits.getInt();
-      }
-    }
-    FailureOr<mapping::MappingCostProfile> resolvedProfile =
-        profileAttr
-            ? mapping::deserializeMappingCostProfile(profileAttr,
-                                                     temporalHardware, function)
-            : FailureOr<mapping::MappingCostProfile>(
-                  mapping::getLegacyMappingCostProfile(temporalHardware));
-    if (failed(resolvedProfile)) {
+    mapping::MappingCostProfile resolvedProfile;
+    if (failed(mapping::initializeLogicalTilePlacementProblem(
+            *graph, *tree, resolvedProfile, problem))) {
       signalPassFailure();
       return;
     }
-    problem.computeGraph = &*graph;
-    problem.raTree = &*tree;
-    problem.costProfile = &*resolvedProfile;
     problem.objective = *parsedObjective;
     problem.networkMode = *parsedNetworkMode;
     problem.timingScope = *parsedTimingScope;

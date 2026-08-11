@@ -154,6 +154,18 @@ struct LogicalTilePlacementPlan {
   std::optional<LogicalTileAnnealingTrace> annealingTrace;
 };
 
+LogicalResult initializeLogicalTilePlacementProblem(
+    const ComputeGraph &computeGraph,
+    const ResourceAllocationTree &resourceAllocationTree,
+    MappingCostProfile &costProfileStorage,
+    LogicalTilePlacementProblem &problem);
+
+LogicalResult initializeLogicalTilePlacementProblemFromPlan(
+    LogicalTilePlacementAttr placementAttr, const ComputeGraph &computeGraph,
+    const ResourceAllocationTree &resourceAllocationTree,
+    MappingCostProfile &costProfileStorage,
+    LogicalTilePlacementProblem &problem);
+
 FailureOr<LogicalTileScheduleKind>
 parseLogicalTileSchedule(StringRef value, Operation *anchor,
                          bool allowAnnealing = true);
