@@ -4,7 +4,10 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/Support/LogicalResult.h"
+
+#include <optional>
 
 namespace mlir {
 namespace sculptor {
@@ -22,6 +25,16 @@ inline constexpr StringLiteral kAssemblyBoundaryCountAttrName =
     "sculptor.mapping.assembly_boundary_count";
 
 enum class DigitalDataflowMode { Bulk, Sharded };
+
+struct StaticTileRegion {
+  SmallVector<int64_t> offsets;
+  SmallVector<int64_t> sizes;
+};
+
+std::optional<StaticTileRegion>
+mapIterationTileThroughIndexingMap(AffineMap indexingMap,
+                                   ArrayRef<int64_t> iterationOffsets,
+                                   ArrayRef<int64_t> iterationSizes);
 
 FailureOr<DigitalDataflowMode> parseDigitalDataflowMode(StringRef value,
                                                         Operation *anchor);

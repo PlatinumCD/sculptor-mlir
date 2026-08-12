@@ -432,11 +432,10 @@ private:
     });
   }
 
-  bool haveMatchingExternalFrontiers(int64_t leftAtomId,
-                                     int64_t rightAtomId) const {
+  bool haveMatchingPredecessorFrontiers(int64_t leftAtomId,
+                                        int64_t rightAtomId) const {
     return containsSameNodes(predecessors[leftAtomId],
-                             predecessors[rightAtomId]) &&
-           containsSameNodes(successors[leftAtomId], successors[rightAtomId]);
+                             predecessors[rightAtomId]);
   }
 
   bool reaches(int64_t sourceId, int64_t targetId) const {
@@ -462,7 +461,8 @@ private:
   bool canJoinMVMWaveCohort(int64_t candidateAtomId,
                             ArrayRef<int64_t> cohortAtomIds) const {
     if (cohortAtomIds.empty() ||
-        !haveMatchingExternalFrontiers(cohortAtomIds.front(), candidateAtomId))
+        !haveMatchingPredecessorFrontiers(cohortAtomIds.front(),
+                                          candidateAtomId))
       return false;
     return llvm::all_of(cohortAtomIds, [&](int64_t memberAtomId) {
       return !reaches(memberAtomId, candidateAtomId) &&
@@ -470,8 +470,11 @@ private:
     });
   }
 
-  // Recover parallel wave bodies when overlapping multi-exit branches forced
-  // the general fork/join parser to retain a conservative sequence.
+  // Recover simultaneously ready MVM bodies when intermediate joins, such as
+  // balanced reductions, force the general fork/join parser to retain a
+  // conservative sequence. Successor frontiers may differ: the sequence after
+  // this cohort remains ordered, while lane-binding legalization below
+  // serializes bodies that genuinely share one programmed array.
   void formParallelMVMWaveCohorts(int64_t regionId) {
     if (regionId < 0 || regionId >= static_cast<int64_t>(tree.regions.size()))
       return;
@@ -1017,8 +1020,7 @@ RecursiveForkJoinPlanner::refine(const MappingProblem &problem,
     return failure();
 
   RecursiveRegionBuilder regionBuilder(
-      problem.graph, partition->computeOperationIds, problem.anchor,
-      problem.mvmBodyPolicy == MVMBodyPolicy::Spread);
+      problem.graph, partition->computeOperationIds, problem.anchor);
   FailureOr<ComputeRegionTree> regions = regionBuilder.build();
   if (failed(regions))
     return failure();

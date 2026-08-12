@@ -108,6 +108,18 @@ struct PlaceLogicalTilesPass
                      "evaluations"),
       llvm::cl::init(1)};
 
+  Option<bool> annealingIncrementalMakespan{
+      *this, "annealing-incremental-makespan",
+      llvm::cl::desc(
+          "Reuse the unchanged temporal schedule prefix during annealing"),
+      llvm::cl::init(true)};
+
+  Option<int64_t> annealingMakespanVerifyInterval{
+      *this, "annealing-makespan-verify-interval",
+      llvm::cl::desc("Compare incremental and full makespan every N "
+                     "evaluations; zero disables verification"),
+      llvm::cl::init(0)};
+
   Option<bool> verifyPlacement{
       *this, "verify-placement",
       llvm::cl::desc("Verify the physical logical-tile placement"),
@@ -139,6 +151,8 @@ struct PlaceLogicalTilesPass
     annealingInitialTemperature = pass.annealingInitialTemperature;
     annealingCoolingRate = pass.annealingCoolingRate;
     annealingTraceSampleInterval = pass.annealingTraceSampleInterval;
+    annealingIncrementalMakespan = pass.annealingIncrementalMakespan;
+    annealingMakespanVerifyInterval = pass.annealingMakespanVerifyInterval;
     verifyPlacement = pass.verifyPlacement;
     summaryOutput = pass.summaryOutput;
   }

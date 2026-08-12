@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -34,10 +35,36 @@ class FourWayReductionLinear(torch.nn.Module):
         return self.linear(value)
 
 
+class ThreeWayReductionLinear(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(6, 2, bias=False)
+        initialize_parameters(self)
+
+    def forward(self, value):
+        return self.linear(value)
+
+
 class ElementwiseChain(torch.nn.Module):
     def forward(self, left, right):
         summed = left + right
         return torch.relu(summed)
+
+
+class TransposeSandwich(torch.nn.Module):
+    def forward(self, value):
+        produced = value + 1.0
+        transposed = produced.transpose(0, 1).contiguous()
+        return transposed + 2.0
+
+
+class LayerNormOnly(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(8)
+
+    def forward(self, value):
+        return self.norm(value)
 
 
 def run_pipeline(case: LoweringCase, passes: list[str]) -> str:
@@ -75,6 +102,30 @@ def run_serialized_pipeline(
             f"{result.returncode}:\n{result.stderr}"
         )
     return result.stdout
+
+
+def build_ra_tree_report(module: str) -> dict:
+    report_tool = DEFAULT_SCULPTOR_OPT.parent / "sculptor-ra-tree-report"
+    with tempfile.TemporaryDirectory() as directory:
+        input_path = Path(directory) / "placed.mlir"
+        json_path = Path(directory) / "report.json"
+        html_path = Path(directory) / "report.html"
+        input_path.write_text(module)
+        result = subprocess.run(
+            [
+                str(report_tool),
+                str(input_path),
+                f"--json-output={json_path}",
+                "-o",
+                str(html_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            raise AssertionError(f"RA-tree report failed:\n{result.stderr}")
+        return json.loads(json_path.read_text())
 
 
 def linear_prefix(array_cols: int = 2) -> list[str]:
@@ -166,6 +217,55 @@ class MappingExtensionTest(unittest.TestCase):
         makespan = re.search(r"predictedMakespanNs = ([0-9.eE+-]+)", lowered)
         self.assertIsNotNone(makespan)
         self.assertGreater(float(makespan.group(1)), 0.0)
+
+    def test_incremental_makespan_annealing_matches_full_evaluator(self):
+        prefix = [
+            *linear_prefix(),
+            "--sculptor-build-ra-tree",
+            (
+                "--sculptor-plan-mapping="
+                "strategies=setup-first,recursive-fork-join "
+                "mesh-rows=4 mesh-cols=4 arrays-per-core=4 "
+                "array-rows=8 array-cols=2 "
+                f"cost-profile={COST_PROFILE}"
+            ),
+        ]
+        placement = (
+            "schedule=annealing annealing-initial-schedule=greedy "
+            "annealing-iterations=200 annealing-initial-temperature=0 "
+            "annealing-cooling-rate=0.995 "
+            "annealing-trace-sample-interval=20 random-seed=7 "
+            "objective=makespan network-mode=full timing-scope=warm "
+            "temporal-candidate-limit=4 "
+            "greedy-tile-order=priority greedy-priority-mode=max "
+            "greedy-candidate-scope=frontier greedy-lookahead=2 "
+            "mesh-rows=4 mesh-cols=4 arrays-per-core=4"
+        )
+        full = run_pipeline(
+            self.linear_case,
+            [
+                *prefix,
+                (
+                    "--sculptor-place-logical-tiles="
+                    f"{placement} annealing-incremental-makespan=false"
+                ),
+            ],
+        )
+        incremental = run_pipeline(
+            self.linear_case,
+            [
+                *prefix,
+                (
+                    "--sculptor-place-logical-tiles="
+                    f"{placement} annealing-incremental-makespan=true "
+                    "annealing-makespan-verify-interval=1"
+                ),
+            ],
+        )
+
+        self.assertEqual(incremental, full)
+        self.assertIn("evaluations = 200 : i64", incremental)
+        self.assertIn("logical_tile_annealing_trace", incremental)
 
     def test_default_extension_modes_remain_legacy(self):
         lowered = run_pipeline(
@@ -380,6 +480,158 @@ class MappingExtensionTest(unittest.TestCase):
             any("task_graph.route_output" in ir for ir in materialized)
         )
 
+    def test_communication_aware_tiling_preserves_transpose_shards(self):
+        case = LoweringCase(
+            name="communication_aware_transpose_sandwich",
+            model_factory=TransposeSandwich,
+            input_factory=lambda: (torch.ones(8, 8),),
+            minimum_matrix_setups=0,
+        )
+        dimension_first = run_pipeline(
+            case,
+            [
+                "--sculptor-expand-digital-work="
+                "parallel-workers=4 dataflow=sharded "
+                "tiling-policy=dimension-first",
+                "--sculptor-build-ra-tree",
+            ],
+        )
+        communication_aware = run_pipeline(
+            case,
+            [
+                "--sculptor-expand-digital-work="
+                "parallel-workers=4 dataflow=sharded "
+                "tiling-policy=communication-aware",
+                "--sculptor-build-ra-tree",
+            ],
+        )
+
+        self.assertIn("sculptor.mapping.shard_edge_count = 4", dimension_first)
+        self.assertIn(
+            "sculptor.mapping.assembly_boundary_count = 2", dimension_first
+        )
+        self.assertIn(
+            'sculptor.mapping.digital_tiling_policy = "communication-aware"',
+            communication_aware,
+        )
+        self.assertIn(
+            "sculptor.mapping.shard_edge_count = 8", communication_aware
+        )
+        self.assertIn(
+            "sculptor.mapping.assembly_boundary_count = 1",
+            communication_aware,
+        )
+        exact_edges = set(
+            re.findall(
+                r"#sculptor\.mapping_work_unit_edge<([^>]*)>",
+                communication_aware,
+            )
+        )
+        self.assertEqual(len(exact_edges), 8)
+        self.assertEqual(
+            sum(
+                "sourceOperationId = 0" in edge
+                and "targetOperationId = 1" in edge
+                for edge in exact_edges
+            ),
+            4,
+        )
+        self.assertEqual(
+            sum(
+                "sourceOperationId = 1" in edge
+                and "targetOperationId = 2" in edge
+                for edge in exact_edges
+            ),
+            4,
+        )
+        self.assertIn("resultSizes = [8, 2]", communication_aware)
+        self.assertIn("resultSizes = [2, 8]", communication_aware)
+
+    def test_consumer_bound_fill_colocates_sharded_work_units(self):
+        case = LoweringCase(
+            name="consumer_bound_fill_layer_norm",
+            model_factory=LayerNormOnly,
+            input_factory=lambda: (torch.ones(1, 4, 8),),
+            minimum_matrix_setups=0,
+        )
+        placed = run_pipeline(
+            case,
+            [
+                "--sculptor-canonicalize-layers",
+                "--sculptor-extract-layers",
+                "--sculptor-convert-layers",
+                (
+                    "--sculptor-expand-digital-work="
+                    "parallel-workers=4 dataflow=sharded "
+                    "shard-propagation-depth=0 "
+                    "require-complete-shard-chain=false"
+                ),
+                "--sculptor-build-ra-tree",
+                (
+                    "--sculptor-plan-mapping="
+                    "strategies=recursive-fork-join,consumer-bound-fill "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4 "
+                    "array-rows=8 array-cols=2"
+                ),
+                (
+                    "--sculptor-place-logical-tiles="
+                    "schedule=greedy mesh-rows=4 mesh-cols=4 "
+                    "arrays-per-core=4"
+                ),
+            ],
+        )
+        report = build_ra_tree_report(placed)["functions"][0]
+        operations = {
+            operation["id"]: operation
+            for operation in report["operations"]
+        }
+        nodes = {node["id"]: node for node in report["tree"]["nodes"]}
+        work_units = {unit["id"]: unit for unit in report["tree"]["work_units"]}
+        assignments = {
+            (
+                assignment["operation_id"],
+                nodes[assignment["leaf_id"]]["work_unit_id"],
+            ): assignment
+            for assignment in report["plan"]["realization"]["leaf_assignments"]
+        }
+        consumers = {}
+        for edge in report["edges"]:
+            consumers.setdefault(edge["source"], set()).add(edge["target"])
+
+        eligible_fill_ids = [
+            operation_id
+            for operation_id, operation in operations.items()
+            if operation["name"] == "linalg.fill"
+            and len(consumers.get(operation_id, set())) == 1
+        ]
+        self.assertEqual(len(eligible_fill_ids), 1)
+        for fill_id in eligible_fill_ids:
+            consumer_id = next(iter(consumers[fill_id]))
+            fill_units = [
+                unit
+                for unit in work_units.values()
+                if unit["operation_id"] == fill_id
+            ]
+            consumer_units = [
+                unit
+                for unit in work_units.values()
+                if unit["operation_id"] == consumer_id
+            ]
+            self.assertEqual(len(fill_units), 4)
+            self.assertEqual(len(consumer_units), 4)
+            for fill_unit in fill_units:
+                matching_consumers = [
+                    unit for unit in consumer_units
+                    if unit["result_offsets"] == fill_unit["result_offsets"]
+                    and unit["result_sizes"] == fill_unit["result_sizes"]
+                ]
+                self.assertEqual(len(matching_consumers), 1)
+                consumer_unit = matching_consumers[0]
+                self.assertEqual(
+                    assignments[(fill_id, fill_unit["id"])]["tile_id"],
+                    assignments[(consumer_id, consumer_unit["id"])]["tile_id"],
+                )
+
     def test_balanced_reduction_tree_reaches_outlined_routines(self):
         lowered = run_pipeline(
             self.linear_case,
@@ -422,6 +674,82 @@ class MappingExtensionTest(unittest.TestCase):
         materialized = materialize_outlined_tiles(lowered)
         self.assertTrue(
             any('task_kind = "digital.reduction"' in ir for ir in materialized)
+        )
+
+    def test_packed_balanced_reduction_keeps_ready_mvm_bodies_parallel(self):
+        case = LoweringCase(
+            name="packed_three_way_reduction",
+            model_factory=ThreeWayReductionLinear,
+            input_factory=lambda: (torch.ones(1, 6),),
+            array_rows=8,
+            array_cols=2,
+        )
+        placed = run_pipeline(
+            case,
+            [
+                *linear_prefix(array_cols=2),
+                (
+                    "--sculptor-expand-digital-work="
+                    "parallel-workers=1 reduction-tree=balanced "
+                    "reduction-fan-in=2 reduction-min-width=3"
+                ),
+                "--sculptor-build-ra-tree",
+                (
+                    "--sculptor-plan-mapping="
+                    "strategies=setup-first,recursive-fork-join "
+                    "mvm-body-policy=packed "
+                    "mesh-rows=4 mesh-cols=4 arrays-per-core=4 "
+                    "array-rows=8 array-cols=2"
+                ),
+                (
+                    "--sculptor-place-logical-tiles="
+                    "schedule=greedy mesh-rows=4 mesh-cols=4 "
+                    "arrays-per-core=4"
+                ),
+            ],
+        )
+        report = build_ra_tree_report(placed)["functions"][0]
+        nodes_by_id = {node["id"]: node for node in report["tree"]["nodes"]}
+        vector_ids = [
+            operation["id"]
+            for operation in report["operations"]
+            if operation["kind"] == "vector_tile"
+        ]
+        mvm_ids = [
+            operation["id"]
+            for operation in report["operations"]
+            if operation["kind"] == "physical_mvm"
+        ]
+        self.assertEqual(len(vector_ids), 3)
+        self.assertEqual(len(mvm_ids), 3)
+
+        leaves_by_operation = {
+            node["operation_id"]: node
+            for node in nodes_by_id.values()
+            if node["kind"] == "leaf" and node["operation_id"] in vector_ids
+        }
+        body_roots = [
+            nodes_by_id[leaves_by_operation[operation_id]["parent_id"]]
+            for operation_id in vector_ids
+        ]
+        cohort_ids = {body["parent_id"] for body in body_roots}
+        self.assertEqual(len(cohort_ids), 1)
+        cohort = nodes_by_id[next(iter(cohort_ids))]
+        self.assertEqual(cohort["kind"], "spatial_cut")
+
+        assignments = {
+            assignment["operation_id"]: assignment
+            for assignment in report["plan"]["realization"]["leaf_assignments"]
+            if assignment["operation_id"] in vector_ids + mvm_ids
+        }
+        self.assertEqual(len(assignments), 6)
+        self.assertEqual(
+            {assignments[operation_id]["start_ns"] for operation_id in vector_ids},
+            {assignments[vector_ids[0]]["start_ns"]},
+        )
+        self.assertEqual(
+            {assignments[operation_id]["start_ns"] for operation_id in mvm_ids},
+            {assignments[mvm_ids[0]]["start_ns"]},
         )
 
 

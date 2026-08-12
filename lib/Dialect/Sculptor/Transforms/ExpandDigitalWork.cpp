@@ -5,11 +5,17 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ShardDataflow.h"
 
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Pass/PassRegistry.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/CheckedArithmetic.h"
+
 #include <algorithm>
+#include <limits>
 #include <optional>
 
 namespace {
@@ -17,6 +23,51 @@ namespace {
 using namespace mlir;
 using namespace mlir::sculptor;
 using namespace mlir::sculptor::mapping;
+
+constexpr StringLiteral kDigitalTilingPolicyAttrName =
+    "sculptor.mapping.digital_tiling_policy";
+
+enum class DigitalTilingPolicy { DimensionFirst, CommunicationAware };
+
+struct WorkUnitSpec {
+  SmallVector<int64_t> resultOffsets;
+  SmallVector<int64_t> resultSizes;
+  SmallVector<int64_t> iterationOffsets;
+  SmallVector<int64_t> iterationSizes;
+};
+
+struct WorkUnitCandidate {
+  SmallVector<int64_t> factors;
+  SmallVector<WorkUnitSpec> units;
+};
+
+struct CandidateCommunicationEdge {
+  int64_t producerId = -1;
+  int64_t consumerId = -1;
+  unsigned operandNumber = 0;
+  int64_t byteSize = 1;
+  AffineMap consumerOperandMap;
+};
+
+FailureOr<DigitalTilingPolicy> parseDigitalTilingPolicy(StringRef value,
+                                                        Operation *anchor) {
+  if (value == "dimension-first")
+    return DigitalTilingPolicy::DimensionFirst;
+  if (value == "communication-aware")
+    return DigitalTilingPolicy::CommunicationAware;
+  anchor->emitError("unknown digital tiling policy '") << value << "'";
+  return failure();
+}
+
+StringRef stringifyDigitalTilingPolicy(DigitalTilingPolicy policy) {
+  switch (policy) {
+  case DigitalTilingPolicy::DimensionFirst:
+    return "dimension-first";
+  case DigitalTilingPolicy::CommunicationAware:
+    return "communication-aware";
+  }
+  llvm_unreachable("unknown digital tiling policy");
+}
 
 void chooseWorkerFactors(ArrayRef<ComputeIterationDimension> domain,
                          int64_t parallelWorkers, size_t dimension,
@@ -49,6 +100,31 @@ void chooseWorkerFactors(ArrayRef<ComputeIterationDimension> domain,
   }
 }
 
+void enumerateExactWorkerFactors(
+    ArrayRef<ComputeIterationDimension> domain, int64_t remainingWorkers,
+    size_t dimension, SmallVectorImpl<int64_t> &current,
+    SmallVectorImpl<SmallVector<int64_t>> &results) {
+  if (dimension == domain.size()) {
+    if (remainingWorkers == 1)
+      results.emplace_back(current.begin(), current.end());
+    return;
+  }
+
+  const ComputeIterationDimension &loop = domain[dimension];
+  int64_t maximumFactor = 1;
+  if (loop.kind == ComputeIteratorKind::Parallel &&
+      !ShapedType::isDynamic(loop.staticExtent) && loop.staticExtent > 1)
+    maximumFactor = std::min(loop.staticExtent, remainingWorkers);
+
+  for (int64_t factor = maximumFactor; factor >= 1; --factor) {
+    if (remainingWorkers % factor != 0)
+      continue;
+    current[dimension] = factor;
+    enumerateExactWorkerFactors(domain, remainingWorkers / factor,
+                                dimension + 1, current, results);
+  }
+}
+
 std::optional<int64_t> getStaticValue(OpFoldResult value) {
   return getConstantIntValue(value);
 }
@@ -65,15 +141,12 @@ void dissolveDigitalMappingStages(func::FuncOp function) {
   });
 }
 
-FailureOr<SmallVector<MappingWorkUnitAttr>>
-buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
-               int64_t &nextWorkUnitId, OpBuilder &builder) {
-  SmallVector<MappingWorkUnitAttr> result;
+bool isExpandableDigitalOperation(const ComputeOperation &operation) {
   if (operation.kind != ComputeOperationKind::Structured ||
       operation.requiredLane.value_or(LogicalLaneKind::Digital) !=
           LogicalLaneKind::Digital ||
       operation.mvmWaveId || operation.operation->getNumResults() != 1)
-    return result;
+    return false;
 
   auto resultType =
       dyn_cast<RankedTensorType>(operation.operation->getResult(0).getType());
@@ -85,18 +158,30 @@ buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
                      return ShapedType::isDynamic(dimension.staticExtent) ||
                             dimension.staticExtent <= 0;
                    }))
-    return result;
+    return false;
+  return true;
+}
 
-  SmallVector<int64_t> current(operation.iterationDomain.size(), 1);
-  SmallVector<int64_t> factors(operation.iterationDomain.size(), 1);
+std::optional<WorkUnitCandidate>
+buildWorkUnitCandidate(const ComputeOperation &operation,
+                       ArrayRef<int64_t> factors, OpBuilder &builder) {
+  auto resultType =
+      cast<RankedTensorType>(operation.operation->getResult(0).getType());
+  auto tiling = cast<TilingInterface>(operation.operation);
   int64_t workerCount = 1;
-  chooseWorkerFactors(operation.iterationDomain, parallelWorkers,
-                      /*dimension=*/0, /*currentProduct=*/1, current, factors,
-                      workerCount);
+  for (int64_t factor : factors) {
+    std::optional<int64_t> next = llvm::checkedMul(workerCount, factor);
+    if (!next)
+      return std::nullopt;
+    workerCount = *next;
+  }
   if (workerCount < 2)
-    return result;
+    return std::nullopt;
 
-  SmallVector<int64_t> coordinates(operation.iterationDomain.size(), 0);
+  WorkUnitCandidate candidate;
+  candidate.factors.assign(factors.begin(), factors.end());
+
+  SmallVector<int64_t> coordinates(factors.size(), 0);
   for (int64_t worker = 0; worker < workerCount; ++worker) {
     int64_t linear = worker;
     for (int64_t dimension = static_cast<int64_t>(factors.size()) - 1;
@@ -129,34 +214,252 @@ buildWorkUnits(const ComputeOperation &operation, int64_t parallelWorkers,
     if (failed(tiling.getResultTilePosition(
             builder, /*resultNumber=*/0, foldedOffsets, foldedSizes,
             foldedResultOffsets, foldedResultSizes)))
-      return SmallVector<MappingWorkUnitAttr>{};
+      return std::nullopt;
 
-    SmallVector<int64_t> resultOffsets;
-    SmallVector<int64_t> resultSizes;
+    WorkUnitSpec unit;
+    unit.iterationOffsets = std::move(iterationOffsets);
+    unit.iterationSizes = std::move(iterationSizes);
     for (OpFoldResult value : foldedResultOffsets) {
       std::optional<int64_t> constant = getStaticValue(value);
       if (!constant)
-        return SmallVector<MappingWorkUnitAttr>{};
-      resultOffsets.push_back(*constant);
+        return std::nullopt;
+      unit.resultOffsets.push_back(*constant);
     }
     for (OpFoldResult value : foldedResultSizes) {
       std::optional<int64_t> constant = getStaticValue(value);
       if (!constant || *constant <= 0)
-        return SmallVector<MappingWorkUnitAttr>{};
-      resultSizes.push_back(*constant);
+        return std::nullopt;
+      unit.resultSizes.push_back(*constant);
     }
-    if (resultOffsets.size() != static_cast<size_t>(resultType.getRank()) ||
-        resultSizes.size() != static_cast<size_t>(resultType.getRank()))
-      return SmallVector<MappingWorkUnitAttr>{};
+    if (unit.resultOffsets.size() !=
+            static_cast<size_t>(resultType.getRank()) ||
+        unit.resultSizes.size() != static_cast<size_t>(resultType.getRank()))
+      return std::nullopt;
+    candidate.units.push_back(std::move(unit));
+  }
+  return candidate;
+}
 
+SmallVector<WorkUnitCandidate, 0>
+buildWorkUnitCandidates(const ComputeOperation &operation,
+                        int64_t parallelWorkers, DigitalTilingPolicy policy,
+                        OpBuilder &builder) {
+  SmallVector<WorkUnitCandidate, 0> result;
+  if (!isExpandableDigitalOperation(operation))
+    return result;
+
+  SmallVector<SmallVector<int64_t>> factorVectors;
+  SmallVector<int64_t> current(operation.iterationDomain.size(), 1);
+  if (policy == DigitalTilingPolicy::DimensionFirst) {
+    SmallVector<int64_t> factors(operation.iterationDomain.size(), 1);
+    int64_t workerCount = 1;
+    chooseWorkerFactors(operation.iterationDomain, parallelWorkers,
+                        /*dimension=*/0, /*currentProduct=*/1, current, factors,
+                        workerCount);
+    if (workerCount >= 2)
+      factorVectors.push_back(std::move(factors));
+  } else {
+    enumerateExactWorkerFactors(operation.iterationDomain, parallelWorkers,
+                                /*dimension=*/0, current, factorVectors);
+  }
+
+  for (const SmallVector<int64_t> &factors : factorVectors) {
+    std::optional<WorkUnitCandidate> candidate =
+        buildWorkUnitCandidate(operation, factors, builder);
+    if (candidate)
+      result.push_back(std::move(*candidate));
+  }
+  return result;
+}
+
+std::optional<int64_t> getStaticTensorByteSize(Type type) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor || !tensor.hasStaticShape())
+    return std::nullopt;
+  unsigned bitWidth = tensor.getElementTypeBitWidth();
+  if (bitWidth == 0 || bitWidth % 8 != 0)
+    return std::nullopt;
+  std::optional<int64_t> bytes = llvm::checkedMul(
+      tensor.getNumElements(), static_cast<int64_t>(bitWidth / 8));
+  return bytes;
+}
+
+bool candidatePairHasOneToOneShards(const WorkUnitCandidate &producer,
+                                    const WorkUnitCandidate &consumer,
+                                    AffineMap consumerOperandMap) {
+  if (producer.units.size() != consumer.units.size())
+    return false;
+  SmallVector<bool> matchedConsumers(consumer.units.size(), false);
+  for (const WorkUnitSpec &source : producer.units) {
+    std::optional<size_t> matchingConsumer;
+    for (auto [consumerIndex, target] : llvm::enumerate(consumer.units)) {
+      if (matchedConsumers[consumerIndex])
+        continue;
+      std::optional<StaticTileRegion> inputRegion =
+          mapIterationTileThroughIndexingMap(consumerOperandMap,
+                                             target.iterationOffsets,
+                                             target.iterationSizes);
+      if (!inputRegion || inputRegion->offsets != source.resultOffsets ||
+          inputRegion->sizes != source.resultSizes)
+        continue;
+      if (matchingConsumer)
+        return false;
+      matchingConsumer = consumerIndex;
+    }
+    if (!matchingConsumer)
+      return false;
+    matchedConsumers[*matchingConsumer] = true;
+  }
+  return llvm::all_of(matchedConsumers, [](bool matched) { return matched; });
+}
+
+SmallVector<CandidateCommunicationEdge> buildCandidateCommunicationEdges(
+    const ComputeGraph &graph,
+    const DenseMap<int64_t, SmallVector<WorkUnitCandidate, 0>> &candidates) {
+  DenseMap<Operation *, int64_t> operationIds;
+  for (const ComputeOperation &operation : graph.operations) {
+    operationIds[operation.operation] = operation.id;
+    for (Operation *member : operation.members)
+      operationIds[member] = operation.id;
+  }
+
+  DenseMap<int64_t, llvm::DenseSet<int64_t>> producersByConsumer;
+  for (int64_t producerId : graph.topologicalOrder) {
+    if (!candidates.contains(producerId))
+      continue;
+    const ComputeOperation &producer = graph.operations[producerId];
+    if (producer.operation->getNumResults() != 1)
+      continue;
+    for (OpOperand &use : producer.operation->getResult(0).getUses()) {
+      auto consumerId = operationIds.find(use.getOwner());
+      if (consumerId != operationIds.end() &&
+          candidates.contains(consumerId->second))
+        producersByConsumer[consumerId->second].insert(producerId);
+    }
+  }
+
+  SmallVector<CandidateCommunicationEdge> edges;
+  for (int64_t producerId : graph.topologicalOrder) {
+    auto producerCandidates = candidates.find(producerId);
+    if (producerCandidates == candidates.end())
+      continue;
+    const ComputeOperation &producer = graph.operations[producerId];
+    if (producer.operation->getNumResults() != 1)
+      continue;
+    std::optional<int64_t> byteSize =
+        getStaticTensorByteSize(producer.operation->getResult(0).getType());
+    if (!byteSize)
+      continue;
+    for (OpOperand &use : producer.operation->getResult(0).getUses()) {
+      auto consumerId = operationIds.find(use.getOwner());
+      if (consumerId == operationIds.end() ||
+          !candidates.contains(consumerId->second) ||
+          producersByConsumer.lookup(consumerId->second).size() != 1)
+        continue;
+      auto consumer = dyn_cast<linalg::LinalgOp>(use.getOwner());
+      if (!consumer || consumer->getNumResults() != 1 ||
+          llvm::any_of(cast<TilingInterface>(consumer.getOperation())
+                           .getLoopIteratorTypes(),
+                       [](utils::IteratorType iterator) {
+                         return iterator != utils::IteratorType::parallel;
+                       }))
+        continue;
+      edges.push_back({producerId, consumerId->second, use.getOperandNumber(),
+                       *byteSize, consumer.getMatchingIndexingMap(&use)});
+    }
+  }
+  return edges;
+}
+
+uint64_t getCommunicationPenalty(
+    ArrayRef<CandidateCommunicationEdge> edges,
+    const DenseMap<int64_t, SmallVector<WorkUnitCandidate, 0>> &candidates,
+    const DenseMap<int64_t, size_t> &selection) {
+  uint64_t penalty = 0;
+  for (const CandidateCommunicationEdge &edge : edges) {
+    const WorkUnitCandidate &producer =
+        candidates.find(edge.producerId)
+            ->second[selection.lookup(edge.producerId)];
+    const WorkUnitCandidate &consumer =
+        candidates.find(edge.consumerId)
+            ->second[selection.lookup(edge.consumerId)];
+    if (candidatePairHasOneToOneShards(producer, consumer,
+                                       edge.consumerOperandMap))
+      continue;
+    uint64_t edgePenalty =
+        static_cast<uint64_t>(std::max<int64_t>(edge.byteSize, 1));
+    if (std::numeric_limits<uint64_t>::max() - penalty < edgePenalty)
+      return std::numeric_limits<uint64_t>::max();
+    penalty += edgePenalty;
+  }
+  return penalty;
+}
+
+DenseMap<int64_t, size_t> selectCommunicationAwareCandidates(
+    const ComputeGraph &graph,
+    const DenseMap<int64_t, SmallVector<WorkUnitCandidate, 0>> &candidates) {
+  DenseMap<int64_t, size_t> selection;
+  for (const auto &entry : candidates)
+    selection[entry.first] = 0;
+  SmallVector<CandidateCommunicationEdge> edges =
+      buildCandidateCommunicationEdges(graph, candidates);
+
+  SmallVector<int64_t> forwardOrder;
+  for (int64_t operationId : graph.topologicalOrder)
+    if (candidates.contains(operationId))
+      forwardOrder.push_back(operationId);
+  SmallVector<int64_t> reverseOrder(forwardOrder.rbegin(), forwardOrder.rend());
+
+  auto refine = [&](ArrayRef<int64_t> order) {
+    bool changed = false;
+    for (int64_t operationId : order) {
+      size_t original = selection.lookup(operationId);
+      size_t best = original;
+      uint64_t bestPenalty =
+          getCommunicationPenalty(edges, candidates, selection);
+      for (size_t candidate = 0;
+           candidate < candidates.find(operationId)->second.size();
+           ++candidate) {
+        selection[operationId] = candidate;
+        uint64_t candidatePenalty =
+            getCommunicationPenalty(edges, candidates, selection);
+        if (candidatePenalty < bestPenalty) {
+          bestPenalty = candidatePenalty;
+          best = candidate;
+        }
+      }
+      selection[operationId] = best;
+      changed |= best != original;
+    }
+    return changed;
+  };
+
+  for (size_t iteration = 0;
+       iteration < std::max<size_t>(1, candidates.size() * 2); ++iteration) {
+    bool changed = refine(forwardOrder);
+    changed |= refine(reverseOrder);
+    if (!changed)
+      break;
+  }
+  return selection;
+}
+
+SmallVector<MappingWorkUnitAttr>
+materializeWorkUnits(const ComputeOperation &operation,
+                     const WorkUnitCandidate &candidate,
+                     int64_t &nextWorkUnitId, OpBuilder &builder) {
+  SmallVector<MappingWorkUnitAttr> result;
+  result.reserve(candidate.units.size());
+  for (const WorkUnitSpec &unit : candidate.units) {
     result.push_back(MappingWorkUnitAttr::get(
         builder.getContext(), builder.getI64IntegerAttr(nextWorkUnitId++),
         builder.getI64IntegerAttr(operation.id), builder.getI64IntegerAttr(0),
-        builder.getI64ArrayAttr(resultOffsets),
-        builder.getI64ArrayAttr(resultSizes),
-        builder.getI64ArrayAttr(iterationOffsets),
-        builder.getI64ArrayAttr(iterationSizes), builder.getI64IntegerAttr(-1),
-        builder.getI64IntegerAttr(-1), builder.getI64IntegerAttr(-1)));
+        builder.getI64ArrayAttr(unit.resultOffsets),
+        builder.getI64ArrayAttr(unit.resultSizes),
+        builder.getI64ArrayAttr(unit.iterationOffsets),
+        builder.getI64ArrayAttr(unit.iterationSizes),
+        builder.getI64IntegerAttr(-1), builder.getI64IntegerAttr(-1),
+        builder.getI64IntegerAttr(-1)));
   }
   return result;
 }
@@ -179,6 +482,11 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
       dataflow(*this, "dataflow",
                llvm::cl::desc("Digital dataflow mode: bulk or sharded"),
                llvm::cl::init("bulk")),
+      tilingPolicy(
+          *this, "tiling-policy",
+          llvm::cl::desc(
+              "Digital tiling policy: dimension-first or communication-aware"),
+          llvm::cl::init("dimension-first")),
       shardPropagationDepth(
           *this, "shard-propagation-depth",
           llvm::cl::desc("Maximum shard propagation depth; zero is unbounded"),
@@ -203,6 +511,7 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
   parallelWorkers = pass.parallelWorkers;
   requireChange = pass.requireChange;
   dataflow = pass.dataflow;
+  tilingPolicy = pass.tilingPolicy;
   shardPropagationDepth = pass.shardPropagationDepth;
   requireCompleteShardChain = pass.requireCompleteShardChain;
   reductionTree = pass.reductionTree;
@@ -219,10 +528,12 @@ void ExpandDigitalWorkPass::runOnOperation() {
   }
   FailureOr<mapping::DigitalDataflowMode> parsedDataflow =
       mapping::parseDigitalDataflowMode(dataflow, module);
+  FailureOr<DigitalTilingPolicy> parsedTilingPolicy =
+      parseDigitalTilingPolicy(tilingPolicy, module);
   FailureOr<mapping::ReductionTreePolicy> parsedReductionTree =
       mapping::parseReductionTreePolicy(reductionTree, module);
-  if (failed(parsedDataflow) || failed(parsedReductionTree) ||
-      shardPropagationDepth < 0) {
+  if (failed(parsedDataflow) || failed(parsedTilingPolicy) ||
+      failed(parsedReductionTree) || shardPropagationDepth < 0) {
     if (succeeded(parsedDataflow))
       module.emitError("shard-propagation-depth must be nonnegative");
     signalPassFailure();
@@ -249,6 +560,7 @@ void ExpandDigitalWorkPass::runOnOperation() {
     function->removeAttr("sculptor.mapping.digital_parallel_workers");
     function->removeAttr("sculptor.mapping.expanded_digital_operation_count");
     function->removeAttr("sculptor.mapping.expanded_digital_work_unit_count");
+    function->removeAttr(kDigitalTilingPolicyAttrName);
     function->removeAttr(mapping::kShardWorkUnitEdgesAttrName);
 
     FailureOr<int64_t> functionReductionTrees = mapping::buildReductionTrees(
@@ -282,23 +594,38 @@ void ExpandDigitalWorkPass::runOnOperation() {
       return;
     }
 
+    DenseMap<int64_t, SmallVector<WorkUnitCandidate, 0>> candidates;
+    for (const mapping::ComputeOperation &operation : graph->operations) {
+      SmallVector<WorkUnitCandidate, 0> operationCandidates =
+          buildWorkUnitCandidates(operation, parallelWorkers,
+                                  *parsedTilingPolicy, builder);
+      if (!operationCandidates.empty())
+        candidates[operation.id] = std::move(operationCandidates);
+    }
+    DenseMap<int64_t, size_t> selection;
+    if (*parsedTilingPolicy == DigitalTilingPolicy::CommunicationAware)
+      selection = selectCommunicationAwareCandidates(*graph, candidates);
+    else
+      for (const auto &entry : candidates)
+        selection[entry.first] = 0;
+
     int64_t nextWorkUnitId = 0;
     int64_t functionOperations = 0;
     int64_t functionWorkUnits = 0;
-    for (const mapping::ComputeOperation &operation : graph->operations) {
-      FailureOr<SmallVector<MappingWorkUnitAttr>> workUnits =
-          buildWorkUnits(operation, parallelWorkers, nextWorkUnitId, builder);
-      if (failed(workUnits)) {
-        signalPassFailure();
-        return;
-      }
-      if (workUnits->empty())
+    for (int64_t operationId : graph->topologicalOrder) {
+      auto found = candidates.find(operationId);
+      if (found == candidates.end())
         continue;
-      SmallVector<Attribute> attributes(workUnits->begin(), workUnits->end());
+      const mapping::ComputeOperation &operation =
+          graph->operations[operationId];
+      SmallVector<MappingWorkUnitAttr> workUnits = materializeWorkUnits(
+          operation, found->second[selection.lookup(operationId)],
+          nextWorkUnitId, builder);
+      SmallVector<Attribute> attributes(workUnits.begin(), workUnits.end());
       operation.operation->setAttr(mapping::kExpandedDigitalWorkAttrName,
                                    builder.getArrayAttr(attributes));
       ++functionOperations;
-      functionWorkUnits += static_cast<int64_t>(workUnits->size());
+      functionWorkUnits += static_cast<int64_t>(workUnits.size());
     }
 
     if (functionOperations > 0) {
@@ -309,6 +636,9 @@ void ExpandDigitalWorkPass::runOnOperation() {
       function->setAttr("sculptor.mapping.expanded_digital_work_unit_count",
                         builder.getI64IntegerAttr(functionWorkUnits));
     }
+    function->setAttr(kDigitalTilingPolicyAttrName,
+                      builder.getStringAttr(
+                          stringifyDigitalTilingPolicy(*parsedTilingPolicy)));
     if (failed(mapping::planShardDataflow(function, *graph, *parsedDataflow,
                                           shardPropagationDepth,
                                           requireCompleteShardChain))) {
@@ -357,6 +687,9 @@ void ExpandDigitalWorkPass::runOnOperation() {
   module->setAttr("sculptor.mapping.maximum_reduction_fan_in",
                   IntegerAttr::get(IntegerType::get(&getContext(), 64),
                                    maximumReductionFanIn));
+  module->setAttr(kDigitalTilingPolicyAttrName,
+                  StringAttr::get(&getContext(), stringifyDigitalTilingPolicy(
+                                                     *parsedTilingPolicy)));
   module->setAttr(
       mapping::kShardDataflowModeAttrName,
       StringAttr::get(&getContext(),

@@ -9,6 +9,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <memory>
 
 namespace mlir {
 namespace sculptor {
@@ -35,6 +36,37 @@ struct TemporalPlacementEvaluation {
   double maximumTileLoadNs = 0.0;
   int64_t maximumDirectedLinkWords = 0;
   SmallVector<int64_t> criticalEventIds;
+};
+
+class IncrementalTemporalPlacementEvaluator {
+public:
+  static FailureOr<std::unique_ptr<IncrementalTemporalPlacementEvaluator>>
+  create(const LogicalTilePlacementProblem &problem,
+         ArrayRef<int64_t> initialPlacement);
+
+  ~IncrementalTemporalPlacementEvaluator();
+  IncrementalTemporalPlacementEvaluator(
+      IncrementalTemporalPlacementEvaluator &&) noexcept;
+  IncrementalTemporalPlacementEvaluator &
+  operator=(IncrementalTemporalPlacementEvaluator &&) noexcept;
+
+  const TemporalPlacementEvaluation &getCurrentEvaluation() const;
+
+  FailureOr<TemporalPlacementEvaluation>
+  evaluateCandidate(ArrayRef<int64_t> placement,
+                    ArrayRef<unsigned> changedLogicalTileIndices);
+
+  void commitCandidate();
+  void discardCandidate();
+
+  FailureOr<TemporalPlacementEvaluation>
+  evaluateFromScratch(ArrayRef<int64_t> placement) const;
+
+private:
+  struct Impl;
+  explicit IncrementalTemporalPlacementEvaluator(std::unique_ptr<Impl> impl);
+
+  std::unique_ptr<Impl> impl;
 };
 
 FailureOr<TemporalPlacementEvaluation>

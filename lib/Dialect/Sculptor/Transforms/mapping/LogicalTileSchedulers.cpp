@@ -1,4 +1,5 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/TemporalPlacementModel.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/CheckedArithmetic.h"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -542,14 +544,44 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
                             config.randomSeed, config.greedy);
   if (failed(initial))
     return failure();
-  FailureOr<int64_t> initialScore =
-      scorePlacementObjective(problem, initial->physicalTiles);
-  if (failed(initialScore))
-    return failure();
+
+  auto scoreTemporalEvaluation =
+      [&](const TemporalPlacementEvaluation &value) -> FailureOr<int64_t> {
+    if (!std::isfinite(value.makespanNs) || value.makespanNs < 0.0 ||
+        value.makespanNs >
+            static_cast<double>(std::numeric_limits<int64_t>::max())) {
+      problem.anchor->emitError("temporal placement makespan is out of range");
+      return failure();
+    }
+    return static_cast<int64_t>(std::ceil(value.makespanNs));
+  };
+
+  std::unique_ptr<IncrementalTemporalPlacementEvaluator> temporalEvaluator;
+  int64_t initialScore = 0;
+  if (problem.objective == PlacementObjectiveKind::Makespan &&
+      config.annealingIncrementalMakespan) {
+    FailureOr<std::unique_ptr<IncrementalTemporalPlacementEvaluator>> created =
+        IncrementalTemporalPlacementEvaluator::create(problem,
+                                                      initial->physicalTiles);
+    if (failed(created))
+      return failure();
+    temporalEvaluator = std::move(*created);
+    FailureOr<int64_t> score =
+        scoreTemporalEvaluation(temporalEvaluator->getCurrentEvaluation());
+    if (failed(score))
+      return failure();
+    initialScore = *score;
+  } else {
+    FailureOr<int64_t> score =
+        scorePlacementObjective(problem, initial->physicalTiles);
+    if (failed(score))
+      return failure();
+    initialScore = *score;
+  }
 
   SmallVector<int64_t> current = initial->physicalTiles;
   SmallVector<int64_t> best = current;
-  int64_t currentScore = *initialScore;
+  int64_t currentScore = initialScore;
   int64_t bestScore = currentScore;
   LogicalTileAnnealingTrace trace;
   trace.initialScore = currentScore;
@@ -573,6 +605,7 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
   for (int64_t iteration = 0; iteration < config.annealingIterations;
        ++iteration) {
     SmallVector<int64_t> candidate = current;
+    SmallVector<unsigned, 2> changedLogicalTiles;
     bool useRelocation = *capacity > static_cast<int64_t>(candidate.size()) &&
                          probability(engine) < 0.30;
     if (useRelocation) {
@@ -589,33 +622,83 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
       if (replacement < 0)
         continue;
       candidate[tile] = replacement;
+      changedLogicalTiles.push_back(tile);
     } else {
       size_t first = tileDistribution(engine);
       size_t second = tileDistribution(engine);
       if (first == second)
         second = (second + 1) % candidate.size();
       std::swap(candidate[first], candidate[second]);
+      changedLogicalTiles.push_back(first);
+      if (second != first)
+        changedLogicalTiles.push_back(second);
     }
 
-    FailureOr<int64_t> candidateScore =
-        scorePlacementObjective(problem, candidate);
-    if (failed(candidateScore))
-      return failure();
+    int64_t candidateScore = 0;
+    if (temporalEvaluator) {
+      FailureOr<TemporalPlacementEvaluation> incremental =
+          temporalEvaluator->evaluateCandidate(candidate, changedLogicalTiles);
+      if (failed(incremental))
+        return failure();
+      FailureOr<int64_t> score = scoreTemporalEvaluation(*incremental);
+      if (failed(score))
+        return failure();
+      candidateScore = *score;
+
+      int64_t verifyInterval = config.annealingMakespanVerifyInterval;
+      if (verifyInterval > 0 && (evaluations + 1) % verifyInterval == 0) {
+        FailureOr<TemporalPlacementEvaluation> full =
+            temporalEvaluator->evaluateFromScratch(candidate);
+        if (failed(full))
+          return failure();
+        FailureOr<int64_t> fullScore = scoreTemporalEvaluation(*full);
+        if (failed(fullScore))
+          return failure();
+        bool mismatch =
+            candidateScore != *fullScore ||
+            incremental->makespanNs != full->makespanNs ||
+            incremental->exposedTransportNs != full->exposedTransportNs ||
+            incremental->exposedContentionNs != full->exposedContentionNs ||
+            incremental->maximumTileLoadNs != full->maximumTileLoadNs ||
+            incremental->taskTimeOnCriticalChainNs !=
+                full->taskTimeOnCriticalChainNs ||
+            incremental->maximumDirectedLinkWords !=
+                full->maximumDirectedLinkWords ||
+            incremental->criticalEventIds != full->criticalEventIds;
+        if (mismatch) {
+          problem.anchor->emitError(
+              "incremental temporal placement evaluation diverged from the "
+              "full evaluator")
+              << ": incremental makespan " << incremental->makespanNs
+              << " ns, full makespan " << full->makespanNs << " ns";
+          return failure();
+        }
+      }
+    } else {
+      FailureOr<int64_t> score = scorePlacementObjective(problem, candidate);
+      if (failed(score))
+        return failure();
+      candidateScore = *score;
+    }
     ++evaluations;
-    int64_t delta = *candidateScore - currentScore;
+    int64_t delta = candidateScore - currentScore;
     bool accept = delta <= 0;
     if (!accept && temperature > 0.0)
       accept = probability(engine) <
                std::exp(-static_cast<double>(delta) / temperature);
     if (accept) {
       current = std::move(candidate);
-      currentScore = *candidateScore;
+      currentScore = candidateScore;
+      if (temporalEvaluator)
+        temporalEvaluator->commitCandidate();
+    } else if (temporalEvaluator) {
+      temporalEvaluator->discardCandidate();
     }
     if (currentScore < bestScore) {
       best = current;
       bestScore = currentScore;
     }
-    lastCandidateScore = *candidateScore;
+    lastCandidateScore = candidateScore;
     lastAccepted = accept;
     if (evaluations % config.annealingTraceSampleInterval == 0) {
       trace.samples.push_back({evaluations, lastCandidateScore, currentScore,
@@ -629,7 +712,7 @@ runAnnealing(const LogicalTilePlacementProblem &problem,
   }
   trace.finalScore = bestScore;
   trace.evaluations = evaluations;
-  return PlacementSearchResult{std::move(best), *initialScore, evaluations,
+  return PlacementSearchResult{std::move(best), initialScore, evaluations,
                                std::move(trace)};
 }
 
@@ -651,7 +734,8 @@ scheduleLogicalTiles(const LogicalTilePlacementProblem &problem,
   if (config.annealingIterations < 0 ||
       config.annealingInitialTemperature < 0.0 ||
       config.annealingCoolingRate <= 0.0 || config.annealingCoolingRate > 1.0 ||
-      config.annealingTraceSampleInterval <= 0) {
+      config.annealingTraceSampleInterval <= 0 ||
+      config.annealingMakespanVerifyInterval < 0) {
     problem.anchor->emitError("invalid logical-tile annealing parameters");
     return failure();
   }

@@ -35,6 +35,12 @@ struct ExpandDigitalWorkPass
       llvm::cl::desc("Digital dataflow mode: bulk or sharded"),
       llvm::cl::init("bulk")};
 
+  Option<std::string> tilingPolicy{
+      *this, "tiling-policy",
+      llvm::cl::desc(
+          "Digital tiling policy: dimension-first or communication-aware"),
+      llvm::cl::init("dimension-first")};
+
   Option<int64_t> shardPropagationDepth{
       *this, "shard-propagation-depth",
       llvm::cl::desc("Maximum shard propagation depth; zero is unbounded"),

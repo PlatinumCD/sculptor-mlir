@@ -55,9 +55,17 @@ FailureOr<int64_t> getShardByteSize(MappingWorkUnitAttr attr,
   return bytes;
 }
 
-bool sameResultTile(MappingWorkUnitAttr lhs, MappingWorkUnitAttr rhs) {
-  return lhs.getResultOffsets() == rhs.getResultOffsets() &&
-         lhs.getResultSizes() == rhs.getResultSizes();
+bool sameTileRegion(ArrayRef<int64_t> lhsOffsets, ArrayRef<int64_t> lhsSizes,
+                    ArrayRef<int64_t> rhsOffsets, ArrayRef<int64_t> rhsSizes) {
+  return lhsOffsets == rhsOffsets && lhsSizes == rhsSizes;
+}
+
+SmallVector<int64_t> getIntegerArray(ArrayAttr values) {
+  SmallVector<int64_t> result;
+  result.reserve(values.size());
+  for (Attribute value : values)
+    result.push_back(cast<IntegerAttr>(value).getInt());
+  return result;
 }
 
 } // namespace
@@ -65,6 +73,37 @@ bool sameResultTile(MappingWorkUnitAttr lhs, MappingWorkUnitAttr rhs) {
 namespace mlir {
 namespace sculptor {
 namespace mapping {
+
+std::optional<StaticTileRegion>
+mapIterationTileThroughIndexingMap(AffineMap indexingMap,
+                                   ArrayRef<int64_t> iterationOffsets,
+                                   ArrayRef<int64_t> iterationSizes) {
+  if (indexingMap.getNumSymbols() != 0 ||
+      indexingMap.getNumDims() != iterationOffsets.size() ||
+      iterationOffsets.size() != iterationSizes.size())
+    return std::nullopt;
+
+  StaticTileRegion region;
+  region.offsets.reserve(indexingMap.getNumResults());
+  region.sizes.reserve(indexingMap.getNumResults());
+  for (AffineExpr expression : indexingMap.getResults()) {
+    if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+      unsigned position = dimension.getPosition();
+      if (position >= iterationOffsets.size() || iterationSizes[position] <= 0)
+        return std::nullopt;
+      region.offsets.push_back(iterationOffsets[position]);
+      region.sizes.push_back(iterationSizes[position]);
+      continue;
+    }
+    if (auto constant = dyn_cast<AffineConstantExpr>(expression)) {
+      region.offsets.push_back(constant.getValue());
+      region.sizes.push_back(1);
+      continue;
+    }
+    return std::nullopt;
+  }
+  return region;
+}
 
 FailureOr<DigitalDataflowMode> parseDigitalDataflowMode(StringRef value,
                                                         Operation *anchor) {
@@ -107,6 +146,7 @@ LogicalResult planShardDataflow(func::FuncOp function,
   DenseMap<int64_t, SmallVector<MappingWorkUnitAttr>> unitsByOperation;
   DenseMap<Operation *, int64_t> operationIds;
   for (const ComputeOperation &operation : graph.operations) {
+    operationIds[operation.operation] = operation.id;
     for (Operation *member : operation.members)
       operationIds[member] = operation.id;
     auto expanded = operation.operation->getAttrOfType<ArrayAttr>(
@@ -216,7 +256,6 @@ LogicalResult planShardDataflow(func::FuncOp function,
 
       auto consumer = dyn_cast<linalg::LinalgOp>(use.getOwner());
       if (!consumer || consumer->getNumResults() != 1 ||
-          consumer->getResult(0).getType() != producerType ||
           llvm::any_of(cast<TilingInterface>(consumer.getOperation())
                            .getLoopIteratorTypes(),
                        [](utils::IteratorType iterator) {
@@ -231,29 +270,44 @@ LogicalResult planShardDataflow(func::FuncOp function,
         continue;
       }
       AffineMap operandMap = consumer.getMatchingIndexingMap(&use);
-      AffineMap resultMap =
-          consumer.getIndexingMapMatchingResult(consumer->getResult(0));
-      if (operandMap != resultMap) {
-        assemblyBoundaries.insert({producerId, consumerId});
-        if (requireCompleteChain) {
-          use.getOwner()->emitError(
-              "complete shard chain reaches an incompatible indexing map");
-          return failure();
-        }
-        continue;
-      }
-
-      SmallVector<std::pair<MappingWorkUnitAttr, MappingWorkUnitAttr>> pairs;
+      struct WorkUnitPair {
+        MappingWorkUnitAttr source;
+        MappingWorkUnitAttr target;
+        size_t targetIndex;
+      };
+      SmallVector<WorkUnitPair> pairs;
+      SmallVector<bool> matchedTargets(consumerUnits->second.size(), false);
       for (MappingWorkUnitAttr source : producerUnits->second) {
-        auto target = llvm::find_if(consumerUnits->second,
-                                    [&](MappingWorkUnitAttr candidate) {
-                                      return sameResultTile(source, candidate);
-                                    });
-        if (target == consumerUnits->second.end()) {
+        SmallVector<int64_t> sourceOffsets =
+            getIntegerArray(source.getResultOffsets());
+        SmallVector<int64_t> sourceSizes =
+            getIntegerArray(source.getResultSizes());
+        std::optional<size_t> matchingTarget;
+        for (auto [targetIndex, target] :
+             llvm::enumerate(consumerUnits->second)) {
+          if (matchedTargets[targetIndex])
+            continue;
+          std::optional<StaticTileRegion> inputRegion =
+              mapIterationTileThroughIndexingMap(
+                  operandMap, getIntegerArray(target.getIterationOffsets()),
+                  getIntegerArray(target.getIterationSizes()));
+          if (!inputRegion ||
+              !sameTileRegion(sourceOffsets, sourceSizes, inputRegion->offsets,
+                              inputRegion->sizes))
+            continue;
+          if (matchingTarget) {
+            matchingTarget.reset();
+            break;
+          }
+          matchingTarget = targetIndex;
+        }
+        if (!matchingTarget) {
           pairs.clear();
           break;
         }
-        pairs.push_back({source, *target});
+        matchedTargets[*matchingTarget] = true;
+        pairs.push_back(
+            {source, consumerUnits->second[*matchingTarget], *matchingTarget});
       }
       if (pairs.size() != producerUnits->second.size() ||
           pairs.size() != consumerUnits->second.size()) {
@@ -266,13 +320,20 @@ LogicalResult planShardDataflow(func::FuncOp function,
         continue;
       }
 
-      int64_t shardGroup = pairs.front().first.getShardGroupId().getInt();
+      int64_t shardGroup = pairs.front().source.getShardGroupId().getInt();
       SmallVector<Attribute> rewrittenConsumerUnits;
       rewrittenConsumerUnits.reserve(consumerUnits->second.size());
-      for (auto [index, unit] : llvm::enumerate(consumerUnits->second)) {
+      SmallVector<int64_t> sourceShardByTarget(consumerUnits->second.size(),
+                                               -1);
+      for (const WorkUnitPair &pair : pairs)
+        sourceShardByTarget[pair.targetIndex] =
+            pair.source.getShardIndex().getInt();
+      for (auto [targetIndex, unit] : llvm::enumerate(consumerUnits->second)) {
+        assert(sourceShardByTarget[targetIndex] >= 0);
         MappingWorkUnitAttr updated = withShardIdentity(
-            unit, shardGroup, index, consumerUnits->second.size());
-        consumerUnits->second[index] = updated;
+            unit, shardGroup, sourceShardByTarget[targetIndex],
+            consumerUnits->second.size());
+        consumerUnits->second[targetIndex] = updated;
         rewrittenConsumerUnits.push_back(updated);
       }
       graph.operations[consumerId].operation->setAttr(
@@ -294,15 +355,11 @@ LogicalResult planShardDataflow(func::FuncOp function,
             "shard edge cannot resolve its compute tensor");
 
       for (const auto &pair : pairs) {
-        MappingWorkUnitAttr source = pair.first;
-        auto target = llvm::find_if(consumerUnits->second,
-                                    [&](MappingWorkUnitAttr candidate) {
-                                      return sameResultTile(source, candidate);
-                                    });
-        assert(target != consumerUnits->second.end());
+        MappingWorkUnitAttr source = pair.source;
+        MappingWorkUnitAttr target = consumerUnits->second[pair.targetIndex];
         auto identity =
             std::make_tuple(producerId, source.getId().getInt(), consumerId,
-                            target->getId().getInt(), use.getOperandNumber());
+                            target.getId().getInt(), use.getOperandNumber());
         if (!seen.insert(identity).second)
           continue;
         FailureOr<int64_t> bytes =
@@ -312,7 +369,7 @@ LogicalResult planShardDataflow(func::FuncOp function,
         exactEdges.push_back(MappingWorkUnitEdgeAttr::get(
             function.getContext(), builder.getI64IntegerAttr(producerId),
             source.getId(), builder.getI64IntegerAttr(consumerId),
-            target->getId(), builder.getI64IntegerAttr(tensorId),
+            target.getId(), builder.getI64IntegerAttr(tensorId),
             builder.getI64IntegerAttr(0),
             builder.getI64IntegerAttr(use.getOperandNumber()),
             builder.getI64IntegerAttr(*bytes)));

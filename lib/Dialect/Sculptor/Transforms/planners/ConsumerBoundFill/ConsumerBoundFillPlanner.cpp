@@ -31,6 +31,120 @@ SmallVector<int64_t> findDirectConsumers(const ComputeOperation &operation,
   return consumers;
 }
 
+FailureOr<int64_t> getWorkUnitByteSize(const MappingWorkUnit &workUnit,
+                                       Type tensorType, Operation *anchor) {
+  auto shapedType = dyn_cast<ShapedType>(tensorType);
+  if (!shapedType || !shapedType.hasRank() ||
+      workUnit.resultSizes.size() !=
+          static_cast<size_t>(shapedType.getRank())) {
+    anchor->emitError(
+        "consumer-bound-fill requires a ranked result tile type");
+    return failure();
+  }
+
+  Type elementType = shapedType.getElementType();
+  if (!elementType.isIntOrFloat()) {
+    anchor->emitError(
+        "consumer-bound-fill requires an integer or floating-point element "
+        "type");
+    return failure();
+  }
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  if (bitWidth == 0 || bitWidth % 8 != 0) {
+    anchor->emitError(
+        "consumer-bound-fill requires a byte-addressable element type");
+    return failure();
+  }
+
+  int64_t byteSize = bitWidth / 8;
+  for (int64_t size : workUnit.resultSizes) {
+    if (size <= 0) {
+      anchor->emitError(
+          "consumer-bound-fill requires positive static result tile sizes");
+      return failure();
+    }
+    std::optional<int64_t> next = llvm::checkedMul(byteSize, size);
+    if (!next) {
+      anchor->emitError(
+          "consumer-bound-fill result tile byte size overflows int64");
+      return failure();
+    }
+    byteSize = *next;
+  }
+  return byteSize;
+}
+
+FailureOr<MappingWorkUnitEdge> buildExactFillEdge(
+    const MappingProblem &problem, const StructuralRATreeNode &fillLeaf,
+    const StructuralRATreeNode &consumerLeaf,
+    const DenseMap<int64_t, const MappingWorkUnit *> &workUnitsById) {
+  const ComputeOperation &fill =
+      problem.graph.operations[fillLeaf.operationId];
+  const ComputeOperation &consumer =
+      problem.graph.operations[consumerLeaf.operationId];
+  const MappingWorkUnit *fillWorkUnit =
+      workUnitsById.lookup(fillLeaf.workUnitId);
+  const MappingWorkUnit *consumerWorkUnit =
+      workUnitsById.lookup(consumerLeaf.workUnitId);
+  if (!fillWorkUnit || !consumerWorkUnit) {
+    problem.anchor->emitError(
+        "consumer-bound-fill cannot resolve a paired work unit");
+    return failure();
+  }
+
+  SmallVector<int64_t> tensorIds;
+  for (int64_t tensorId : fill.outputTensors) {
+    const ComputeTensor &tensor = problem.graph.tensors[tensorId];
+    if (llvm::is_contained(tensor.consumerOperations, consumer.id))
+      tensorIds.push_back(tensorId);
+  }
+  if (tensorIds.size() != 1) {
+    problem.anchor->emitError(
+        "consumer-bound-fill requires exactly one fill-to-consumer tensor");
+    return failure();
+  }
+
+  int64_t tensorId = tensorIds.front();
+  const ComputeTensor &tensor = problem.graph.tensors[tensorId];
+  auto sourceResult = dyn_cast<OpResult>(tensor.value);
+  if (!sourceResult || sourceResult.getOwner() != fill.operation ||
+      sourceResult.getResultNumber() != fillWorkUnit->resultNumber) {
+    fill.operation->emitError(
+        "consumer-bound-fill cannot resolve the fill result number");
+    return failure();
+  }
+
+  int64_t targetOperandNumber = -1;
+  for (OpOperand &operand : consumer.operation->getOpOperands()) {
+    if (operand.get() != tensor.value)
+      continue;
+    if (targetOperandNumber >= 0) {
+      consumer.operation->emitError(
+          "consumer-bound-fill tensor appears in multiple consumer operands");
+      return failure();
+    }
+    targetOperandNumber = operand.getOperandNumber();
+  }
+  if (targetOperandNumber < 0) {
+    consumer.operation->emitError(
+        "consumer-bound-fill cannot resolve the consumer operand");
+    return failure();
+  }
+
+  FailureOr<int64_t> byteSize =
+      getWorkUnitByteSize(*fillWorkUnit, tensor.type, fill.operation);
+  if (failed(byteSize))
+    return failure();
+  return MappingWorkUnitEdge{fill.id,
+                             fillLeaf.workUnitId,
+                             consumer.id,
+                             consumerLeaf.workUnitId,
+                             tensorId,
+                             fillWorkUnit->resultNumber,
+                             targetOperandNumber,
+                             *byteSize};
+}
+
 class ConsumerBoundFillTreeBuilder {
 public:
   ConsumerBoundFillTreeBuilder(
@@ -193,6 +307,7 @@ bindFillsToConsumers(const MappingProblem &problem) {
 
   DenseMap<int64_t, SmallVector<int64_t>> fillLeavesByTarget;
   DenseSet<int64_t> movedFillLeaves;
+  SmallVector<MappingWorkUnitEdge> exactFillEdges;
   for (const ComputeOperation &operation : problem.graph.operations) {
     if (!isFill(operation))
       continue;
@@ -237,6 +352,27 @@ bindFillsToConsumers(const MappingProblem &problem) {
     for (auto [fillLeafId, consumerLeafId] : pairs) {
       movedFillLeaves.insert(fillLeafId);
       fillLeavesByTarget[consumerLeafId].push_back(fillLeafId);
+
+      const StructuralRATreeNode *fillLeaf = nodesById.lookup(fillLeafId);
+      const StructuralRATreeNode *consumerLeaf =
+          nodesById.lookup(consumerLeafId);
+      if (fillLeaf->workUnitId < 0)
+        continue;
+      FailureOr<MappingWorkUnitEdge> edge = buildExactFillEdge(
+          problem, *fillLeaf, *consumerLeaf, workUnitsById);
+      if (failed(edge))
+        return failure();
+      bool alreadyPresent = llvm::any_of(
+          problem.currentTree.workUnitEdges,
+          [&](const MappingWorkUnitEdge &existing) {
+            return existing.sourceOperationId == edge->sourceOperationId &&
+                   existing.sourceWorkUnitId == edge->sourceWorkUnitId &&
+                   existing.targetOperationId == edge->targetOperationId &&
+                   existing.targetWorkUnitId == edge->targetWorkUnitId &&
+                   existing.targetOperandNumber == edge->targetOperandNumber;
+          });
+      if (!alreadyPresent)
+        exactFillEdges.push_back(*edge);
     }
   }
 
@@ -254,7 +390,11 @@ bindFillsToConsumers(const MappingProblem &problem) {
 
   ConsumerBoundFillTreeBuilder builder(problem, fillLeavesByTarget,
                                        movedFillLeaves);
-  return builder.build();
+  FailureOr<ResourceAllocationTree> tree = builder.build();
+  if (failed(tree))
+    return failure();
+  tree->workUnitEdges.append(exactFillEdges.begin(), exactFillEdges.end());
+  return tree;
 }
 
 } // namespace
