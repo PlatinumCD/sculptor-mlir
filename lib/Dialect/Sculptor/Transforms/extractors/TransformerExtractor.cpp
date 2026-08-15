@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/ExtractLayers.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticLayerIdentity.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Layers/TransformerStackStructure.h"
 
 #include "mlir/IR/PatternMatch.h"
@@ -28,7 +29,7 @@ createInlineBlock(TransformerOp transformerOp,
   TransformerBlockKind blockKind = block.isDecoder
                                        ? TransformerBlockKind::Decoder
                                        : TransformerBlockKind::Encoder;
-  return rewriter.create<NNTransformerBlockOp>(
+  NNTransformerBlockOp blockOp = rewriter.create<NNTransformerBlockOp>(
       transformerOp.getLoc(), outputType, input, memory, block.qkvWeight,
       block.qkvBias, block.attnOutputWeight, block.attnOutputBias,
       block.attnNormWeight, block.attnNormBias, block.crossQueryWeight,
@@ -51,6 +52,8 @@ createInlineBlock(TransformerOp transformerOp,
       rewriter.getI64IntegerAttr(block.blockIndex),
       rewriter.getI64IntegerAttr(block.numBlocks),
       transformerOp.getLayerNormEpsAttr());
+  mlir::sculptor::copySemanticLayerIdentity(transformerOp, blockOp);
+  return blockOp;
 }
 
 static mlir::LogicalResult

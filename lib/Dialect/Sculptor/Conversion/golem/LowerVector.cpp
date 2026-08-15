@@ -43,11 +43,11 @@ public:
   matchAndRewrite(mlir::sculptor::ArrayVectorPlaceOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const final {
     // Validate both the Analog slice contract and the lowered vector shape.
-    auto sliceType =
-        llvm::dyn_cast<mlir::sculptor::VectorSliceType>(op.getInput().getType());
+    auto sliceType = llvm::dyn_cast<mlir::sculptor::VectorSliceType>(
+        op.getInput().getType());
     if (!sliceType) {
-      return rewriter.notifyMatchFailure(op,
-                                         "expected sculptor.vector.slice input type");
+      return rewriter.notifyMatchFailure(
+          op, "expected sculptor.vector.slice input type");
     }
 
     auto vectorType =
@@ -83,12 +83,13 @@ public:
       col = adaptor.getIndices()[1];
     }
 
-    // Encode the grid coordinate expected by the runtime and emit the load shim.
+    // Encode the grid coordinate expected by the runtime and emit the load
+    // shim.
     mlir::Value arrayId = mlir::sculptor::golem::buildLinearArrayId(
         rewriter, op.getLoc(), row, col, plan.gridCols);
-    mlir::sculptor::golem::emitShimCall(
-        rewriter, op.getLoc(), mlir::sculptor::golem::kLoadShimName,
-        {arrayMemref, arrayId});
+    mlir::sculptor::golem::emitShimCall(rewriter, op.getLoc(),
+                                        mlir::sculptor::golem::kLoadShimName,
+                                        {arrayMemref, arrayId});
 
     rewriter.eraseOp(op);
     return mlir::success();
@@ -105,11 +106,9 @@ public:
   matchAndRewrite(mlir::sculptor::ArrayLoadOp op, OneToNOpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const final {
     mlir::Value vector = adaptor.getVector().front();
-    auto vectorType =
-        llvm::dyn_cast<mlir::RankedTensorType>(vector.getType());
+    auto vectorType = llvm::dyn_cast<mlir::RankedTensorType>(vector.getType());
     if (!vectorType || vectorType.getRank() != 2) {
-      return rewriter.notifyMatchFailure(op,
-                                         "expected vector tensor<1xn>");
+      return rewriter.notifyMatchFailure(op, "expected vector tensor<1xn>");
     }
 
     mlir::FailureOr<mlir::Value> localArrayId =
@@ -117,11 +116,12 @@ public:
     if (mlir::failed(localArrayId))
       return mlir::failure();
 
-    mlir::Value vectorMemref = mlir::sculptor::golem::materializeTensorMemref(
-        rewriter, op.getLoc(), vector);
-    mlir::sculptor::golem::emitShimCall(
-        rewriter, op.getLoc(), mlir::sculptor::golem::kLoadShimName,
-        {vectorMemref, *localArrayId});
+    // Keep the read-only tensor operand intact until one-shot bufferization.
+    // The shim declaration carries bufferization.access = "read", allowing an
+    // extract_slice to become a memref.subview instead of a copied temporary.
+    mlir::sculptor::golem::emitShimCall(rewriter, op.getLoc(),
+                                        mlir::sculptor::golem::kLoadShimName,
+                                        {vector, *localArrayId});
 
     rewriter.replaceOpWithMultiple(
         op, llvm::ArrayRef<mlir::ValueRange>{mlir::ValueRange{}});

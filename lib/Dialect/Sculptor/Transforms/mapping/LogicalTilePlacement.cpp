@@ -1,16 +1,26 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/LogicalTilePlacement.h"
 
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingConfig.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/MappingCostProfile.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ResourceAllocationTree.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/CheckedArithmetic.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <set>
+#include <tuple>
 
 namespace {
 
@@ -70,6 +80,762 @@ FailureOr<int64_t> checkedAddCost(int64_t current, int64_t increment,
   return *result;
 }
 
+FailureOr<std::optional<int64_t>>
+getStaticByteSize(Type type, std::optional<ArrayRef<int64_t>> shapeOverride,
+                  Operation *anchor) {
+  if (isa<sculptor::LogicalArrayType>(type))
+    return std::optional<int64_t>{0};
+  auto shapedType = dyn_cast<ShapedType>(type);
+  if (!shapedType || !shapedType.getElementType().isIntOrFloat())
+    return std::optional<int64_t>{};
+  unsigned bitWidth = shapedType.getElementType().getIntOrFloatBitWidth();
+  if (bitWidth == 0 || bitWidth % 8 != 0)
+    return std::optional<int64_t>{};
+
+  ArrayRef<int64_t> shape =
+      shapeOverride ? *shapeOverride : shapedType.getShape();
+  int64_t elements = 1;
+  for (int64_t dimension : shape) {
+    if (ShapedType::isDynamic(dimension) || dimension < 0)
+      return std::optional<int64_t>{};
+    std::optional<int64_t> updated = llvm::checkedMul(elements, dimension);
+    if (!updated) {
+      anchor->emitError("logical-tile memory element-count overflow");
+      return failure();
+    }
+    elements = *updated;
+  }
+  std::optional<int64_t> bytes =
+      llvm::checkedMul(elements, static_cast<int64_t>(bitWidth / 8));
+  if (!bytes) {
+    anchor->emitError("logical-tile memory byte-size overflow");
+    return failure();
+  }
+  return std::optional<int64_t>{*bytes};
+}
+
+LogicalResult addEstimatedBytes(int64_t &target, std::optional<int64_t> bytes,
+                                bool &complete, Operation *anchor) {
+  if (!bytes) {
+    complete = false;
+    return success();
+  }
+  std::optional<int64_t> updated = llvm::checkedAdd(target, *bytes);
+  if (!updated)
+    return anchor->emitError("logical-tile memory estimate overflow");
+  target = *updated;
+  return success();
+}
+
+enum class EstimateTransientKind { Produced, Incoming };
+
+struct EstimateLiveRange {
+  int64_t bytes = 0;
+  double beginNs = 0.0;
+  double endNs = 0.0;
+  EstimateTransientKind kind = EstimateTransientKind::Produced;
+  int64_t sourceTileId = -1;
+  int64_t sourceOperationId = -1;
+  int64_t sourceWorkUnitId = -1;
+  int64_t targetOperationId = -1;
+  int64_t targetWorkUnitId = -1;
+  int64_t tensorId = -1;
+};
+
+struct EstimateEventBucket {
+  int64_t producedStarts = 0;
+  int64_t producedEnds = 0;
+  int64_t producedInstant = 0;
+  int64_t incomingStarts = 0;
+  int64_t incomingEnds = 0;
+  int64_t incomingInstant = 0;
+};
+
+struct EndpointAssignmentLocation {
+  int64_t tileId = -1;
+  const LogicalTileAssignment *assignment = nullptr;
+};
+
+using EstimateEndpoint = std::pair<int64_t, int64_t>;
+
+LogicalResult checkedAccumulateEstimate(int64_t &target, int64_t bytes,
+                                        Operation *anchor) {
+  if (bytes < 0)
+    return anchor->emitError("logical-tile memory estimate has negative bytes");
+  std::optional<int64_t> updated = llvm::checkedAdd(target, bytes);
+  if (!updated)
+    return anchor->emitError("logical-tile memory estimate overflow");
+  target = *updated;
+  return success();
+}
+
+LogicalResult checkedReleaseEstimate(int64_t &target, int64_t bytes,
+                                     Operation *anchor) {
+  if (bytes < 0 || bytes > target)
+    return anchor->emitError(
+        "logical-tile memory lifetime event is unbalanced");
+  target -= bytes;
+  return success();
+}
+
+LogicalResult
+buildLogicalTileMemoryEstimates(const ComputeGraph &graph,
+                                const ResourceAllocationTree &tree,
+                                LogicalTilePlacementProblem &problem) {
+  DenseMap<int64_t, const MappingWorkUnit *> workUnitsById;
+  std::map<EstimateEndpoint, SmallVector<int64_t>>
+      sourceTensorIdsByWorkUnitEndpoint;
+  for (const MappingWorkUnit &workUnit : tree.workUnits) {
+    if (!workUnitsById.try_emplace(workUnit.id, &workUnit).second)
+      return problem.anchor->emitError(
+          "duplicate work-unit ID while estimating tile memory");
+  }
+  for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
+    SmallVector<int64_t> &tensorIds = sourceTensorIdsByWorkUnitEndpoint[
+        {edge.sourceOperationId, edge.sourceWorkUnitId}];
+    if (!llvm::is_contained(tensorIds, edge.tensorId))
+      tensorIds.push_back(edge.tensorId);
+  }
+
+  llvm::DenseSet<Value> modelOutputValues;
+  llvm::DenseSet<Value> internallyConsumedModelOutputValues;
+  for (const ComputeTensor &tensor : graph.tensors) {
+    if (!tensor.isFunctionOutput)
+      continue;
+    modelOutputValues.insert(tensor.value);
+    for (Operation *user : tensor.value.getUsers()) {
+      if (!isa<func::ReturnOp>(user)) {
+        internallyConsumedModelOutputValues.insert(tensor.value);
+        break;
+      }
+    }
+  }
+  auto isOutputOnlyValue = [&](Value value) {
+    return modelOutputValues.contains(value) &&
+           !internallyConsumedModelOutputValues.contains(value);
+  };
+
+  // Endpoint schedules are global even though memory is estimated one logical
+  // tile at a time. Cross-tile payload lifetimes therefore use the source and
+  // target assignment times without requiring a physical placement.
+  std::map<EstimateEndpoint, SmallVector<EndpointAssignmentLocation>>
+      endpointAssignments;
+  std::map<int64_t, SmallVector<EndpointAssignmentLocation>>
+      workUnitAssignmentsByOperation;
+  auto indexAssignment = [&](int64_t tileId,
+                             const LogicalTileAssignment &assignment) {
+    EndpointAssignmentLocation location{tileId, &assignment};
+    endpointAssignments[{assignment.operationId, assignment.workUnitId}]
+        .push_back(location);
+    if (assignment.workUnitId >= 0)
+      workUnitAssignmentsByOperation[assignment.operationId].push_back(
+          location);
+  };
+  for (const LogicalTile &tile : problem.tileGraph.tiles) {
+    for (const LogicalTileAssignment &assignment : tile.digitalAssignments)
+      indexAssignment(tile.id, assignment);
+    for (const LogicalTileAnalogLane &lane : tile.analogLanes)
+      for (const LogicalTileAssignment &assignment : lane.assignments)
+        indexAssignment(tile.id, assignment);
+  }
+  auto findAssignments = [&](int64_t operationId, int64_t workUnitId,
+                             int64_t tileId) {
+    SmallVector<const LogicalTileAssignment *> result;
+    auto found = endpointAssignments.find({operationId, workUnitId});
+    if (found != endpointAssignments.end()) {
+      for (const EndpointAssignmentLocation &location : found->second)
+        if (location.tileId == tileId)
+          result.push_back(location.assignment);
+    }
+    // An operation-wide dependency can target an operation that was expanded
+    // into work-unit endpoints after the dependency was discovered.
+    if (!result.empty() || workUnitId >= 0)
+      return result;
+    auto expanded = workUnitAssignmentsByOperation.find(operationId);
+    if (expanded != workUnitAssignmentsByOperation.end())
+      for (const EndpointAssignmentLocation &location : expanded->second)
+        if (location.tileId == tileId)
+          result.push_back(location.assignment);
+    return result;
+  };
+
+  problem.memoryEstimates.clear();
+  problem.memoryEstimateIndexByTileId.clear();
+  problem.memoryEstimates.reserve(problem.tileGraph.tiles.size());
+  bool emittedCapacityDiagnostic = false;
+  for (const LogicalTile &tile : problem.tileGraph.tiles) {
+    LogicalTileMemoryEstimate estimate;
+    estimate.logicalTileId = tile.id;
+    estimate.complete = true;
+    std::set<int64_t> persistentTensorIds;
+    std::set<std::pair<int64_t, int64_t>> endpoints;
+    llvm::DenseSet<Value> persistentValues;
+    llvm::DenseSet<Value> producedValues;
+    SmallVector<EstimateLiveRange> liveRanges;
+    std::map<std::tuple<int64_t, int64_t, int64_t>, SmallVector<unsigned>>
+        producedByEndpointAndTensor;
+    std::map<std::pair<int64_t, int64_t>, SmallVector<unsigned>>
+        producedByOperationAndTensor;
+    auto markIncomplete = [&](StringRef reason) {
+      estimate.complete = false;
+      if (estimate.incompleteReason.empty())
+        estimate.incompleteReason = reason.str();
+    };
+
+    auto validAssignmentTimes = [&](const LogicalTileAssignment &assignment) {
+      return std::isfinite(assignment.startNs) &&
+             std::isfinite(assignment.finishNs) &&
+             assignment.startNs >= 0.0 &&
+             assignment.finishNs >= assignment.startNs;
+    };
+
+    auto addInternalProducedRange =
+        [&](const LogicalTileAssignment &assignment,
+            std::optional<int64_t> bytes) -> LogicalResult {
+      if (!bytes) {
+        markIncomplete("a produced resource has unknown static size");
+        return success();
+      }
+      if (*bytes == 0)
+        return success();
+      if (*bytes < 0)
+        return problem.anchor->emitError(
+            "logical-tile produced resource has negative bytes");
+      if (!validAssignmentTimes(assignment)) {
+        markIncomplete("an assignment has invalid schedule times");
+        return success();
+      }
+      liveRanges.push_back(
+          {*bytes, assignment.startNs, assignment.finishNs,
+           EstimateTransientKind::Produced, tile.id, assignment.operationId,
+           assignment.workUnitId});
+      return success();
+    };
+
+    auto addBoundaryProducedRange =
+        [&](const LogicalTileAssignment &assignment,
+            std::optional<int64_t> bytes, ArrayRef<int64_t> tensorIds,
+            bool includeAssignmentExecution) -> LogicalResult {
+      if (!bytes) {
+        markIncomplete("a produced boundary has unknown static size");
+        return success();
+      }
+      if (*bytes == 0)
+        return success();
+      if (*bytes < 0)
+        return problem.anchor->emitError(
+            "logical-tile produced boundary has negative bytes");
+      if (!validAssignmentTimes(assignment)) {
+        markIncomplete("an assignment has invalid schedule times");
+        return success();
+      }
+      unsigned index = liveRanges.size();
+      double beginNs = includeAssignmentExecution ? assignment.startNs
+                                                  : assignment.finishNs;
+      liveRanges.push_back(
+          {*bytes, beginNs, assignment.finishNs,
+           EstimateTransientKind::Produced, tile.id, assignment.operationId,
+           assignment.workUnitId, -1, -1,
+           tensorIds.empty() ? -1 : tensorIds.front()});
+      for (int64_t tensorId : tensorIds) {
+        producedByEndpointAndTensor[
+            {assignment.operationId, assignment.workUnitId, tensorId}]
+            .push_back(index);
+        producedByOperationAndTensor[{assignment.operationId, tensorId}]
+            .push_back(index);
+      }
+      return success();
+    };
+
+    auto accountAssignment =
+        [&](const LogicalTileAssignment &assignment) -> LogicalResult {
+      if (assignment.operationId < 0 ||
+          assignment.operationId >=
+              static_cast<int64_t>(graph.operations.size()))
+        return problem.anchor->emitError(
+            "logical tile references an unknown operation during memory "
+            "estimation");
+      if (!endpoints.insert({assignment.operationId, assignment.workUnitId})
+               .second)
+        return success();
+      const ComputeOperation &operation =
+          graph.operations[assignment.operationId];
+
+      if (operation.kind == ComputeOperationKind::MatrixSetup) {
+        for (int64_t tensorId : operation.inputTensors) {
+          if (tensorId < 0 ||
+              tensorId >= static_cast<int64_t>(graph.tensors.size()))
+            return problem.anchor->emitError(
+                "matrix setup references an unknown tensor during memory "
+                "estimation");
+          const ComputeTensor &tensor = graph.tensors[tensorId];
+          if (tensor.isLogicalArray || tensor.isFunctionInput ||
+              !persistentTensorIds.insert(tensorId).second ||
+              !persistentValues.insert(tensor.value).second)
+            continue;
+          FailureOr<std::optional<int64_t>> bytes =
+              getStaticByteSize(tensor.type, std::nullopt, problem.anchor);
+          if (failed(bytes) ||
+              failed(addEstimatedBytes(estimate.persistentBytes, *bytes,
+                                       estimate.complete, problem.anchor)))
+            return failure();
+        }
+        for (Operation *member : operation.members) {
+          for (Value result : member->getResults()) {
+            if (!isa<ShapedType>(result.getType()) ||
+                !persistentValues.insert(result).second)
+              continue;
+            FailureOr<std::optional<int64_t>> bytes = getStaticByteSize(
+                result.getType(), std::nullopt, problem.anchor);
+            if (failed(bytes) ||
+                failed(addEstimatedBytes(estimate.persistentBytes, *bytes,
+                                         estimate.complete, problem.anchor)))
+              return failure();
+          }
+        }
+        return success();
+      }
+
+      if (assignment.workUnitId >= 0) {
+        const MappingWorkUnit *workUnit =
+            workUnitsById.lookup(assignment.workUnitId);
+        if (!workUnit || workUnit->operationId != assignment.operationId ||
+            workUnit->resultNumber < 0 ||
+            workUnit->resultNumber >=
+                static_cast<int64_t>(operation.operation->getNumResults())) {
+          markIncomplete("an assignment references an invalid work unit");
+          return success();
+        }
+        Value result = operation.operation->getResult(workUnit->resultNumber);
+        if (isOutputOnlyValue(result))
+          return success();
+        FailureOr<std::optional<int64_t>> bytes = getStaticByteSize(
+            result.getType(), ArrayRef<int64_t>(workUnit->resultSizes),
+            problem.anchor);
+        if (failed(bytes))
+          return failure();
+        SmallVector<int64_t> tensorIds = sourceTensorIdsByWorkUnitEndpoint[
+            {assignment.operationId, assignment.workUnitId}];
+        if (tensorIds.empty())
+          tensorIds.push_back(-1);
+        if (failed(addBoundaryProducedRange(
+                assignment, *bytes, tensorIds,
+                /*includeAssignmentExecution=*/true)))
+          return failure();
+        return success();
+      }
+
+      // The compute graph's output-tensor list intentionally follows graph
+      // boundaries and can omit a value consumed by a non-compute support op
+      // such as tensor.concat.  Account the endpoint root's shaped results
+      // directly so mixed expanded/unexpanded plans still have a complete
+      // transient estimate.
+      for (Value result : operation.operation->getResults()) {
+        if (!isa<ShapedType>(result.getType()) ||
+            isa<sculptor::LogicalArrayType>(result.getType()) ||
+            isOutputOnlyValue(result) ||
+            !producedValues.insert(result).second)
+          continue;
+        FailureOr<std::optional<int64_t>> bytes =
+            getStaticByteSize(result.getType(), std::nullopt, problem.anchor);
+        if (failed(bytes) ||
+            failed(addInternalProducedRange(assignment, *bytes)))
+          return failure();
+      }
+
+      for (Operation *member : operation.members) {
+        bool destinationStyle = isa<DestinationStyleOpInterface>(member);
+        for (Value result : member->getResults()) {
+          if (destinationStyle || isa<tensor::ExtractSliceOp>(member) ||
+              !isa<ShapedType, sculptor::LogicalArrayType>(result.getType()) ||
+              isa<sculptor::LogicalArrayType>(result.getType()) ||
+              isOutputOnlyValue(result) ||
+              !producedValues.insert(result).second)
+            continue;
+          FailureOr<std::optional<int64_t>> bytes =
+              getStaticByteSize(result.getType(), std::nullopt, problem.anchor);
+          if (failed(bytes) ||
+              failed(addInternalProducedRange(assignment, *bytes)))
+            return failure();
+        }
+      }
+      for (int64_t tensorId : operation.outputTensors) {
+        if (tensorId < 0 ||
+            tensorId >= static_cast<int64_t>(graph.tensors.size()))
+          return problem.anchor->emitError(
+              "compute output references an unknown tensor during memory "
+              "estimation");
+        const ComputeTensor &tensor = graph.tensors[tensorId];
+        if (tensor.isLogicalArray || isOutputOnlyValue(tensor.value))
+          continue;
+        int64_t contributionBytes = getProducerContributionByteSize(
+            tensor, assignment.operationId);
+        if (contributionBytes < 0) {
+          markIncomplete(
+              "a tensor producer contribution has unknown static size");
+          continue;
+        }
+        if (failed(addBoundaryProducedRange(
+                assignment, std::optional<int64_t>{contributionBytes},
+                ArrayRef<int64_t>{tensorId},
+                /*includeAssignmentExecution=*/false)))
+          return failure();
+      }
+      return success();
+    };
+
+    for (const LogicalTileAssignment &assignment : tile.digitalAssignments)
+      if (failed(accountAssignment(assignment)))
+        return failure();
+    for (const LogicalTileAnalogLane &lane : tile.analogLanes)
+      for (const LogicalTileAssignment &assignment : lane.assignments)
+        if (failed(accountAssignment(assignment)))
+          return failure();
+    if (!estimate.complete && estimate.incompleteReason.empty())
+      estimate.incompleteReason =
+          "a persistent resource has unknown static size";
+
+    auto extendProducedLifetime = [&](const LogicalTileDependency &dependency,
+                                      double finalUseNs) -> LogicalResult {
+      auto ranges = producedByEndpointAndTensor.find(
+          {dependency.sourceOperationId, dependency.sourceWorkUnitId,
+           dependency.tensorId});
+      if (ranges == producedByEndpointAndTensor.end())
+        ranges = producedByEndpointAndTensor.find(
+            {dependency.sourceOperationId, dependency.sourceWorkUnitId, -1});
+      if (ranges == producedByEndpointAndTensor.end()) {
+        bool extendedExpandedSource = false;
+        if (dependency.sourceWorkUnitId < 0) {
+          auto expanded = producedByOperationAndTensor.find(
+              {dependency.sourceOperationId, dependency.tensorId});
+          if (expanded == producedByOperationAndTensor.end())
+            expanded = producedByOperationAndTensor.find(
+                {dependency.sourceOperationId, -1});
+          if (expanded != producedByOperationAndTensor.end()) {
+            for (unsigned rangeIndex : expanded->second)
+              if (finalUseNs >= liveRanges[rangeIndex].endNs) {
+                liveRanges[rangeIndex].endNs = finalUseNs;
+                liveRanges[rangeIndex].targetOperationId =
+                    dependency.targetOperationId;
+                liveRanges[rangeIndex].targetWorkUnitId =
+                    dependency.targetWorkUnitId;
+              }
+            extendedExpandedSource = !expanded->second.empty();
+          }
+        }
+        if (!extendedExpandedSource && dependency.byteSize != 0) {
+          std::string reason =
+              "dependency source operation " +
+              std::to_string(dependency.sourceOperationId) + " work unit " +
+              std::to_string(dependency.sourceWorkUnitId) +
+              " has no estimated transient resource";
+          markIncomplete(reason);
+        }
+        return success();
+      }
+      if (!std::isfinite(finalUseNs) || finalUseNs < 0.0) {
+        markIncomplete("a produced resource has an invalid final-use time");
+        return success();
+      }
+      for (unsigned rangeIndex : ranges->second) {
+        if (finalUseNs < liveRanges[rangeIndex].endNs)
+          continue;
+        liveRanges[rangeIndex].endNs = finalUseNs;
+        liveRanges[rangeIndex].targetOperationId =
+            dependency.targetOperationId;
+        liveRanges[rangeIndex].targetWorkUnitId =
+            dependency.targetWorkUnitId;
+      }
+      return success();
+    };
+
+    for (const LogicalTileDependency &dependency : tile.internalDependencies) {
+      SmallVector<const LogicalTileAssignment *> targets = findAssignments(
+          dependency.targetOperationId, dependency.targetWorkUnitId, tile.id);
+      if (targets.empty() || llvm::any_of(targets, [&](const auto *target) {
+            return !validAssignmentTimes(*target);
+          })) {
+        markIncomplete("an internal dependency has no scheduled target");
+        continue;
+      }
+      double finalUseNs =
+          (*llvm::max_element(targets, [](const auto *left,
+                                         const auto *right) {
+            return left->finishNs < right->finishNs;
+          }))->finishNs;
+      if (failed(extendProducedLifetime(dependency, finalUseNs)))
+        return failure();
+    }
+
+    // One received payload can feed several consumers on the same tile. Keep
+    // one range and extend it through the final consuming assignment.
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, unsigned>
+        incomingPayloads;
+    for (const LogicalTileEdge &edge : problem.tileGraph.edges) {
+      if (edge.sourceTileId == tile.id) {
+        for (const LogicalTileDependency &dependency : edge.dependencies) {
+          SmallVector<const LogicalTileAssignment *> targets = findAssignments(
+              dependency.targetOperationId, dependency.targetWorkUnitId,
+              edge.targetTileId);
+          if (targets.empty() || llvm::any_of(targets, [&](const auto *target) {
+                return !validAssignmentTimes(*target);
+              })) {
+            markIncomplete("an outgoing dependency has no scheduled target");
+            continue;
+          }
+          // The source buffer must survive until the route can hand the value
+          // to its destination. Target start is a conservative pre-placement
+          // proxy for route completion.
+          double finalUseNs =
+              (*llvm::max_element(targets, [](const auto *left,
+                                             const auto *right) {
+                return left->startNs < right->startNs;
+              }))->startNs;
+          if (failed(extendProducedLifetime(dependency, finalUseNs)))
+            return failure();
+        }
+      }
+      if (edge.targetTileId != tile.id)
+        continue;
+      for (const LogicalTileDependency &dependency : edge.dependencies) {
+        if (dependency.byteSize < 0) {
+          markIncomplete("an incoming dependency has unknown byte size");
+          continue;
+        }
+        if (dependency.byteSize == 0)
+          continue;
+        SmallVector<const LogicalTileAssignment *> sources = findAssignments(
+            dependency.sourceOperationId, dependency.sourceWorkUnitId,
+            edge.sourceTileId);
+        SmallVector<const LogicalTileAssignment *> targets = findAssignments(
+            dependency.targetOperationId, dependency.targetWorkUnitId, tile.id);
+        if (sources.empty() || targets.empty() ||
+            llvm::any_of(sources, [&](const auto *source) {
+              return !validAssignmentTimes(*source);
+            }) ||
+            llvm::any_of(targets, [&](const auto *target) {
+              return !validAssignmentTimes(*target);
+            })) {
+          markIncomplete("an incoming dependency has an unscheduled endpoint");
+          continue;
+        }
+        double sourceFinishNs =
+            (*llvm::max_element(sources, [](const auto *left,
+                                           const auto *right) {
+              return left->finishNs < right->finishNs;
+            }))->finishNs;
+        double targetFinishNs =
+            (*llvm::max_element(targets, [](const auto *left,
+                                           const auto *right) {
+              return left->finishNs < right->finishNs;
+            }))->finishNs;
+        auto key = std::make_tuple(
+            dependency.sourceOperationId, dependency.sourceWorkUnitId,
+            dependency.tensorId, dependency.byteSize);
+        auto existing = incomingPayloads.find(key);
+        if (existing == incomingPayloads.end()) {
+          unsigned index = liveRanges.size();
+          liveRanges.push_back(
+              {dependency.byteSize,
+               sourceFinishNs,
+               targetFinishNs,
+               EstimateTransientKind::Incoming,
+               edge.sourceTileId,
+               dependency.sourceOperationId,
+               dependency.sourceWorkUnitId,
+               dependency.targetOperationId,
+               dependency.targetWorkUnitId,
+               dependency.tensorId});
+          incomingPayloads.emplace(key, index);
+        } else {
+          EstimateLiveRange &range = liveRanges[existing->second];
+          range.beginNs = std::min(range.beginNs, sourceFinishNs);
+          range.endNs = std::max(range.endNs, targetFinishNs);
+        }
+      }
+    }
+
+    std::map<double, EstimateEventBucket> events;
+    for (EstimateLiveRange &range : liveRanges) {
+      if (!std::isfinite(range.beginNs) || !std::isfinite(range.endNs) ||
+          range.beginNs < 0.0) {
+        markIncomplete("a resource has invalid lifetime bounds");
+        continue;
+      }
+      if (range.endNs < range.beginNs) {
+        markIncomplete("a resource dies before it becomes live");
+        range.endNs = range.beginNs;
+      }
+      EstimateEventBucket &begin = events[range.beginNs];
+      if (range.beginNs == range.endNs) {
+        int64_t &instant = range.kind == EstimateTransientKind::Produced
+                               ? begin.producedInstant
+                               : begin.incomingInstant;
+        if (failed(checkedAccumulateEstimate(instant, range.bytes,
+                                             problem.anchor)))
+          return failure();
+        continue;
+      }
+      EstimateEventBucket &end = events[range.endNs];
+      int64_t &starts = range.kind == EstimateTransientKind::Produced
+                            ? begin.producedStarts
+                            : begin.incomingStarts;
+      int64_t &ends = range.kind == EstimateTransientKind::Produced
+                          ? end.producedEnds
+                          : end.incomingEnds;
+      if (failed(checkedAccumulateEstimate(starts, range.bytes,
+                                           problem.anchor)) ||
+          failed(checkedAccumulateEstimate(ends, range.bytes,
+                                           problem.anchor)))
+        return failure();
+    }
+
+    int64_t liveProduced = 0;
+    int64_t liveIncoming = 0;
+    double peakTimeNs = 0.0;
+    bool hasPeakTime = false;
+    estimate.requiredBytes = estimate.persistentBytes;
+    for (const auto &[time, event] : events) {
+      // A resource whose final consumer has completed can be reused by work
+      // beginning at the same scheduled instant.
+      if (failed(checkedReleaseEstimate(liveProduced, event.producedEnds,
+                                        problem.anchor)) ||
+          failed(checkedReleaseEstimate(liveIncoming, event.incomingEnds,
+                                        problem.anchor)) ||
+          failed(checkedAccumulateEstimate(liveProduced, event.producedStarts,
+                                           problem.anchor)) ||
+          failed(checkedAccumulateEstimate(liveIncoming, event.incomingStarts,
+                                           problem.anchor)) ||
+          failed(checkedAccumulateEstimate(liveProduced,
+                                           event.producedInstant,
+                                           problem.anchor)) ||
+          failed(checkedAccumulateEstimate(liveIncoming,
+                                           event.incomingInstant,
+                                           problem.anchor)))
+        return failure();
+
+      std::optional<int64_t> transient =
+          llvm::checkedAdd(liveProduced, liveIncoming);
+      std::optional<int64_t> required =
+          transient ? llvm::checkedAdd(estimate.persistentBytes, *transient)
+                    : std::nullopt;
+      if (!required)
+        return problem.anchor->emitError(
+            "logical-tile peak-memory estimate overflow");
+      if (*required > estimate.requiredBytes) {
+        estimate.requiredBytes = *required;
+        estimate.producedBytes = liveProduced;
+        estimate.incomingBytes = liveIncoming;
+        peakTimeNs = time;
+        hasPeakTime = true;
+      }
+
+      if (failed(checkedReleaseEstimate(liveProduced,
+                                        event.producedInstant,
+                                        problem.anchor)) ||
+          failed(checkedReleaseEstimate(liveIncoming,
+                                        event.incomingInstant,
+                                        problem.anchor)))
+        return failure();
+    }
+    if (liveProduced != 0 || liveIncoming != 0)
+      return problem.anchor->emitError(
+          "logical-tile memory lifetimes do not close at schedule end");
+
+    // Keep capacity failures actionable without attaching diagnostics to the
+    // potentially enormous one-line module operation. Report the first
+    // offending tile and its largest payloads at the exact peak as a compact,
+    // grep-friendly record on stderr.
+    if (!emittedCapacityDiagnostic && problem.tileMemoryCapacityBytes > 0 &&
+        estimate.requiredBytes > problem.tileMemoryCapacityBytes) {
+      emittedCapacityDiagnostic = true;
+      SmallVector<const EstimateLiveRange *> activeRanges;
+      size_t activeProducedCount = 0;
+      size_t activeIncomingCount = 0;
+      if (hasPeakTime) {
+        for (const EstimateLiveRange &range : liveRanges) {
+          bool live = range.beginNs == range.endNs
+                          ? range.beginNs == peakTimeNs
+                          : range.beginNs <= peakTimeNs &&
+                                peakTimeNs < range.endNs;
+          if (!live)
+            continue;
+          activeRanges.push_back(&range);
+          if (range.kind == EstimateTransientKind::Produced)
+            ++activeProducedCount;
+          else
+            ++activeIncomingCount;
+        }
+      }
+      llvm::sort(activeRanges, [](const EstimateLiveRange *left,
+                                  const EstimateLiveRange *right) {
+        return std::tie(left->bytes, left->beginNs, left->endNs) >
+               std::tie(right->bytes, right->beginNs, right->endNs);
+      });
+      constexpr size_t maxReportedPayloads = 12;
+      llvm::errs() << "SCULPTOR_LOGICAL_TILE_MEMORY_PEAK tile=" << tile.id
+                   << " capacity_bytes=" << problem.tileMemoryCapacityBytes
+                   << " required_bytes=" << estimate.requiredBytes
+                   << " persistent_bytes=" << estimate.persistentBytes
+                   << " produced_bytes=" << estimate.producedBytes
+                   << " incoming_bytes=" << estimate.incomingBytes
+                   << " time_ns=";
+      if (hasPeakTime)
+        llvm::errs() << peakTimeNs;
+      else
+        llvm::errs() << "none";
+      llvm::errs() << " active_produced_count=" << activeProducedCount
+                   << " active_incoming_count=" << activeIncomingCount
+                   << '\n';
+      for (const EstimateLiveRange *range :
+           llvm::ArrayRef(activeRanges).take_front(
+               std::min(maxReportedPayloads, activeRanges.size()))) {
+        StringRef sourceName = "unknown";
+        StringRef targetName = "unknown";
+        StringRef tensorDefiningName = "block_argument";
+        if (range->sourceOperationId >= 0 &&
+            range->sourceOperationId <
+                static_cast<int64_t>(graph.operations.size()))
+          sourceName = graph.operations[range->sourceOperationId]
+                           .operation->getName()
+                           .getStringRef();
+        if (range->targetOperationId >= 0 &&
+            range->targetOperationId <
+                static_cast<int64_t>(graph.operations.size()))
+          targetName = graph.operations[range->targetOperationId]
+                           .operation->getName()
+                           .getStringRef();
+        if (range->tensorId >= 0 &&
+            range->tensorId < static_cast<int64_t>(graph.tensors.size()))
+          if (Operation *defining =
+                  graph.tensors[range->tensorId].value.getDefiningOp())
+            tensorDefiningName = defining->getName().getStringRef();
+        llvm::errs() << "SCULPTOR_LOGICAL_TILE_MEMORY_PAYLOAD"
+                     << " kind="
+                     << (range->kind == EstimateTransientKind::Produced
+                             ? "produced"
+                             : "incoming")
+                     << " bytes=" << range->bytes
+                     << " source_tile=" << range->sourceTileId
+                     << " source_operation=" << range->sourceOperationId
+                     << " source_name=" << sourceName
+                     << " source_work_unit=" << range->sourceWorkUnitId
+                     << " target_operation=" << range->targetOperationId
+                     << " target_name=" << targetName
+                     << " target_work_unit=" << range->targetWorkUnitId
+                     << " tensor=" << range->tensorId
+                     << " tensor_defining_name=" << tensorDefiningName
+                     << " begin_ns=" << range->beginNs
+                     << " end_ns=" << range->endNs << '\n';
+      }
+    }
+    problem.memoryEstimateIndexByTileId[tile.id] =
+        problem.memoryEstimates.size();
+    problem.memoryEstimates.push_back(estimate);
+  }
+  return success();
+}
+
 } // namespace
 
 namespace mlir {
@@ -111,7 +877,8 @@ LogicalResult initializeLogicalTilePlacementProblem(
   problem.computeGraph = &computeGraph;
   problem.raTree = &resourceAllocationTree;
   problem.costProfile = &costProfileStorage;
-  return success();
+  return buildLogicalTileMemoryEstimates(computeGraph, resourceAllocationTree,
+                                         problem);
 }
 
 LogicalResult initializeLogicalTilePlacementProblemFromPlan(
@@ -122,6 +889,8 @@ LogicalResult initializeLogicalTilePlacementProblemFromPlan(
   problem.mesh = {placementAttr.getMeshRows().getInt(),
                   placementAttr.getMeshCols().getInt(),
                   placementAttr.getArraysPerCore().getInt()};
+  problem.tileMemoryCapacityBytes =
+      placementAttr.getTileMemoryCapacityBytes().getInt();
   FailureOr<PlacementObjectiveKind> objective = parsePlacementObjective(
       placementAttr.getObjective().getValue(), problem.anchor);
   FailureOr<TemporalNetworkMode> networkMode = parseTemporalNetworkMode(
@@ -273,6 +1042,60 @@ LogicalResult validateLogicalTilePlacementProblem(
       return failure();
     }
   }
+  if (problem.tileMemoryCapacityBytes < 0) {
+    problem.anchor->emitError(
+        "tile memory capacity must be nonnegative; zero disables it");
+    return failure();
+  }
+  if (problem.memoryEstimates.size() != problem.tileGraph.tiles.size()) {
+    problem.anchor->emitError(
+        "logical-tile memory estimate count does not match active tiles");
+    return failure();
+  }
+  llvm::DenseSet<int64_t> estimatedTileIds;
+  for (const LogicalTileMemoryEstimate &estimate : problem.memoryEstimates) {
+    if (!problem.tileGraph.tileIndexById.contains(estimate.logicalTileId) ||
+        !estimatedTileIds.insert(estimate.logicalTileId).second ||
+        estimate.persistentBytes < 0 || estimate.producedBytes < 0 ||
+        estimate.incomingBytes < 0 || estimate.requiredBytes < 0) {
+      problem.anchor->emitError(
+          "logical-tile memory estimate has invalid identity or bytes");
+      return failure();
+    }
+    std::optional<int64_t> partial =
+        llvm::checkedAdd(estimate.persistentBytes, estimate.producedBytes);
+    std::optional<int64_t> required =
+        partial ? llvm::checkedAdd(*partial, estimate.incomingBytes)
+                : std::nullopt;
+    if (!required || *required != estimate.requiredBytes) {
+      problem.anchor->emitError(
+          "logical-tile memory estimate categories do not add up");
+      return failure();
+    }
+    if (problem.tileMemoryCapacityBytes == 0)
+      continue;
+    if (!estimate.complete) {
+      problem.anchor->emitError("cannot enforce tile memory capacity for "
+                                "logical tile ")
+          << estimate.logicalTileId
+          << ": its pre-outlining memory estimate is incomplete"
+          << (estimate.incompleteReason.empty()
+                  ? ""
+                  : (" (" + estimate.incompleteReason + ")"));
+      return failure();
+    }
+    if (estimate.requiredBytes > problem.tileMemoryCapacityBytes) {
+      problem.anchor->emitError("logical tile ")
+          << estimate.logicalTileId << " requires " << estimate.requiredBytes
+          << " conservative local-memory bytes (persistent "
+          << estimate.persistentBytes << ", peak produced "
+          << estimate.producedBytes << ", peak incoming "
+          << estimate.incomingBytes << "), exceeding the per-tile "
+             "capacity of "
+          << problem.tileMemoryCapacityBytes << " bytes";
+      return failure();
+    }
+  }
   return success();
 }
 
@@ -348,6 +1171,11 @@ buildLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
     plan.costProfileHash = problem.costProfile->contentHash;
   }
   plan.mesh = problem.mesh;
+  plan.tileMemoryCapacityBytes = problem.tileMemoryCapacityBytes;
+  plan.memoryEstimates = problem.memoryEstimates;
+  for (auto indexedEstimate : llvm::enumerate(plan.memoryEstimates))
+    plan.memoryEstimateIndexByTileId[indexedEstimate.value().logicalTileId] =
+        indexedEstimate.index();
   plan.initialScore = initialScore;
   plan.objectiveScore = objective->score;
   plan.totalTransferCost = objective->transferCost;
@@ -390,10 +1218,10 @@ verifyLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
                                const LogicalTilePlacementPlan &plan) {
   if (failed(validateLogicalTilePlacementProblem(problem)))
     return failure();
-  if (plan.version != 2)
+  if (plan.version != 3)
     return problem.anchor->emitError(
                "logical-tile placement version mismatch: ")
-           << plan.version << " versus 2";
+           << plan.version << " versus 3";
   if (plan.schedule.empty())
     return problem.anchor->emitError(
         "logical-tile placement schedule must not be empty");
@@ -438,6 +1266,32 @@ verifyLogicalTilePlacementPlan(const LogicalTilePlacementProblem &problem,
                "logical-tile placement arrays-per-core mismatch: ")
            << plan.mesh.arraysPerCore << " versus "
            << problem.mesh.arraysPerCore;
+  if (plan.tileMemoryCapacityBytes != problem.tileMemoryCapacityBytes)
+    return problem.anchor->emitError(
+               "logical-tile placement memory-capacity mismatch: ")
+           << plan.tileMemoryCapacityBytes << " versus "
+           << problem.tileMemoryCapacityBytes;
+  if (plan.memoryEstimates.size() != problem.memoryEstimates.size())
+    return problem.anchor->emitError(
+        "logical-tile placement memory-estimate count mismatch");
+  for (const LogicalTileMemoryEstimate &expected : problem.memoryEstimates) {
+    auto indexed =
+        plan.memoryEstimateIndexByTileId.find(expected.logicalTileId);
+    if (indexed == plan.memoryEstimateIndexByTileId.end())
+      return problem.anchor->emitError(
+          "logical-tile placement is missing a memory estimate");
+    const LogicalTileMemoryEstimate &actual =
+        plan.memoryEstimates[indexed->second];
+    if (actual.logicalTileId != expected.logicalTileId ||
+        actual.persistentBytes != expected.persistentBytes ||
+        actual.producedBytes != expected.producedBytes ||
+        actual.incomingBytes != expected.incomingBytes ||
+        actual.requiredBytes != expected.requiredBytes ||
+        actual.complete != expected.complete)
+      return problem.anchor->emitError(
+          "logical-tile placement memory estimate does not match the "
+          "reconstructed placement problem");
+  }
   if (plan.initialScore < 0)
     return problem.anchor->emitError(
         "logical-tile placement initial score must be nonnegative");
@@ -571,6 +1425,17 @@ serializeLogicalTilePlacement(MLIRContext *context,
         builder.getI64IntegerAttr(edge.manhattanHops),
         builder.getI64IntegerAttr(edge.transferCost)));
   }
+  SmallVector<Attribute> memoryEstimates;
+  memoryEstimates.reserve(plan.memoryEstimates.size());
+  for (const LogicalTileMemoryEstimate &estimate : plan.memoryEstimates) {
+    memoryEstimates.push_back(LogicalTileMemoryEstimateAttr::get(
+        context, builder.getI64IntegerAttr(estimate.logicalTileId),
+        builder.getI64IntegerAttr(estimate.persistentBytes),
+        builder.getI64IntegerAttr(estimate.producedBytes),
+        builder.getI64IntegerAttr(estimate.incomingBytes),
+        builder.getI64IntegerAttr(estimate.requiredBytes),
+        builder.getBoolAttr(estimate.complete)));
+  }
   return LogicalTilePlacementAttr::get(
       context, builder.getI64IntegerAttr(plan.version),
       builder.getStringAttr(plan.schedule),
@@ -583,6 +1448,8 @@ serializeLogicalTilePlacement(MLIRContext *context,
       builder.getI64IntegerAttr(plan.mesh.rows),
       builder.getI64IntegerAttr(plan.mesh.columns),
       builder.getI64IntegerAttr(plan.mesh.arraysPerCore),
+      builder.getI64IntegerAttr(plan.tileMemoryCapacityBytes),
+      builder.getArrayAttr(memoryEstimates),
       builder.getI64IntegerAttr(plan.initialScore),
       builder.getI64IntegerAttr(plan.objectiveScore),
       builder.getI64IntegerAttr(plan.totalTransferCost),
@@ -615,6 +1482,29 @@ deserializeLogicalTilePlacement(LogicalTilePlacementAttr attr,
   plan.costProfileHash = attr.getCostProfileHash().getValue().str();
   plan.mesh = {attr.getMeshRows().getInt(), attr.getMeshCols().getInt(),
                attr.getArraysPerCore().getInt()};
+  plan.tileMemoryCapacityBytes = attr.getTileMemoryCapacityBytes().getInt();
+  for (Attribute value : attr.getMemoryEstimates()) {
+    auto estimateAttr = dyn_cast<LogicalTileMemoryEstimateAttr>(value);
+    if (!estimateAttr) {
+      problem.anchor->emitError("logical-tile memory estimates must be typed");
+      return failure();
+    }
+    LogicalTileMemoryEstimate estimate{
+        estimateAttr.getLogicalTileId().getInt(),
+        estimateAttr.getPersistentBytes().getInt(),
+        estimateAttr.getProducedBytes().getInt(),
+        estimateAttr.getIncomingBytes().getInt(),
+        estimateAttr.getRequiredBytes().getInt(),
+        estimateAttr.getComplete().getValue()};
+    if (plan.memoryEstimateIndexByTileId.contains(estimate.logicalTileId)) {
+      problem.anchor->emitError(
+          "logical-tile placement contains a duplicate memory estimate");
+      return failure();
+    }
+    plan.memoryEstimateIndexByTileId[estimate.logicalTileId] =
+        plan.memoryEstimates.size();
+    plan.memoryEstimates.push_back(estimate);
+  }
   plan.initialScore = attr.getInitialScore().getInt();
   plan.objectiveScore = attr.getObjectiveScore().getInt();
   plan.totalTransferCost = attr.getTotalTransferCost().getInt();

@@ -31,21 +31,21 @@ MappingWorkUnitAttr withShardIdentity(MappingWorkUnitAttr attr, int64_t groupId,
       IntegerAttr::get(IntegerType::get(attr.getContext(), 64), count));
 }
 
-FailureOr<int64_t> getShardByteSize(MappingWorkUnitAttr attr,
-                                    RankedTensorType type, Operation *anchor) {
+FailureOr<int64_t> getRegionByteSize(ArrayRef<int64_t> sizes,
+                                     RankedTensorType type,
+                                     Operation *anchor) {
   unsigned bitWidth = type.getElementTypeBitWidth();
   if (bitWidth == 0 || bitWidth % 8 != 0) {
     anchor->emitError("shard dataflow requires byte-addressable element types");
     return failure();
   }
   int64_t bytes = bitWidth / 8;
-  for (Attribute value : attr.getResultSizes()) {
-    auto size = dyn_cast<IntegerAttr>(value);
-    if (!size || size.getInt() <= 0) {
+  for (int64_t size : sizes) {
+    if (size <= 0) {
       anchor->emitError("shard dataflow requires positive static tile sizes");
       return failure();
     }
-    std::optional<int64_t> next = llvm::checkedMul(bytes, size.getInt());
+    std::optional<int64_t> next = llvm::checkedMul(bytes, size);
     if (!next) {
       anchor->emitError("shard byte size overflows int64");
       return failure();
@@ -53,6 +53,58 @@ FailureOr<int64_t> getShardByteSize(MappingWorkUnitAttr attr,
     bytes = *next;
   }
   return bytes;
+}
+
+std::optional<StaticTileRegion>
+intersectTileRegions(ArrayRef<int64_t> lhsOffsets,
+                     ArrayRef<int64_t> lhsSizes,
+                     ArrayRef<int64_t> rhsOffsets,
+                     ArrayRef<int64_t> rhsSizes) {
+  if (lhsOffsets.size() != lhsSizes.size() ||
+      rhsOffsets.size() != rhsSizes.size() ||
+      lhsOffsets.size() != rhsOffsets.size())
+    return std::nullopt;
+
+  StaticTileRegion intersection;
+  intersection.offsets.reserve(lhsOffsets.size());
+  intersection.sizes.reserve(lhsSizes.size());
+  for (auto [lhsOffset, lhsSize, rhsOffset, rhsSize] :
+       llvm::zip_equal(lhsOffsets, lhsSizes, rhsOffsets, rhsSizes)) {
+    if (lhsSize <= 0 || rhsSize <= 0)
+      return std::nullopt;
+    int64_t begin = std::max(lhsOffset, rhsOffset);
+    int64_t end = std::min(lhsOffset + lhsSize, rhsOffset + rhsSize);
+    if (begin >= end)
+      return std::nullopt;
+    intersection.offsets.push_back(begin);
+    intersection.sizes.push_back(end - begin);
+  }
+  return intersection;
+}
+
+bool regionsOverlap(ArrayRef<int64_t> lhsOffsets, ArrayRef<int64_t> lhsSizes,
+                    ArrayRef<int64_t> rhsOffsets,
+                    ArrayRef<int64_t> rhsSizes) {
+  return intersectTileRegions(lhsOffsets, lhsSizes, rhsOffsets, rhsSizes)
+      .has_value();
+}
+
+FailureOr<int64_t> getRegionElementCount(ArrayRef<int64_t> sizes,
+                                         Operation *anchor) {
+  int64_t elements = 1;
+  for (int64_t size : sizes) {
+    if (size <= 0) {
+      anchor->emitError("shard dataflow requires positive static tile sizes");
+      return failure();
+    }
+    std::optional<int64_t> next = llvm::checkedMul(elements, size);
+    if (!next) {
+      anchor->emitError("shard element count overflows int64");
+      return failure();
+    }
+    elements = *next;
+  }
+  return elements;
 }
 
 bool sameTileRegion(ArrayRef<int64_t> lhsOffsets, ArrayRef<int64_t> lhsSizes,
@@ -244,102 +296,152 @@ LogicalResult planShardDataflow(func::FuncOp function,
         }
         continue;
       }
-      if (producersByConsumer.lookup(consumerId).size() > 1) {
-        assemblyBoundaries.insert({producerId, consumerId});
-        if (requireCompleteChain) {
-          use.getOwner()->emitError("complete shard chain reaches incompatible "
-                                    "producer shard groups");
-          return failure();
-        }
-        continue;
-      }
-
       auto consumer = dyn_cast<linalg::LinalgOp>(use.getOwner());
-      if (!consumer || consumer->getNumResults() != 1 ||
-          llvm::any_of(cast<TilingInterface>(consumer.getOperation())
-                           .getLoopIteratorTypes(),
-                       [](utils::IteratorType iterator) {
-                         return iterator != utils::IteratorType::parallel;
-                       })) {
+      if (!consumer || consumer->getNumResults() != 1) {
         assemblyBoundaries.insert({producerId, consumerId});
         if (requireCompleteChain) {
           use.getOwner()->emitError(
-              "complete shard chain reaches a non-elementwise boundary");
+              "complete shard chain reaches an unsupported boundary");
           return failure();
         }
         continue;
       }
       AffineMap operandMap = consumer.getMatchingIndexingMap(&use);
-      struct WorkUnitPair {
+      struct WorkUnitIntersection {
         MappingWorkUnitAttr source;
         MappingWorkUnitAttr target;
         size_t targetIndex;
+        StaticTileRegion region;
       };
-      SmallVector<WorkUnitPair> pairs;
-      SmallVector<bool> matchedTargets(consumerUnits->second.size(), false);
-      for (MappingWorkUnitAttr source : producerUnits->second) {
-        SmallVector<int64_t> sourceOffsets =
-            getIntegerArray(source.getResultOffsets());
-        SmallVector<int64_t> sourceSizes =
-            getIntegerArray(source.getResultSizes());
-        std::optional<size_t> matchingTarget;
-        for (auto [targetIndex, target] :
-             llvm::enumerate(consumerUnits->second)) {
-          if (matchedTargets[targetIndex])
-            continue;
-          std::optional<StaticTileRegion> inputRegion =
-              mapIterationTileThroughIndexingMap(
-                  operandMap, getIntegerArray(target.getIterationOffsets()),
-                  getIntegerArray(target.getIterationSizes()));
-          if (!inputRegion ||
-              !sameTileRegion(sourceOffsets, sourceSizes, inputRegion->offsets,
-                              inputRegion->sizes))
-            continue;
-          if (matchingTarget) {
-            matchingTarget.reset();
-            break;
-          }
-          matchingTarget = targetIndex;
-        }
-        if (!matchingTarget) {
-          pairs.clear();
+      SmallVector<WorkUnitIntersection> intersections;
+      bool completeCoverage = true;
+      for (auto [targetIndex, target] :
+           llvm::enumerate(consumerUnits->second)) {
+        std::optional<StaticTileRegion> inputRegion =
+            mapIterationTileThroughIndexingMap(
+                operandMap, getIntegerArray(target.getIterationOffsets()),
+                getIntegerArray(target.getIterationSizes()));
+        if (!inputRegion) {
+          completeCoverage = false;
           break;
         }
-        matchedTargets[*matchingTarget] = true;
-        pairs.push_back(
-            {source, consumerUnits->second[*matchingTarget], *matchingTarget});
+
+        FailureOr<int64_t> demandedElements =
+            getRegionElementCount(inputRegion->sizes, use.getOwner());
+        if (failed(demandedElements))
+          return failure();
+        int64_t coveredElements = 0;
+        SmallVector<StaticTileRegion> targetIntersections;
+        for (MappingWorkUnitAttr source : producerUnits->second) {
+          std::optional<StaticTileRegion> intersection = intersectTileRegions(
+              getIntegerArray(source.getResultOffsets()),
+              getIntegerArray(source.getResultSizes()), inputRegion->offsets,
+              inputRegion->sizes);
+          if (!intersection)
+            continue;
+          if (llvm::any_of(targetIntersections,
+                           [&](const StaticTileRegion &existing) {
+                             return regionsOverlap(
+                                 existing.offsets, existing.sizes,
+                                 intersection->offsets, intersection->sizes);
+                           })) {
+            use.getOwner()->emitError(
+                "producer work units overlap within one consumer demand");
+            return failure();
+          }
+          FailureOr<int64_t> intersectionElements =
+              getRegionElementCount(intersection->sizes, use.getOwner());
+          if (failed(intersectionElements))
+            return failure();
+          std::optional<int64_t> next =
+              llvm::checkedAdd(coveredElements, *intersectionElements);
+          if (!next) {
+            use.getOwner()->emitError(
+                "consumer shard coverage overflows int64");
+            return failure();
+          }
+          coveredElements = *next;
+          targetIntersections.push_back(*intersection);
+          intersections.push_back({source, target, targetIndex,
+                                   std::move(*intersection)});
+        }
+        if (coveredElements != *demandedElements) {
+          completeCoverage = false;
+          break;
+        }
       }
-      if (pairs.size() != producerUnits->second.size() ||
-          pairs.size() != consumerUnits->second.size()) {
+      if (!completeCoverage || intersections.empty()) {
         assemblyBoundaries.insert({producerId, consumerId});
         if (requireCompleteChain) {
           use.getOwner()->emitError(
-              "complete shard chain has incompatible work-unit coverage");
+              "complete shard chain has incomplete work-unit coverage");
           return failure();
         }
         continue;
       }
 
-      int64_t shardGroup = pairs.front().source.getShardGroupId().getInt();
-      SmallVector<Attribute> rewrittenConsumerUnits;
-      rewrittenConsumerUnits.reserve(consumerUnits->second.size());
+      // Preserve the original one-to-one shard identity propagation. For an
+      // intersection graph, the target work units have their own stable shard
+      // group because one target can depend on multiple source shards or
+      // multiple producer groups.
+      bool oneToOne = producersByConsumer.lookup(consumerId).size() == 1 &&
+                      intersections.size() == producerUnits->second.size() &&
+                      intersections.size() == consumerUnits->second.size();
       SmallVector<int64_t> sourceShardByTarget(consumerUnits->second.size(),
                                                -1);
-      for (const WorkUnitPair &pair : pairs)
-        sourceShardByTarget[pair.targetIndex] =
-            pair.source.getShardIndex().getInt();
-      for (auto [targetIndex, unit] : llvm::enumerate(consumerUnits->second)) {
-        assert(sourceShardByTarget[targetIndex] >= 0);
-        MappingWorkUnitAttr updated = withShardIdentity(
-            unit, shardGroup, sourceShardByTarget[targetIndex],
-            consumerUnits->second.size());
-        consumerUnits->second[targetIndex] = updated;
-        rewrittenConsumerUnits.push_back(updated);
+      SmallVector<bool> seenSources(producerUnits->second.size(), false);
+      if (oneToOne) {
+        for (const WorkUnitIntersection &intersection : intersections) {
+          SmallVector<int64_t> sourceOffsets =
+              getIntegerArray(intersection.source.getResultOffsets());
+          SmallVector<int64_t> sourceSizes =
+              getIntegerArray(intersection.source.getResultSizes());
+          if (!sameTileRegion(sourceOffsets, sourceSizes,
+                              intersection.region.offsets,
+                              intersection.region.sizes) ||
+              sourceShardByTarget[intersection.targetIndex] >= 0) {
+            oneToOne = false;
+            break;
+          }
+          auto sourceIt = llvm::find_if(
+              producerUnits->second, [&](MappingWorkUnitAttr candidate) {
+                return candidate.getId() == intersection.source.getId();
+              });
+          if (sourceIt == producerUnits->second.end()) {
+            oneToOne = false;
+            break;
+          }
+          size_t sourceIndex =
+              static_cast<size_t>(sourceIt - producerUnits->second.begin());
+          if (seenSources[sourceIndex]) {
+            oneToOne = false;
+            break;
+          }
+          seenSources[sourceIndex] = true;
+          sourceShardByTarget[intersection.targetIndex] =
+              intersection.source.getShardIndex().getInt();
+        }
       }
-      graph.operations[consumerId].operation->setAttr(
-          kExpandedDigitalWorkAttrName,
-          builder.getArrayAttr(rewrittenConsumerUnits));
-      propagationLevel[consumerId] = propagationLevel.lookup(producerId) + 1;
+      if (oneToOne) {
+        int64_t shardGroup =
+            intersections.front().source.getShardGroupId().getInt();
+        SmallVector<Attribute> rewrittenConsumerUnits;
+        rewrittenConsumerUnits.reserve(consumerUnits->second.size());
+        for (auto [targetIndex, unit] :
+             llvm::enumerate(consumerUnits->second)) {
+          MappingWorkUnitAttr updated = withShardIdentity(
+              unit, shardGroup, sourceShardByTarget[targetIndex],
+              consumerUnits->second.size());
+          consumerUnits->second[targetIndex] = updated;
+          rewrittenConsumerUnits.push_back(updated);
+        }
+        graph.operations[consumerId].operation->setAttr(
+            kExpandedDigitalWorkAttrName,
+            builder.getArrayAttr(rewrittenConsumerUnits));
+      }
+      propagationLevel[consumerId] =
+          std::max(propagationLevel.lookup(consumerId),
+                   propagationLevel.lookup(producerId) + 1);
 
       int64_t tensorId = -1;
       for (const ComputeTensor &tensor : graph.tensors) {
@@ -354,16 +456,17 @@ LogicalResult planShardDataflow(func::FuncOp function,
         return use.getOwner()->emitError(
             "shard edge cannot resolve its compute tensor");
 
-      for (const auto &pair : pairs) {
-        MappingWorkUnitAttr source = pair.source;
-        MappingWorkUnitAttr target = consumerUnits->second[pair.targetIndex];
+      for (const WorkUnitIntersection &intersection : intersections) {
+        MappingWorkUnitAttr source = intersection.source;
+        MappingWorkUnitAttr target =
+            consumerUnits->second[intersection.targetIndex];
         auto identity =
             std::make_tuple(producerId, source.getId().getInt(), consumerId,
                             target.getId().getInt(), use.getOperandNumber());
         if (!seen.insert(identity).second)
           continue;
-        FailureOr<int64_t> bytes =
-            getShardByteSize(source, producerType, use.getOwner());
+        FailureOr<int64_t> bytes = getRegionByteSize(
+            intersection.region.sizes, producerType, use.getOwner());
         if (failed(bytes))
           return failure();
         exactEdges.push_back(MappingWorkUnitEdgeAttr::get(

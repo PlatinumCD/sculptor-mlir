@@ -3,6 +3,7 @@ set(SCULPTOR_MAPPING_PLANNER_SOURCES
   planners/RegisterMappingPlanners.cpp
   planners/ConsumerBoundFill/ConsumerBoundFillPlanner.cpp
   planners/FanOutCut/FanOutCutPlanner.cpp
+  planners/LayerCut/LayerCutPlanner.cpp
   planners/MVMWave/MVMWavePlanner.cpp
   planners/RecursiveForkJoin/RecursiveForkJoinPlanner.cpp
   planners/SetupFirst/SetupFirstPlanner.cpp

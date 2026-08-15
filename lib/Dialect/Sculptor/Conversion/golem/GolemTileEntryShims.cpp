@@ -1,6 +1,7 @@
 #include "GolemTileABI.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include "mlir/IR/SymbolTable.h"
 
@@ -64,6 +65,25 @@ SmallVector<int64_t> computeStaticStrides(ShapedType shapedType) {
   return strides;
 }
 
+uint32_t getElementTypeCode(Type elementType) {
+  if (elementType.isF32())
+    return kFloat32ElementType;
+  auto integerType = cast<IntegerType>(elementType);
+  bool isUnsigned = integerType.isUnsigned();
+  switch (integerType.getWidth()) {
+  case 8:
+    return isUnsigned ? kUInt8ElementType : kInt8ElementType;
+  case 16:
+    return isUnsigned ? kUInt16ElementType : kInt16ElementType;
+  case 32:
+    return isUnsigned ? kUInt32ElementType : kInt32ElementType;
+  case 64:
+    return isUnsigned ? kUInt64ElementType : kInt64ElementType;
+  default:
+    llvm_unreachable("unsupported validated tile ABI element type");
+  }
+}
+
 Value validateTensorHeader(OpBuilder &builder, Location loc, Value tensor,
                            ShapedType shapedType) {
   Value elementType =
@@ -74,7 +94,8 @@ Value validateTensorHeader(OpBuilder &builder, Location loc, Value tensor,
       builder.create<LLVM::ExtractValueOp>(loc, tensor, ArrayRef<int64_t>{2});
 
   Value valid = isEqual(builder, loc, elementType,
-                        buildI32(builder, loc, kFloat32ElementType));
+                        buildI32(builder, loc, getElementTypeCode(
+                                                  shapedType.getElementType())));
   valid = andValue(builder, loc, valid,
                    isEqual(builder, loc, rank,
                            buildI64(builder, loc, shapedType.getRank())));
@@ -130,7 +151,7 @@ void copyDescriptorData(OpBuilder &builder, Location loc,
                         Value sourceDescriptor, Value destinationDescriptor,
                         ShapedType shapedType) {
   Type ptrType = LLVM::LLVMPointerType::get(builder.getContext());
-  Type f32Type = Float32Type::get(builder.getContext());
+  Type elementType = shapedType.getElementType();
   Value sourceAligned = builder.create<LLVM::ExtractValueOp>(
       loc, sourceDescriptor, ArrayRef<int64_t>{1});
   Value sourceOffset = builder.create<LLVM::ExtractValueOp>(
@@ -139,11 +160,12 @@ void copyDescriptorData(OpBuilder &builder, Location loc,
       loc, destinationDescriptor, ArrayRef<int64_t>{1});
   Value destinationOffset = builder.create<LLVM::ExtractValueOp>(
       loc, destinationDescriptor, ArrayRef<int64_t>{2});
-  Value source = builder.create<LLVM::GEPOp>(loc, ptrType, f32Type,
+  Value source = builder.create<LLVM::GEPOp>(loc, ptrType, elementType,
                                              sourceAligned, sourceOffset);
   Value destination = builder.create<LLVM::GEPOp>(
-      loc, ptrType, f32Type, destinationAligned, destinationOffset);
-  int64_t byteSize = shapedType.getNumElements() * sizeof(float);
+      loc, ptrType, elementType, destinationAligned, destinationOffset);
+  int64_t byteSize = shapedType.getNumElements() *
+                     (elementType.getIntOrFloatBitWidth() / 8);
   builder.create<LLVM::MemcpyOp>(loc, destination, source,
                                  buildI64(builder, loc, byteSize),
                                  /*isVolatile=*/false);

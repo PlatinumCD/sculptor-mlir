@@ -100,14 +100,14 @@ LLVM::GlobalOp getOrCreateStringConstant(OpBuilder &builder, Location loc,
     }
   }
 
-  // Insert globals at module scope so later lowering can reference them by name.
+  // Insert globals at module scope so later lowering can reference them by
+  // name.
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(module.getBody());
   std::string globalName = makeUniqueGlobalName(module, prefix, value);
-  return builder.create<LLVM::GlobalOp>(loc, globalType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::Internal, globalName,
-                                        stringAttr);
+  return builder.create<LLVM::GlobalOp>(
+      loc, globalType,
+      /*isConstant=*/true, LLVM::Linkage::Internal, globalName, stringAttr);
 }
 
 // Derives the enclosing module from the rewrite insertion point before loading.
@@ -125,11 +125,12 @@ Value getOrCreateGlobalStringPtr(OpBuilder &builder, Location loc,
                                  llvm::StringRef value) {
   auto global = getOrCreateStringConstant(builder, loc, module, prefix, value);
   auto globalPtr = builder.create<LLVM::AddressOfOp>(
-      loc, LLVM::LLVMPointerType::get(builder.getContext(), global.getAddrSpace()),
+      loc,
+      LLVM::LLVMPointerType::get(builder.getContext(), global.getAddrSpace()),
       global.getSymNameAttr());
   return builder.create<LLVM::GEPOp>(
-      loc, LLVM::LLVMPointerType::get(builder.getContext()), global.getGlobalType(),
-      globalPtr, ArrayRef<LLVM::GEPArg>{0, 0});
+      loc, LLVM::LLVMPointerType::get(builder.getContext()),
+      global.getGlobalType(), globalPtr, ArrayRef<LLVM::GEPArg>{0, 0});
 }
 
 // Adapts MLIR integer-like values to the fixed i32 runtime argument width.
@@ -175,12 +176,29 @@ void emitShimCall(PatternRewriter &rewriter, Location loc,
 
   auto functionType = rewriter.getFunctionType(argumentTypes, TypeRange{});
   auto callee = getOrCreateShimDecl(module, shimName, functionType);
+  // These shims are external while one-shot bufferization runs. Without an
+  // explicit access contract MLIR must assume every memref argument is
+  // read-write, which inserts a defensive full-buffer copy before each analog
+  // load. The target intrinsics have precise directional semantics.
+  if (shimName == kSetShimName || shimName == kLoadShimName) {
+    callee.setArgAttr(0, "bufferization.access",
+                      rewriter.getStringAttr("read"));
+    if (auto tensorType = dyn_cast<RankedTensorType>(argumentTypes.front())) {
+      SmallVector<int64_t> strides(tensorType.getRank(), ShapedType::kDynamic);
+      callee.setArgAttr(0, "bufferization.buffer_layout",
+                        StridedLayoutAttr::get(rewriter.getContext(),
+                                               ShapedType::kDynamic, strides));
+    }
+  } else if (shimName == kStoreShimName) {
+    callee.setArgAttr(0, "bufferization.access",
+                      rewriter.getStringAttr("write"));
+  }
   rewriter.create<func::CallOp>(loc, callee.getName(), TypeRange{}, operands);
 }
 
 FailureOr<int64_t> getRequiredLocalArrayId(Operation *op) {
-  auto localArrayAttr =
-      op->getAttrOfType<IntegerAttr>(tile_runtime_attrs::kTaskLocalArrayIdAttrName);
+  auto localArrayAttr = op->getAttrOfType<IntegerAttr>(
+      tile_runtime_attrs::kTaskLocalArrayIdAttrName);
   if (localArrayAttr) {
     int64_t localArrayId = localArrayAttr.getInt();
     if (localArrayId < 0 ||
@@ -238,8 +256,8 @@ FailureOr<TypedAttr> getZeroAttrForElementType(PatternRewriter &rewriter,
                                                Type elementType) {
   TypedAttr zeroAttr = rewriter.getZeroAttr(elementType);
   if (!zeroAttr) {
-    return rewriter.notifyMatchFailure(op,
-                                       "expected zero-initializable element type");
+    return rewriter.notifyMatchFailure(
+        op, "expected zero-initializable element type");
   }
   return zeroAttr;
 }
@@ -299,8 +317,8 @@ void copyVectorSliceIntoScratch(PatternRewriter &rewriter, Location loc,
       [&](OpBuilder &builder, Location loopLoc, Value columnIndex, ValueRange) {
         Value sourceCol =
             builder.create<arith::AddIOp>(loopLoc, colOffset, columnIndex);
-        Value value = builder.create<memref::LoadOp>(
-            loopLoc, fullMemref, ValueRange{c0, sourceCol});
+        Value value = builder.create<memref::LoadOp>(loopLoc, fullMemref,
+                                                     ValueRange{c0, sourceCol});
         builder.create<memref::StoreOp>(loopLoc, value, arrayMemref,
                                         ValueRange{c0, columnIndex});
         builder.create<scf::YieldOp>(loopLoc);
@@ -310,14 +328,15 @@ void copyVectorSliceIntoScratch(PatternRewriter &rewriter, Location loc,
 // Narrows the caller-visible store destination to one hardware result slice.
 Value buildStoreDestinationSubview(PatternRewriter &rewriter, Location loc,
                                    Value destination, Value arrayRow,
-                                   Value arrayCol, int64_t arrayRows, Value c0) {
+                                   Value arrayCol, int64_t arrayRows,
+                                   Value c0) {
   llvm::SmallVector<OpFoldResult> offsets{arrayRow, arrayCol, c0};
-  llvm::SmallVector<OpFoldResult> sizes{
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1),
-      rewriter.getIndexAttr(arrayRows)};
-  llvm::SmallVector<OpFoldResult> strides{
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1),
-      rewriter.getIndexAttr(1)};
+  llvm::SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(arrayRows)};
+  llvm::SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1),
+                                          rewriter.getIndexAttr(1),
+                                          rewriter.getIndexAttr(1)};
 
   return rewriter
       .create<memref::SubViewOp>(loc, destination, offsets, sizes, strides)
@@ -344,8 +363,8 @@ void copyStoreScratchToDestination(PatternRewriter &rewriter, Location loc,
       [&](OpBuilder &builder, Location loopLoc, Value laneIndex, ValueRange) {
         Value value = builder.create<memref::LoadOp>(
             loopLoc, scratch, ValueRange{c0, c0, laneIndex});
-        builder.create<memref::StoreOp>(
-            loopLoc, value, destinationSlice, ValueRange{c0, c0, laneIndex});
+        builder.create<memref::StoreOp>(loopLoc, value, destinationSlice,
+                                        ValueRange{c0, c0, laneIndex});
         builder.create<scf::YieldOp>(loopLoc);
       });
 }
@@ -379,29 +398,22 @@ MatrixPlacementPlan buildMatrixPlacementPlan(
   // Read source dimensions at runtime, then clamp copies for boundary tiles.
   Value matrixRows = rewriter.create<memref::DimOp>(loc, fullMemref, 0);
   Value matrixCols = rewriter.create<memref::DimOp>(loc, fullMemref, 1);
-  Value copyRows =
-      buildClampedCopyUpperBound(rewriter, loc, matrixRows, rowOffset, cArrayRows);
-  Value copyCols =
-      buildClampedCopyUpperBound(rewriter, loc, matrixCols, colOffset, cArrayCols);
+  Value copyRows = buildClampedCopyUpperBound(rewriter, loc, matrixRows,
+                                              rowOffset, cArrayRows);
+  Value copyCols = buildClampedCopyUpperBound(rewriter, loc, matrixCols,
+                                              colOffset, cArrayCols);
 
-  MatrixPlacementPlan plan{arrayRows,
-                           arrayCols,
-                           gridType.getGridShape()[1],
-                           c0,
-                           c1,
-                           cArrayRows,
-                           cArrayCols,
-                           rowOffset,
-                           colOffset,
-                           copyRows,
-                           copyCols};
+  MatrixPlacementPlan plan{arrayRows,  arrayCols, gridType.getGridShape()[1],
+                           c0,         c1,        cArrayRows,
+                           cArrayCols, rowOffset, colOffset,
+                           copyRows,   copyCols};
   return plan;
 }
 
 // Gathers the static slice shape and dynamic bounds for one vector placement.
 VectorPlacementPlan buildVectorPlacementPlan(
-    PatternRewriter &rewriter, sculptor::ArrayVectorPlaceOp op, Value sliceIndex,
-    Value fullMemref, sculptor::VectorSliceType sliceType) {
+    PatternRewriter &rewriter, sculptor::ArrayVectorPlaceOp op,
+    Value sliceIndex, Value fullMemref, sculptor::VectorSliceType sliceType) {
   Location loc = op.getLoc();
   int64_t arrayCols = sliceType.getArrayShape()[1];
   Value c0 = buildIndexConstant(rewriter, loc, 0);
@@ -411,16 +423,12 @@ VectorPlacementPlan buildVectorPlacementPlan(
 
   // Read the vector width at runtime so the final slice can be partial.
   Value vectorCols = rewriter.create<memref::DimOp>(loc, fullMemref, 1);
-  Value copyCols =
-      buildClampedCopyUpperBound(rewriter, loc, vectorCols, colOffset, cArrayCols);
+  Value copyCols = buildClampedCopyUpperBound(rewriter, loc, vectorCols,
+                                              colOffset, cArrayCols);
 
-  VectorPlacementPlan plan{arrayCols,
-                           sliceType.getGridShape()[1],
-                           c0,
-                           c1,
-                           cArrayCols,
-                           colOffset,
-                           copyCols};
+  VectorPlacementPlan plan{
+      arrayCols, sliceType.getGridShape()[1], c0, c1, cArrayCols, colOffset,
+      copyCols};
   return plan;
 }
 
@@ -445,7 +453,8 @@ FailureOr<Value> allocateZeroedScratchTile(PatternRewriter &rewriter,
   return scratch;
 }
 
-// Registers type rewrites from Sculptor wrappers to their tensor payload shapes.
+// Registers type rewrites from Sculptor wrappers to their tensor payload
+// shapes.
 void populateSculptorTypeConversions(TypeConverter &typeConverter) {
   typeConverter.addConversion([](Type type) { return type; });
   typeConverter.addConversion(

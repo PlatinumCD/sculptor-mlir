@@ -1,6 +1,8 @@
 #ifndef SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_SUPPORT_IR_SEMANTICOPERATIONSCOPE_H
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_SUPPORT_IR_SEMANTICOPERATIONSCOPE_H
 
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticLayerIdentity.h"
+
 #include "llvm/ADT/StringRef.h"
 
 #include "mlir/IR/Builders.h"
@@ -50,6 +52,20 @@ public:
         if (!operation->hasAttr(attribute.getName()))
           operation->setAttr(attribute.getName(), attribute.getValue());
       }
+      // Sections and stage names intentionally describe only the inserted
+      // top-level stage. Parent-layer identity, however, must survive on the
+      // nested executable operations that later outlining may detach from it.
+      operation->walk([&](Operation *nested) {
+        if (nested == operation)
+          return;
+        for (llvm::StringRef name : {kSemanticLayerIdAttrName,
+                                     kSemanticLayerKindAttrName}) {
+          if (!nested->hasAttr(name)) {
+            if (Attribute value = attributes.get(name))
+              nested->setAttr(name, value);
+          }
+        }
+      });
       operation = operation->getNextNode();
     }
   }

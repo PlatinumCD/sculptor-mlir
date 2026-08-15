@@ -13,6 +13,8 @@ enum class ElementType : uint32_t {
     UInt16 = 5,
     Int32 = 6,
     UInt32 = 7,
+    Int64 = 8,
+    UInt64 = 9,
 };
 
 struct Tensor {
@@ -33,6 +35,9 @@ constexpr uint32_t elementSizeBytes(ElementType element_type) {
         case ElementType::Int32:
         case ElementType::UInt32:
             return 4;
+        case ElementType::Int64:
+        case ElementType::UInt64:
+            return 8;
         case ElementType::Invalid:
             return 0;
     }

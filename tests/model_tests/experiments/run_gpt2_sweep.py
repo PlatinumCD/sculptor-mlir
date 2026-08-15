@@ -254,6 +254,10 @@ def prepare_token_stages(args, token_count):
         "convert",
         (
             "--sculptor-canonicalize-layers",
+            "--sculptor-fold-inference-parameters",
+            "--sculptor-fuse-elementwise-regions",
+            "--canonicalize",
+            "--cse",
             "--sculptor-extract-layers",
             "--sculptor-convert-layers",
         ),

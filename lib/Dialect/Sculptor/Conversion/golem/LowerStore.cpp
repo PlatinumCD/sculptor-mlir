@@ -3,13 +3,13 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace {
 
-mlir::FailureOr<int64_t>
-getPhysicalArrayRows(mlir::sculptor::ArrayStoreOp op) {
+mlir::FailureOr<int64_t> getPhysicalArrayRows(mlir::sculptor::ArrayStoreOp op) {
   auto shape = op->getAttrOfType<mlir::ArrayAttr>(
       mlir::sculptor::golem_tiling_attrs::kTilePhysicalShapeAttrName);
   if (!shape) {
@@ -69,12 +69,13 @@ public:
           "logical store width must be between one and physical array rows");
     }
 
-    auto outputMemrefType =
-        mlir::MemRefType::get(outputType.getShape(), elementType);
-    mlir::Value outputMemref =
-        rewriter.create<mlir::memref::AllocOp>(loc, outputMemrefType);
     mlir::Value scratch = mlir::sculptor::golem::allocateStoreScratchBuffer(
         rewriter, loc, *physicalRows, elementType);
+    // Mark the backing allocation as well as the logical prefix below. A
+    // full-width subview can be folded during canonicalization, while the
+    // allocation remains the authoritative origin of the ISA store result.
+    scratch.getDefiningOp()->setAttr(
+        "sculptor.memory.analog_store_valid_prefix", rewriter.getUnitAttr());
 
     auto shimScratchType = mlir::MemRefType::get({mlir::ShapedType::kDynamic,
                                                   mlir::ShapedType::kDynamic,
@@ -87,22 +88,40 @@ public:
                                         mlir::sculptor::golem::kStoreShimName,
                                         {shimScratch, *localArrayId});
 
-    mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
-    mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
-    mlir::Value cValidRows =
-        rewriter.create<mlir::arith::ConstantIndexOp>(loc, validRows);
-    rewriter.create<mlir::scf::ForOp>(
-        loc, c0, cValidRows, c1, mlir::ValueRange{},
-        [&](mlir::OpBuilder &builder, mlir::Location loopLoc,
-            mlir::Value laneIndex, mlir::ValueRange) {
-          mlir::Value value = builder.create<mlir::memref::LoadOp>(
-              loopLoc, scratch, mlir::ValueRange{c0, c0, laneIndex});
-          builder.create<mlir::memref::StoreOp>(
-              loopLoc, value, outputMemref, mlir::ValueRange{c0, laneIndex});
-          builder.create<mlir::scf::YieldOp>(loopLoc);
-        });
+    // The ISA store has no length operand and must retain its full physical
+    // scratch buffer.  The logical result is its valid prefix, however, so
+    // expose that prefix as an alias instead of allocating a second buffer and
+    // copying every valid lane in a scalar loop.
+    auto index = [&](int64_t value) -> mlir::OpFoldResult {
+      return rewriter.getIndexAttr(value);
+    };
+    mlir::Value validPhysicalRows = rewriter.create<mlir::memref::SubViewOp>(
+        loc, scratch,
+        mlir::SmallVector<mlir::OpFoldResult>{index(0), index(0), index(0)},
+        mlir::SmallVector<mlir::OpFoldResult>{index(1), index(1),
+                                              index(validRows)},
+        mlir::SmallVector<mlir::OpFoldResult>{index(1), index(1), index(1)});
+    auto outputMemrefType = mlir::MemRefType::get(
+        outputType.getShape(), elementType,
+        mlir::StridedLayoutAttr::get(rewriter.getContext(), 0,
+                                     {*physicalRows, 1}));
+    mlir::Value outputMemref = rewriter.create<mlir::memref::CollapseShapeOp>(
+        loc, outputMemrefType, validPhysicalRows,
+        mlir::ArrayRef<mlir::ReassociationIndices>{{0, 1}, {2}});
+    outputMemref.getDefiningOp()->setAttr(
+        "sculptor.memory.analog_store_valid_prefix", rewriter.getUnitAttr());
     auto tensor = rewriter.create<mlir::bufferization::ToTensorOp>(
         loc, outputType, outputMemref, /*restrict=*/true, /*writable=*/true);
+    tensor->setAttr("sculptor.memory.direct_physical_store_view",
+                    rewriter.getUnitAttr());
+    if (auto function = op->getParentOfType<mlir::func::FuncOp>()) {
+      constexpr llvm::StringLiteral marker =
+          "sculptor.memory.direct_physical_store_view_count";
+      int64_t count = 0;
+      if (auto current = function->getAttrOfType<mlir::IntegerAttr>(marker))
+        count = current.getInt();
+      function->setAttr(marker, rewriter.getI64IntegerAttr(count + 1));
+    }
     rewriter.replaceOp(op, tensor.getResult());
     return mlir::success();
   }

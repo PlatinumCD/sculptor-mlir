@@ -1,5 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/golem/GolemUtils.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
 namespace {
 
 // Erases matrix materialization once the type converter carries matrix storage.
@@ -113,6 +115,53 @@ public:
 
     mlir::Value matrixMemref = mlir::sculptor::golem::materializeTensorMemref(
         rewriter, op.getLoc(), adaptor.getMatrix());
+    auto physicalShape = op->getAttrOfType<mlir::ArrayAttr>(
+        "sculptor.tile_physical_shape");
+    if (physicalShape) {
+      if (physicalShape.size() != 2)
+        return op.emitOpError(
+            "physical matrix tile shape must contain two dimensions");
+      auto rows = mlir::dyn_cast<mlir::IntegerAttr>(physicalShape[0]);
+      auto cols = mlir::dyn_cast<mlir::IntegerAttr>(physicalShape[1]);
+      if (!rows || !cols)
+        return op.emitOpError(
+            "physical matrix tile shape must contain integer dimensions");
+      llvm::SmallVector<int64_t, 2> shape{rows.getInt(), cols.getInt()};
+      if (shape[0] < matrixType.getDimSize(0) ||
+          shape[1] < matrixType.getDimSize(1)) {
+        return op.emitOpError(
+            "has invalid physical matrix tile shape metadata");
+      }
+      if (shape[0] != matrixType.getDimSize(0) ||
+          shape[1] != matrixType.getDimSize(1)) {
+        mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(
+            op.getLoc(), 0);
+        mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(
+            op.getLoc(), 1);
+        mlir::Value physicalRows =
+            rewriter.create<mlir::arith::ConstantIndexOp>(op.getLoc(),
+                                                          shape[0]);
+        mlir::Value physicalCols =
+            rewriter.create<mlir::arith::ConstantIndexOp>(op.getLoc(),
+                                                          shape[1]);
+        mlir::FailureOr<mlir::Value> scratch =
+            mlir::sculptor::golem::allocateZeroedScratchTile(
+                rewriter, op, shape, matrixType.getElementType(), physicalRows,
+                physicalCols, c0, c1);
+        if (mlir::failed(scratch))
+          return mlir::failure();
+        mlir::Value validRows =
+            rewriter.create<mlir::arith::ConstantIndexOp>(
+                op.getLoc(), matrixType.getDimSize(0));
+        mlir::Value validCols =
+            rewriter.create<mlir::arith::ConstantIndexOp>(
+                op.getLoc(), matrixType.getDimSize(1));
+        mlir::sculptor::golem::copyMatrixTileIntoScratch(
+            rewriter, op.getLoc(), matrixMemref, *scratch, c0, c0, validRows,
+            validCols, c0, c1);
+        matrixMemref = *scratch;
+      }
+    }
     mlir::sculptor::golem::emitShimCall(
         rewriter, op.getLoc(), mlir::sculptor::golem::kSetShimName,
         {matrixMemref, *localArrayId});

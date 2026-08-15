@@ -76,6 +76,12 @@ llvm::cl::opt<std::string>
                    llvm::cl::value_desc("symbol"), llvm::cl::init(""),
                    llvm::cl::cat(reportCategory));
 
+llvm::cl::opt<bool> compactReport(
+    "compact",
+    llvm::cl::desc("Omit heavyweight node-allocation closure and operation "
+                   "MLIR text while retaining mapping visualizations"),
+    llvm::cl::init(false), llvm::cl::cat(reportCategory));
+
 struct ReportEdge {
   int64_t source = -1;
   int64_t target = -1;
@@ -148,13 +154,12 @@ std::string printOperationGroup(ArrayRef<Operation *> operations) {
   return text;
 }
 
-std::string printComputeOperation(const ComputeOperation &operation) {
+std::string printComputeOperation(const ComputeOperation &operation,
+                                  AsmState &asmState) {
   std::string text;
   llvm::raw_string_ostream stream(text);
-  OpPrintingFlags flags;
-  flags.elideLargeElementsAttrs().elideLargeResourceString();
   for (Operation *member : operation.members) {
-    member->print(stream, flags);
+    member->print(stream, asmState);
     stream << '\n';
   }
   return text;
@@ -558,6 +563,45 @@ void emitTree(llvm::json::OStream &json, const ReportFunction &report) {
     inferredWaveIds[nodeId] = waveId;
     return waveId;
   };
+  DenseMap<int64_t, std::optional<int64_t>> inferredLayerRegionIds;
+  std::function<std::optional<int64_t>(int64_t)> inferLayerRegionId =
+      [&](int64_t nodeId) -> std::optional<int64_t> {
+    auto cached = inferredLayerRegionIds.find(nodeId);
+    if (cached != inferredLayerRegionIds.end())
+      return cached->second;
+
+    const StructuralRATreeNode *node = nodesById.lookup(nodeId);
+    if (!node)
+      return std::nullopt;
+    if (node->kind == RATreeNodeKind::Leaf) {
+      const ComputeOperation &operation =
+          report.graph.operations[node->operationId];
+      std::optional<int64_t> regionId;
+      if (operation.kind != ComputeOperationKind::MatrixSetup &&
+          operation.layerRegionId >= 0)
+        regionId = operation.layerRegionId;
+      inferredLayerRegionIds[nodeId] = regionId;
+      return regionId;
+    }
+
+    std::optional<int64_t> regionId;
+    bool homogeneous = true;
+    for (int64_t childId : node->childIds) {
+      std::optional<int64_t> childRegionId = inferLayerRegionId(childId);
+      if (!childRegionId) {
+        homogeneous = false;
+        continue;
+      }
+      if (regionId && *regionId != *childRegionId)
+        homogeneous = false;
+      else if (!regionId)
+        regionId = childRegionId;
+    }
+    if (!homogeneous)
+      regionId = std::nullopt;
+    inferredLayerRegionIds[nodeId] = regionId;
+    return regionId;
+  };
 
   json.attributeObject("tree", [&] {
     json.attribute("version", report.treeAttr.getVersion().getInt());
@@ -608,6 +652,8 @@ void emitTree(llvm::json::OStream &json, const ReportFunction &report) {
           json.attribute("work_unit_id", node.workUnitId);
           json.attribute("work_group_count", node.workGroupCount);
           json.attribute("mvm_wave_id", inferWaveId(node.id).value_or(-1));
+          json.attribute("layer_region_id",
+                         inferLayerRegionId(node.id).value_or(-1));
         });
       }
     });
@@ -619,6 +665,14 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
     return;
 
   MappingPlanAttr plan = report.planAttr;
+  StringRef digitalSchedulingPolicy = "affinity";
+  if (auto policy = report.function->getAttrOfType<StringAttr>(
+          "sculptor.mapping.digital_scheduling_policy")) {
+    digitalSchedulingPolicy = policy.getValue();
+  } else if (auto balancing = report.function->getAttrOfType<BoolAttr>(
+                 "sculptor.mapping.digital_work_balancing")) {
+    digitalSchedulingPolicy = balancing.getValue() ? "balanced" : "affinity";
+  }
   json.attributeObject("plan", [&] {
     json.attribute("version", plan.getVersion().getInt());
     json.attribute("planner", plan.getPlanner().getValue());
@@ -627,6 +681,10 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
     json.attribute("mvm_body_policy", plan.getMvmBodyPolicy().getValue());
     json.attribute("setup_binding_policy",
                    plan.getSetupBindingPolicy().getValue());
+    json.attribute("digital_scheduling_policy", digitalSchedulingPolicy);
+    if (auto window = report.function->getAttrOfType<IntegerAttr>(
+            "sculptor.mapping.digital_window_size"))
+      json.attribute("digital_window_size", window.getInt());
     json.attribute("cost_profile_name", plan.getCostProfileName().getValue());
     json.attribute("cost_profile_hash", plan.getCostProfileHash().getValue());
     json.attribute("ra_tree_fingerprint",
@@ -693,7 +751,22 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
         for (Attribute work : realization.getDigitalWorkPerTile())
           json.value(cast<IntegerAttr>(work).getInt());
       });
+      json.attributeArray("layer_tile_pools", [&] {
+        for (Attribute attribute : realization.getLayerTilePools()) {
+          auto pool = cast<MappingLayerTilePoolAttr>(attribute);
+          json.object([&] {
+            json.attribute("layer_region_id",
+                           pool.getLayerRegionId().getInt());
+            json.attributeArray("tile_ids", [&] {
+              for (Attribute tileId : pool.getTileIds())
+                json.value(cast<IntegerAttr>(tileId).getInt());
+            });
+          });
+        }
+      });
       json.attributeArray("node_allocations", [&] {
+        if (compactReport)
+          return;
         for (Attribute attribute : realization.getNodeAllocations()) {
           auto allocation = cast<MappingNodeAllocationAttr>(attribute);
           json.object([&] {
@@ -739,6 +812,9 @@ void emitPlan(llvm::json::OStream &json, const ReportFunction &report) {
 }
 
 void emitOperations(llvm::json::OStream &json, const ReportFunction &report) {
+  OpPrintingFlags flags;
+  flags.elideLargeElementsAttrs().elideLargeResourceString();
+  AsmState asmState(report.function, flags);
   json.attributeArray("operations", [&] {
     for (const ComputeOperation &operation : report.graph.operations) {
       json.object([&] {
@@ -748,6 +824,10 @@ void emitOperations(llvm::json::OStream &json, const ReportFunction &report) {
                            ? operation.operation->getName().getStringRef()
                            : StringRef(operation.stageName));
         json.attribute("kind", stringifyComputeOperationKind(operation.kind));
+        json.attribute("layer_region_id", operation.layerRegionId);
+        json.attribute("semantic_layer_id",
+                       operation.semanticLayerId.value_or(-1));
+        json.attribute("semantic_layer_kind", operation.semanticLayerKind);
         json.attribute("required_lane",
                        operation.requiredLane
                            ? stringifyLogicalLaneKind(*operation.requiredLane)
@@ -776,7 +856,10 @@ void emitOperations(llvm::json::OStream &json, const ReportFunction &report) {
         json.attribute("member_count", operation.members.size());
         json.attribute("location",
                        printLocation(operation.operation->getLoc()));
-        json.attribute("mlir", printComputeOperation(operation));
+        if (compactReport)
+          json.attribute("mlir", "");
+        else
+          json.attribute("mlir", printComputeOperation(operation, asmState));
         emitI64Array(json, "input_tensors", operation.inputTensors);
         emitI64Array(json, "output_tensors", operation.outputTensors);
         emitSemanticAttributes(json, operation.operation);
@@ -800,6 +883,34 @@ void emitOperations(llvm::json::OStream &json, const ReportFunction &report) {
       });
     }
   });
+}
+
+void emitLayerRegions(llvm::json::OStream &json,
+                      const ReportFunction &report) {
+  json.attributeArray("layer_regions", [&] {
+    for (const LayerRegion &region : report.graph.layerRegions) {
+      json.object([&] {
+        json.attribute("id", region.id);
+        json.attribute("semantic_layer_id",
+                       region.semanticLayerId.value_or(-1));
+        json.attribute("semantic_layer_kind", region.semanticLayerKind);
+        json.attribute("singleton_fallback", region.isSingletonFallback);
+        emitI64Array(json, "operation_ids", region.operationIds);
+        emitI64Array(json, "input_tensors", region.inputTensors);
+        emitI64Array(json, "output_tensors", region.outputTensors);
+        emitI64Array(json, "internal_tensors", region.internalTensors);
+        json.attribute("analog_lane_demand", region.analogLaneDemand);
+        json.attribute("estimated_digital_work_items",
+                       region.estimatedDigitalWorkItems);
+        json.attribute("estimated_static_memory_bytes",
+                       region.estimatedStaticMemoryBytes);
+        json.attribute("estimated_input_bytes", region.estimatedInputBytes);
+        json.attribute("estimated_output_bytes", region.estimatedOutputBytes);
+      });
+    }
+  });
+  emitI64Array(json, "topological_layer_region_order",
+               report.graph.topologicalLayerRegionOrder);
 }
 
 void emitLogicalTileAssignment(llvm::json::OStream &json,
@@ -1073,6 +1184,7 @@ void emitFunction(llvm::json::OStream &json, const ReportFunction &report) {
     emitLogicalTilePlacement(json, report);
     emitI64Array(json, "topological_order", report.graph.topologicalOrder);
     emitOperations(json, report);
+    emitLayerRegions(json, report);
     emitLaneBindingGroups(json, report);
     emitMVMWaves(json, report);
     emitTensors(json, report);
@@ -1086,7 +1198,7 @@ std::string buildJSON(ArrayRef<ReportFunction> functions, StringRef title) {
   llvm::raw_string_ostream stream(text);
   llvm::json::OStream json(stream, /*IndentSize=*/0);
   json.object([&] {
-    json.attribute("schema_version", 9);
+    json.attribute("schema_version", 11);
     json.attribute("format", "sculptor.ra_tree.report");
     json.attribute("title", title);
     json.attribute("source", inputFilename);

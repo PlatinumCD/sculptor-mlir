@@ -59,10 +59,12 @@ public:
   RecursiveRegionBuilder(const ComputeGraph &graph,
                          ArrayRef<int64_t> includedOperationIds,
                          Operation *anchor,
-                         bool exposeParallelMVMCohorts = true)
+                         bool exposeParallelMVMCohorts = true,
+                         bool collapseMVMWaves = true)
       : graph(graph), includedOperationIds(includedOperationIds),
         anchor(anchor),
-        exposeParallelMVMCohorts(exposeParallelMVMCohorts) {}
+        exposeParallelMVMCohorts(exposeParallelMVMCohorts),
+        collapseMVMWaves(collapseMVMWaves) {}
 
   FailureOr<ComputeRegionTree> build() {
     if (includedOperationIds.empty()) {
@@ -141,7 +143,7 @@ private:
 
     SmallVector<int64_t> operationToWave(operationCount, -1);
     DenseMap<int64_t, SmallVector<int64_t>> waveMembers;
-    {
+    if (collapseMVMWaves) {
       DenseSet<int64_t> knownWaveIds;
       for (const MVMWave &wave : graph.mvmWaves) {
         SmallVector<int64_t> members = getWaveOperationIds(wave);
@@ -730,6 +732,7 @@ private:
   ArrayRef<int64_t> includedOperationIds;
   Operation *anchor;
   bool exposeParallelMVMCohorts;
+  bool collapseMVMWaves;
   ComputeRegionTree tree;
   int64_t virtualSourceId = -1;
   int64_t virtualSinkId = -1;
@@ -745,67 +748,9 @@ private:
   DenseSet<int64_t> emittedAtoms;
 };
 
-void collectSubtreeOperations(
-    int64_t nodeId,
-    const DenseMap<int64_t, const StructuralRATreeNode *> &nodes,
-    DenseSet<int64_t> &operationIds) {
-  const StructuralRATreeNode *node = nodes.lookup(nodeId);
-  assert(node && "verified RA tree must contain every referenced node");
-  if (node->kind == RATreeNodeKind::Leaf) {
-    operationIds.insert(node->operationId);
-    return;
-  }
-  for (int64_t childId : node->childIds)
-    collectSubtreeOperations(childId, nodes, operationIds);
-}
-
-struct SetupPartition {
-  std::optional<int64_t> setupRootId;
-  SmallVector<int64_t> computeOperationIds;
-};
-
-FailureOr<SetupPartition>
-findSetupPartition(const MappingProblem &problem) {
-  DenseSet<int64_t> expectedSetups;
-  SetupPartition partition;
-  for (int64_t operationId : problem.graph.topologicalOrder) {
-    if (problem.graph.operations[operationId].kind ==
-        ComputeOperationKind::MatrixSetup)
-      expectedSetups.insert(operationId);
-    else
-      partition.computeOperationIds.push_back(operationId);
-  }
-  if (expectedSetups.empty())
-    return partition;
-
-  DenseMap<int64_t, const StructuralRATreeNode *> nodes;
-  for (const StructuralRATreeNode &node : problem.currentTree.nodes)
-    nodes[node.id] = &node;
-  const StructuralRATreeNode *root = nodes.lookup(problem.currentTree.rootId);
-  if (!root || root->kind != RATreeNodeKind::TemporalCut ||
-      root->childIds.size() != 2) {
-    problem.anchor->emitError(
-        "recursive-fork-join must run after setup-first when matrix setup "
-        "operations are present");
-    return failure();
-  }
-
-  DenseSet<int64_t> actualSetups;
-  collectSubtreeOperations(root->childIds.front(), nodes, actualSetups);
-  if (actualSetups != expectedSetups) {
-    problem.anchor->emitError(
-        "recursive-fork-join cannot identify the setup-first subtree");
-    return failure();
-  }
-  partition.setupRootId = root->childIds.front();
-  return partition;
-}
-
 class RATreeAssembler {
 public:
-  RATreeAssembler(const MappingProblem &problem,
-                  const ComputeRegionTree &regions)
-      : problem(problem), regions(regions) {
+  explicit RATreeAssembler(const MappingProblem &problem) : problem(problem) {
     tree.workUnits = problem.currentTree.workUnits;
     tree.workUnitEdges = problem.currentTree.workUnitEdges;
     for (const StructuralRATreeNode &node : problem.currentTree.nodes) {
@@ -815,25 +760,84 @@ public:
     }
   }
 
-  FailureOr<ResourceAllocationTree>
-  build(std::optional<int64_t> setupRootId) {
-    FailureOr<int64_t> computeRoot = buildRegion(regions, regions.rootId);
-    if (failed(computeRoot))
-      return failure();
+  FailureOr<int64_t> buildComputeLayer(const ComputeRegionTree &regions) {
+    return buildRegion(regions, regions.rootId);
+  }
 
-    int64_t rootId = *computeRoot;
-    if (setupRootId) {
-      FailureOr<int64_t> setupRoot = cloneSubtree(*setupRootId);
-      if (failed(setupRoot))
+  bool usedConservativeWaveFallback() const {
+    return conservativeWaveFallback;
+  }
+
+  FailureOr<ResourceAllocationTree>
+  finish(ArrayRef<int64_t> setupOperationIds,
+         const DenseMap<int64_t, int64_t> &computeLayerRoots) {
+    SmallVector<int64_t> setupLeaves;
+    setupLeaves.reserve(setupOperationIds.size());
+    for (int64_t operationId : setupOperationIds) {
+      FailureOr<int64_t> setup = buildOperation(operationId);
+      if (failed(setup))
         return failure();
-      rootId = addCut(RATreeNodeKind::TemporalCut, {*setupRoot, *computeRoot});
+      setupLeaves.push_back(*setup);
     }
+
+    std::optional<int64_t> setupRoot;
+    if (!setupLeaves.empty())
+      setupRoot = setupLeaves.size() == 1
+                      ? setupLeaves.front()
+                      : addCut(RATreeNodeKind::SpatialCut, setupLeaves);
+    std::optional<int64_t> computeRoot;
+    if (!computeLayerRoots.empty()) {
+      const StructuralRATreeNode *sourceRoot =
+          sourceNodes.lookup(problem.currentTree.rootId);
+      if (!sourceRoot) {
+        problem.anchor->emitError(
+            "recursive-fork-join cannot resolve the source RA root");
+        return failure();
+      }
+      int64_t sourceComputeRoot = sourceRoot->id;
+      if (!setupOperationIds.empty()) {
+        if (sourceRoot->kind != RATreeNodeKind::TemporalCut ||
+            sourceRoot->childIds.size() != 2) {
+          problem.anchor->emitError(
+              "recursive-fork-join requires the setup-first root frontier");
+          return failure();
+        }
+        sourceComputeRoot = sourceRoot->childIds.back();
+      }
+      if (sourceComputeRoot < 0) {
+        problem.anchor->emitError(
+            "recursive-fork-join cannot resolve the compute frontier");
+        return failure();
+      }
+      DenseSet<int64_t> emittedRegions;
+      FailureOr<int64_t> refined = cloneComputeHierarchy(
+          sourceComputeRoot, computeLayerRoots, emittedRegions);
+      if (failed(refined))
+        return failure();
+      if (emittedRegions.size() != computeLayerRoots.size()) {
+        problem.anchor->emitError(
+            "recursive-fork-join did not preserve every layer-cut region");
+        return failure();
+      }
+      computeRoot = *refined;
+    }
+    if (!setupRoot && !computeRoot) {
+      problem.anchor->emitError(
+          "recursive-fork-join produced an empty mapping hierarchy");
+      return failure();
+    }
+    int64_t rootId = setupRoot && computeRoot
+                         ? addCut(RATreeNodeKind::TemporalCut,
+                                  {*setupRoot, *computeRoot})
+                         : setupRoot ? *setupRoot : *computeRoot;
     tree.rootId = rootId;
     tree.nodes[rootId].parentId = -1;
     return std::move(tree);
   }
 
 private:
+  static constexpr int64_t mixedLayerRegion = -1;
+
   int64_t addLeaf(int64_t operationId, int64_t workUnitId,
                   int64_t workGroupCount) {
     int64_t id = static_cast<int64_t>(tree.nodes.size());
@@ -855,6 +859,95 @@ private:
     for (int64_t childId : children)
       tree.nodes[childId].parentId = id;
     return id;
+  }
+
+  FailureOr<int64_t> classifyComputeSubtree(int64_t nodeId) {
+    auto cached = subtreeLayerRegions.find(nodeId);
+    if (cached != subtreeLayerRegions.end())
+      return cached->second;
+    const StructuralRATreeNode *node = sourceNodes.lookup(nodeId);
+    if (!node) {
+      problem.anchor->emitError(
+          "recursive-fork-join cannot resolve source RA node ")
+          << nodeId;
+      return failure();
+    }
+    if (node->kind == RATreeNodeKind::Leaf) {
+      const ComputeOperation &operation =
+          problem.graph.operations[node->operationId];
+      if (operation.kind == ComputeOperationKind::MatrixSetup ||
+          operation.layerRegionId < 0) {
+        operation.operation->emitError(
+            "recursive-fork-join found non-layer work in the compute phase");
+        return failure();
+      }
+      subtreeLayerRegions[nodeId] = operation.layerRegionId;
+      return operation.layerRegionId;
+    }
+
+    std::optional<int64_t> commonRegion;
+    for (int64_t childId : node->childIds) {
+      FailureOr<int64_t> childRegion = classifyComputeSubtree(childId);
+      if (failed(childRegion))
+        return failure();
+      if (*childRegion == mixedLayerRegion ||
+          (commonRegion && *commonRegion != *childRegion)) {
+        subtreeLayerRegions[nodeId] = mixedLayerRegion;
+        return mixedLayerRegion;
+      }
+      commonRegion = *childRegion;
+    }
+    if (!commonRegion) {
+      problem.anchor->emitError(
+          "recursive-fork-join found an empty compute subtree");
+      return failure();
+    }
+    subtreeLayerRegions[nodeId] = *commonRegion;
+    return *commonRegion;
+  }
+
+  FailureOr<int64_t> cloneComputeHierarchy(
+      int64_t nodeId, const DenseMap<int64_t, int64_t> &layerRoots,
+      DenseSet<int64_t> &emittedRegions) {
+    FailureOr<int64_t> region = classifyComputeSubtree(nodeId);
+    if (failed(region))
+      return failure();
+    if (*region != mixedLayerRegion) {
+      auto root = layerRoots.find(*region);
+      if (root == layerRoots.end()) {
+        problem.anchor->emitError(
+            "recursive-fork-join cannot resolve refined layer region ")
+            << *region;
+        return failure();
+      }
+      if (!emittedRegions.insert(*region).second) {
+        problem.anchor->emitError(
+            "recursive-fork-join found a duplicated layer-cut region ")
+            << *region;
+        return failure();
+      }
+      return root->second;
+    }
+
+    const StructuralRATreeNode *source = sourceNodes.lookup(nodeId);
+    SmallVector<int64_t> children;
+    children.reserve(source->childIds.size());
+    for (int64_t childId : source->childIds) {
+      FailureOr<int64_t> child =
+          cloneComputeHierarchy(childId, layerRoots, emittedRegions);
+      if (failed(child))
+        return failure();
+      children.push_back(*child);
+    }
+    if (children.size() == 1)
+      return children.front();
+    if (source->kind != RATreeNodeKind::TemporalCut &&
+        source->kind != RATreeNodeKind::SpatialCut) {
+      problem.anchor->emitError(
+          "recursive-fork-join cannot preserve a mixed non-cut hierarchy");
+      return failure();
+    }
+    return addCut(source->kind, children, source->workGroupCount);
   }
 
   FailureOr<int64_t> buildOperation(int64_t operationId) {
@@ -881,55 +974,25 @@ private:
   }
 
   FailureOr<int64_t> buildPackedMVMBody(const ComputeAtom &atom) {
-    const MVMWave *wave = nullptr;
-    for (const MVMWave &candidate : problem.graph.mvmWaves) {
-      if (candidate.id == atom.mvmWaveId) {
-        wave = &candidate;
-        break;
-      }
-    }
-    if (!wave || wave->physicalMVMOperationIds.empty()) {
+    if (atom.memberOperationIds.empty()) {
       problem.anchor->emitError(
           "recursive-fork-join cannot resolve a packed MVM body");
       return failure();
     }
 
-    SmallVector<int64_t> phases;
-    for (int64_t operationId : wave->vectorTileOperationIds) {
-      FailureOr<int64_t> vectorTile = buildOperation(operationId);
-      if (failed(vectorTile))
-        return failure();
-      phases.push_back(*vectorTile);
-    }
-
-    SmallVector<int64_t> analogBranches;
-    for (int64_t operationId : wave->physicalMVMOperationIds) {
-      FailureOr<int64_t> physicalMVM = buildOperation(operationId);
-      if (failed(physicalMVM))
-        return failure();
-      analogBranches.push_back(*physicalMVM);
-    }
-    phases.push_back(analogBranches.size() == 1
-                         ? analogBranches.front()
-                         : addCut(RATreeNodeKind::SpatialCut, analogBranches));
-
-    if (wave->recombineOperationId) {
-      FailureOr<int64_t> recombine =
-          buildOperation(*wave->recombineOperationId);
-      if (failed(recombine))
-        return failure();
-      phases.push_back(*recombine);
-    }
-    if (wave->biasAddOperationId) {
-      FailureOr<int64_t> biasAdd = buildOperation(*wave->biasAddOperationId);
-      if (failed(biasAdd))
-        return failure();
-      phases.push_back(*biasAdd);
-    }
-
-    return phases.size() == 1
-               ? phases.front()
-               : addCut(RATreeNodeKind::TemporalCut, phases);
+    // Keep a wave atomic relative to unrelated work, but derive its interior
+    // from the real SSA dependency DAG. This exposes independent
+    // vector-tile->physical-MVM chains as nested spatial branches and places
+    // the synchronization only at their actual recombination operation.
+    RecursiveRegionBuilder waveBuilder(
+        problem.graph, atom.memberOperationIds, problem.anchor,
+        /*exposeParallelMVMCohorts=*/false,
+        /*collapseMVMWaves=*/false);
+    FailureOr<ComputeRegionTree> waveRegions = waveBuilder.build();
+    if (failed(waveRegions))
+      return failure();
+    conservativeWaveFallback |= waveRegions->usedConservativeFallback;
+    return buildRegion(*waveRegions, waveRegions->rootId);
   }
 
   FailureOr<int64_t> buildAtom(const ComputeAtom &atom) {
@@ -977,33 +1040,13 @@ private:
                   children);
   }
 
-  FailureOr<int64_t> cloneSubtree(int64_t sourceNodeId) {
-    const StructuralRATreeNode *source = sourceNodes.lookup(sourceNodeId);
-    if (!source) {
-      problem.anchor->emitError(
-          "recursive-fork-join cannot clone a missing setup RA node");
-      return failure();
-    }
-    if (source->kind == RATreeNodeKind::Leaf)
-      return addLeaf(source->operationId, source->workUnitId,
-                     source->workGroupCount);
-
-    SmallVector<int64_t> children;
-    for (int64_t childId : source->childIds) {
-      FailureOr<int64_t> child = cloneSubtree(childId);
-      if (failed(child))
-        return failure();
-      children.push_back(*child);
-    }
-    return addCut(source->kind, children, source->workGroupCount);
-  }
-
   const MappingProblem &problem;
-  const ComputeRegionTree &regions;
   ResourceAllocationTree tree;
   DenseMap<int64_t, const StructuralRATreeNode *> sourceNodes;
   DenseMap<int64_t, SmallVector<const StructuralRATreeNode *>>
       leavesByOperation;
+  DenseMap<int64_t, int64_t> subtreeLayerRegions;
+  bool conservativeWaveFallback = false;
 };
 
 } // namespace
@@ -1015,19 +1058,40 @@ namespace mapping {
 FailureOr<MappingPlan>
 RecursiveForkJoinPlanner::refine(const MappingProblem &problem,
                                  const MappingEvaluator &evaluator) const {
-  FailureOr<SetupPartition> partition = findSetupPartition(problem);
-  if (failed(partition))
-    return failure();
+  RATreeAssembler assembler(problem);
+  SmallVector<int64_t> setupOperationIds;
+  for (int64_t operationId : problem.graph.topologicalOrder) {
+    if (problem.graph.operations[operationId].kind ==
+        ComputeOperationKind::MatrixSetup)
+      setupOperationIds.push_back(operationId);
+  }
+  DenseMap<int64_t, int64_t> layerRoots;
+  bool usedConservativeFallback = false;
+  for (int64_t regionId : problem.graph.topologicalLayerRegionOrder) {
+    const LayerRegion &layer = problem.graph.layerRegions[regionId];
+    SmallVector<int64_t> computeOperationIds;
+    for (int64_t operationId : layer.operationIds) {
+      if (problem.graph.operations[operationId].kind !=
+          ComputeOperationKind::MatrixSetup)
+        computeOperationIds.push_back(operationId);
+    }
+    if (computeOperationIds.empty())
+      continue;
+    RecursiveRegionBuilder regionBuilder(
+        problem.graph, computeOperationIds, problem.anchor);
+    FailureOr<ComputeRegionTree> regions = regionBuilder.build();
+    if (failed(regions))
+      return failure();
+    usedConservativeFallback |= regions->usedConservativeFallback;
+    FailureOr<int64_t> layerRoot = assembler.buildComputeLayer(*regions);
+    if (failed(layerRoot))
+      return failure();
+    layerRoots[regionId] = *layerRoot;
+  }
+  usedConservativeFallback |= assembler.usedConservativeWaveFallback();
 
-  RecursiveRegionBuilder regionBuilder(
-      problem.graph, partition->computeOperationIds, problem.anchor);
-  FailureOr<ComputeRegionTree> regions = regionBuilder.build();
-  if (failed(regions))
-    return failure();
-
-  RATreeAssembler assembler(problem, *regions);
   FailureOr<ResourceAllocationTree> tree =
-      assembler.build(partition->setupRootId);
+      assembler.finish(setupOperationIds, layerRoots);
   if (failed(tree))
     return failure();
   FailureOr<ResourceAllocationTree> reindexed =
@@ -1047,7 +1111,7 @@ RecursiveForkJoinPlanner::refine(const MappingProblem &problem,
   plan.selectedTree = std::move(*reindexed);
   plan.evaluation = *evaluation;
   plan.candidates.push_back(
-      {regions->usedConservativeFallback
+      {usedConservativeFallback
            ? "recursive-fork-join-conservative-fallback"
            : "recursive-fork-join",
        *evaluation, /*selected=*/true});

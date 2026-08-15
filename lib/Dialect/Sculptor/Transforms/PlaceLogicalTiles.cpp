@@ -14,6 +14,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <memory>
 
 namespace mlir {
@@ -60,6 +61,7 @@ void PlaceLogicalTilesPass::runOnOperation() {
     *summary << "function,schedule,objective,network_mode,timing_scope,"
                 "cost_profile_name,cost_profile_hash,"
                 "mesh_rows,mesh_cols,arrays_per_core,"
+                "tile_memory_capacity_bytes,max_tile_memory_estimate_bytes,"
                 "greedy_tile_order,greedy_priority_mode,"
                 "greedy_candidate_scope,greedy_lookahead,digital_workers,"
                 "matrix_duplication,matrix_setups,logical_tiles,logical_edges,"
@@ -120,6 +122,7 @@ void PlaceLogicalTilesPass::runOnOperation() {
         *tileGraph,
         {resolvedMeshRows, resolvedMeshCols, resolvedArraysPerCore},
         function};
+    problem.tileMemoryCapacityBytes = tileMemoryCapacityBytes;
     mapping::MappingCostProfile resolvedProfile;
     if (failed(mapping::initializeLogicalTilePlacementProblem(
             *graph, *tree, resolvedProfile, problem))) {
@@ -156,6 +159,10 @@ void PlaceLogicalTilesPass::runOnOperation() {
     function->setAttr(
         mapping::kLogicalTilePlacementAttrName,
         mapping::serializeLogicalTilePlacement(&getContext(), *placement));
+    function->setAttr(mapping::kLogicalTileMemoryEstimateMethodAttrName,
+                      StringAttr::get(
+                          &getContext(),
+                          mapping::kScheduleAwareMemoryEstimateMethod));
     bool usesGreedy =
         *parsedSchedule == mapping::LogicalTileScheduleKind::Greedy ||
         (*parsedSchedule == mapping::LogicalTileScheduleKind::Annealing &&
@@ -202,6 +209,11 @@ void PlaceLogicalTilesPass::runOnOperation() {
           "sculptor.mapping.digital_parallel_workers");
       auto mappingPlan = function->getAttrOfType<MappingPlanAttr>(
           mapping::kMappingPlanAttrName);
+      int64_t maximumMemoryEstimate = 0;
+      for (const mapping::LogicalTileMemoryEstimate &estimate :
+           placement->memoryEstimates)
+        maximumMemoryEstimate =
+            std::max(maximumMemoryEstimate, estimate.requiredBytes);
       *summary
           << function.getSymName() << ',' << placement->schedule << ','
           << mapping::stringifyPlacementObjective(placement->objective) << ','
@@ -210,7 +222,9 @@ void PlaceLogicalTilesPass::runOnOperation() {
           << placement->costProfileName << ',' << placement->costProfileHash
           << ',' << placement->mesh.rows << ',' << placement->mesh.columns
           << ',' << placement->mesh.arraysPerCore << ','
-          << mapping::stringifyGreedyTileOrder(*parsedGreedyTileOrder) << ','
+          << placement->tileMemoryCapacityBytes << ',' << maximumMemoryEstimate
+          << ',' << mapping::stringifyGreedyTileOrder(*parsedGreedyTileOrder)
+          << ','
           << mapping::stringifyGreedyPriorityMode(*parsedGreedyPriorityMode)
           << ','
           << mapping::stringifyGreedyCandidateScope(*parsedGreedyCandidateScope)

@@ -74,6 +74,13 @@ ResourceAllocationTree
 cloneResourceAllocationTree(const ResourceAllocationTree &tree);
 
 FailureOr<ResourceAllocationTree>
+stripLayerRegionNodes(const ResourceAllocationTree &tree, Operation *anchor);
+
+FailureOr<ResourceAllocationTree>
+materializeLayerRegionNodes(const ResourceAllocationTree &tree,
+                            const ComputeGraph &graph, Operation *anchor);
+
+FailureOr<ResourceAllocationTree>
 reindexResourceAllocationTree(const ResourceAllocationTree &tree,
                               Operation *anchor);
 

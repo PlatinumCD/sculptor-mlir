@@ -485,8 +485,10 @@ LogicalResult decomposeInlineLSTMCellLayers(func::FuncOp func) {
   SmallVector<NNLSTMCellOp> ops;
   func.walk([&](NNLSTMCellOp op) { ops.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNLSTMCellOp op : ops) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerLSTMCellOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline LSTMCell");
       return failure();

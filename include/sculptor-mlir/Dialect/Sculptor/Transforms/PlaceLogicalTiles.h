@@ -56,6 +56,12 @@ struct PlaceLogicalTilesPass
                      "tile shape"),
       llvm::cl::init(0)};
 
+  Option<int64_t> tileMemoryCapacityBytes{
+      *this, "tile-memory-capacity-bytes",
+      llvm::cl::desc("Maximum conservative local-memory bytes per physical "
+                     "tile; zero disables the capacity constraint"),
+      llvm::cl::init(0)};
+
   Option<std::string> greedyTileOrder{
       *this, "greedy-tile-order",
       llvm::cl::desc("Greedy logical-tile order: sequential or priority"),
@@ -141,6 +147,7 @@ struct PlaceLogicalTilesPass
     meshRows = pass.meshRows;
     meshCols = pass.meshCols;
     arraysPerCore = pass.arraysPerCore;
+    tileMemoryCapacityBytes = pass.tileMemoryCapacityBytes;
     greedyTileOrder = pass.greedyTileOrder;
     greedyPriorityMode = pass.greedyPriorityMode;
     greedyCandidateScope = pass.greedyCandidateScope;

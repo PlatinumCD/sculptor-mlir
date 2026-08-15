@@ -206,7 +206,7 @@ LogicalResult emitResourceTable(ModuleOp module, const TileModel &model) {
               resource.routeId.value_or(0),
               resource.slot,
               static_cast<uint32_t>(resource.kind),
-              kFloat32ElementType,
+              resource.elementType,
               static_cast<uint32_t>(resource.shapedType.getRank()),
               resource.dimensionOffset,
               getResourceFlags(resource),
@@ -263,6 +263,291 @@ LogicalResult emitResourceDimensionTable(ModuleOp module,
                                  global)) ||
       failed(emitCountAccessor(module, kResourceDimensionCountAccessorName,
                                model.resourceDimensions.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitMemoryOwnerTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kMemoryOwnersGlobalName)) ||
+      failed(checkAvailableSymbol(module, kMemoryOwnersAccessorName)) ||
+      failed(checkAvailableSymbol(module, kMemoryOwnerCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!model.memoryOwners.empty()) {
+    auto type = getMemoryOwnerType(module.getContext());
+    global = emitArrayGlobal(
+        module, kMemoryOwnersGlobalName, type, model.memoryOwners.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const MemoryOwnerModel &owner = model.memoryOwners[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {owner.id, owner.globalResourceId,
+                                     owner.localSlot, owner.kind};
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), owner.byteSize),
+              ArrayRef<int64_t>{4});
+        });
+  }
+  if (failed(emitPointerAccessor(module, kMemoryOwnersAccessorName, global)) ||
+      failed(emitCountAccessor(module, kMemoryOwnerCountAccessorName,
+                               model.memoryOwners.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitMemoryViewTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kMemoryViewsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kMemoryViewsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kMemoryViewCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!model.memoryViews.empty()) {
+    auto type = getMemoryViewType(module.getContext());
+    global = emitArrayGlobal(
+        module, kMemoryViewsGlobalName, type, model.memoryViews.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const MemoryViewModel &view = model.memoryViews[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {view.id,
+                                     view.ownerId,
+                                     view.ownerSlot,
+                                     view.rank,
+                                     view.geometryOffset,
+                                     view.contiguity,
+                                     0,
+                                     0};
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), view.byteOffset),
+              ArrayRef<int64_t>{8});
+          return builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), view.byteSize),
+              ArrayRef<int64_t>{9});
+        });
+  }
+  if (failed(emitPointerAccessor(module, kMemoryViewsAccessorName, global)) ||
+      failed(emitCountAccessor(module, kMemoryViewCountAccessorName,
+                               model.memoryViews.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitMemoryViewGeometryTable(ModuleOp module,
+                                          const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kMemoryViewGeometryGlobalName)) ||
+      failed(checkAvailableSymbol(module, kMemoryViewGeometryAccessorName)) ||
+      failed(
+          checkAvailableSymbol(module, kMemoryViewGeometryCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!model.memoryViewGeometry.empty()) {
+    Type type = IntegerType::get(module.getContext(), 64);
+    global =
+        emitArrayGlobal(module, kMemoryViewGeometryGlobalName, type,
+                        model.memoryViewGeometry.size(),
+                        [&](OpBuilder &builder, unsigned index) -> Value {
+                          return buildI64(builder, module.getLoc(),
+                                          static_cast<uint64_t>(
+                                              model.memoryViewGeometry[index]));
+                        });
+  }
+  if (failed(emitPointerAccessor(module, kMemoryViewGeometryAccessorName,
+                                 global)) ||
+      failed(emitCountAccessor(module, kMemoryViewGeometryCountAccessorName,
+                               model.memoryViewGeometry.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitRouteViewTable(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kRouteViewsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kRouteViewsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kRouteViewCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!model.routeViews.empty()) {
+    auto type = getRouteViewType(module.getContext());
+    global = emitArrayGlobal(
+        module, kRouteViewsGlobalName, type, model.routeViews.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const RouteViewModel &view = model.routeViews[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {view.routeId,      view.localResourceSlot,
+                                     view.ownerSlot,    view.viewId,
+                                     view.movementMode, view.completionEventId,
+                                     view.assemblyId,   view.flags};
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), view.byteOffset),
+              ArrayRef<int64_t>{8});
+          return builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), view.byteSize),
+              ArrayRef<int64_t>{9});
+        });
+  }
+  if (failed(emitPointerAccessor(module, kRouteViewsAccessorName, global)) ||
+      failed(emitCountAccessor(module, kRouteViewCountAccessorName,
+                               model.routeViews.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitAssemblyTables(ModuleOp module, const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kAssembliesGlobalName)) ||
+      failed(checkAvailableSymbol(module, kAssembliesAccessorName)) ||
+      failed(checkAvailableSymbol(module, kAssemblyCountAccessorName)) ||
+      failed(checkAvailableSymbol(module, kAssemblyContributionsGlobalName)) ||
+      failed(
+          checkAvailableSymbol(module, kAssemblyContributionsAccessorName)) ||
+      failed(
+          checkAvailableSymbol(module, kAssemblyContributionCountAccessorName)))
+    return failure();
+  LLVM::GlobalOp assemblyGlobal;
+  if (!model.assemblies.empty()) {
+    auto type = getAssemblyType(module.getContext());
+    assemblyGlobal = emitArrayGlobal(
+        module, kAssembliesGlobalName, type, model.assemblies.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const AssemblyModel &assembly = model.assemblies[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {assembly.id,
+                                     assembly.ownerSlot,
+                                     assembly.contributionOffset,
+                                     assembly.contributionCount,
+                                     assembly.readinessEventId,
+                                     0};
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return entry;
+        });
+  }
+  LLVM::GlobalOp contributionGlobal;
+  if (!model.assemblyContributions.empty()) {
+    auto type = getAssemblyContributionType(module.getContext());
+    contributionGlobal = emitArrayGlobal(
+        module, kAssemblyContributionsGlobalName, type,
+        model.assemblyContributions.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const AssemblyContributionModel &contribution =
+              model.assemblyContributions[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {
+              contribution.assemblyId,        contribution.sourceViewId,
+              contribution.destinationViewId, contribution.completionEventId,
+              contribution.routeId,           contribution.flags};
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return entry;
+        });
+  }
+  if (failed(emitPointerAccessor(module, kAssembliesAccessorName,
+                                 assemblyGlobal)) ||
+      failed(emitCountAccessor(module, kAssemblyCountAccessorName,
+                               model.assemblies.size())) ||
+      failed(emitPointerAccessor(module, kAssemblyContributionsAccessorName,
+                                 contributionGlobal)) ||
+      failed(emitCountAccessor(module, kAssemblyContributionCountAccessorName,
+                               model.assemblyContributions.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitSegmentedMovementTables(ModuleOp module,
+                                          const TileModel &model) {
+  if (failed(checkAvailableSymbol(module, kSegmentedMovementsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kSegmentedMovementsAccessorName)) ||
+      failed(
+          checkAvailableSymbol(module, kSegmentedMovementCountAccessorName)) ||
+      failed(checkAvailableSymbol(module, kMemorySegmentsGlobalName)) ||
+      failed(checkAvailableSymbol(module, kMemorySegmentsAccessorName)) ||
+      failed(checkAvailableSymbol(module, kMemorySegmentCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp movementGlobal;
+  if (!model.segmentedMovements.empty()) {
+    auto type = getSegmentedMovementType(module.getContext());
+    movementGlobal = emitArrayGlobal(
+        module, kSegmentedMovementsGlobalName, type,
+        model.segmentedMovements.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const SegmentedMovementModel &movement =
+              model.segmentedMovements[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint32_t values[] = {
+              movement.movementId,
+              movement.routeId,
+              movement.segmentOffset,
+              movement.segmentCount,
+              movement.completionEventId,
+              movement.assemblyId,
+              movement.flags,
+              0U,
+          };
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI64(builder, module.getLoc(), movement.byteSize),
+              ArrayRef<int64_t>{8});
+        });
+  }
+  if (failed(emitPointerAccessor(module, kSegmentedMovementsAccessorName,
+                                 movementGlobal)) ||
+      failed(emitCountAccessor(module, kSegmentedMovementCountAccessorName,
+                               model.segmentedMovements.size())))
+    return failure();
+
+  LLVM::GlobalOp segmentGlobal;
+  if (!model.memorySegments.empty()) {
+    auto type = getMemorySegmentType(module.getContext());
+    segmentGlobal = emitArrayGlobal(
+        module, kMemorySegmentsGlobalName, type, model.memorySegments.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const MemorySegmentModel &segment = model.memorySegments[index];
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          const uint64_t values[] = {
+              segment.sourceByteOffset,
+              segment.destinationByteOffset,
+              segment.byteSize,
+          };
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI64(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return entry;
+        });
+  }
+  if (failed(emitPointerAccessor(module, kMemorySegmentsAccessorName,
+                                 segmentGlobal)) ||
+      failed(emitCountAccessor(module, kMemorySegmentCountAccessorName,
+                               model.memorySegments.size())))
     return failure();
   return success();
 }
@@ -326,6 +611,132 @@ LogicalResult emitTaskBindingDataTable(ModuleOp module,
           emitPointerAccessor(module, kTaskBindingDataAccessorName, global)) ||
       failed(emitCountAccessor(module, kTaskBindingDataCountAccessorName,
                                model.taskBindingData.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitIdIndexTable(ModuleOp module, ArrayRef<IdIndexModel> entries,
+                               StringRef globalName, StringRef accessorName,
+                               StringRef countAccessorName) {
+  if (failed(checkAvailableSymbol(module, globalName)) ||
+      failed(checkAvailableSymbol(module, accessorName)) ||
+      failed(checkAvailableSymbol(module, countAccessorName)))
+    return failure();
+  LLVM::GlobalOp global;
+  if (!entries.empty()) {
+    auto type = getIdIndexType(module.getContext());
+    global = emitArrayGlobal(
+        module, globalName, type, entries.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          entry = builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI32(builder, module.getLoc(), entries[index].id),
+              ArrayRef<int64_t>{0});
+          return builder.create<LLVM::InsertValueOp>(
+              module.getLoc(), entry,
+              buildI32(builder, module.getLoc(), entries[index].index),
+              ArrayRef<int64_t>{1});
+        });
+  }
+  if (failed(emitPointerAccessor(module, accessorName, global)) ||
+      failed(emitCountAccessor(module, countAccessorName, entries.size())))
+    return failure();
+  return success();
+}
+
+LogicalResult emitStaticRuntimeTables(ModuleOp module,
+                                      const TileModel &model) {
+  if (failed(emitIdIndexTable(
+          module, model.taskIdIndex, kTaskIdIndexGlobalName,
+          kTaskIdIndexAccessorName, kTaskIdIndexCountAccessorName)) ||
+      failed(emitIdIndexTable(
+          module, model.incomingRouteIdIndex,
+          kIncomingRouteIdIndexGlobalName, kIncomingRouteIdIndexAccessorName,
+          kIncomingRouteIdIndexCountAccessorName)) ||
+      failed(emitIdIndexTable(
+          module, model.outgoingRouteIdIndex,
+          kOutgoingRouteIdIndexGlobalName, kOutgoingRouteIdIndexAccessorName,
+          kOutgoingRouteIdIndexCountAccessorName)))
+    return failure();
+
+  if (failed(checkAvailableSymbol(module, kStaticTasksGlobalName)) ||
+      failed(checkAvailableSymbol(module, kStaticTasksAccessorName)) ||
+      failed(checkAvailableSymbol(module, kStaticTaskCountAccessorName)) ||
+      failed(checkAvailableSymbol(module, kStaticResourcesGlobalName)) ||
+      failed(checkAvailableSymbol(module, kStaticResourcesAccessorName)) ||
+      failed(checkAvailableSymbol(module, kStaticResourceCountAccessorName)) ||
+      failed(checkAvailableSymbol(module, kStaticRuntimeDataGlobalName)) ||
+      failed(checkAvailableSymbol(module, kStaticRuntimeDataAccessorName)) ||
+      failed(checkAvailableSymbol(module, kStaticRuntimeDataCountAccessorName)))
+    return failure();
+
+  LLVM::GlobalOp taskGlobal;
+  if (!model.staticTasks.empty()) {
+    auto type = getStaticTaskType(module.getContext());
+    taskGlobal = emitArrayGlobal(
+        module, kStaticTasksGlobalName, type, model.staticTasks.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const StaticTaskModel &task = model.staticTasks[index];
+          const uint32_t values[] = {
+              task.initialReadiness, task.outgoingRouteOffset,
+              task.outgoingRouteCount, task.dependentOffset,
+              task.dependentCount};
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return entry;
+        });
+  }
+  if (failed(emitPointerAccessor(module, kStaticTasksAccessorName,
+                                 taskGlobal)) ||
+      failed(emitCountAccessor(module, kStaticTaskCountAccessorName,
+                               model.staticTasks.size())))
+    return failure();
+
+  LLVM::GlobalOp resourceGlobal;
+  if (!model.staticResources.empty()) {
+    auto type = getStaticResourceType(module.getContext());
+    resourceGlobal = emitArrayGlobal(
+        module, kStaticResourcesGlobalName, type, model.staticResources.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          const StaticResourceModel &resource = model.staticResources[index];
+          const uint32_t values[] = {
+              resource.readyConsumerOffset, resource.readyConsumerCount,
+              resource.boundConsumerOffset, resource.boundConsumerCount};
+          Value entry = builder.create<LLVM::ZeroOp>(module.getLoc(), type);
+          for (auto value : llvm::enumerate(values))
+            entry = builder.create<LLVM::InsertValueOp>(
+                module.getLoc(), entry,
+                buildI32(builder, module.getLoc(), value.value()),
+                ArrayRef<int64_t>{static_cast<int64_t>(value.index())});
+          return entry;
+        });
+  }
+  if (failed(emitPointerAccessor(module, kStaticResourcesAccessorName,
+                                 resourceGlobal)) ||
+      failed(emitCountAccessor(module, kStaticResourceCountAccessorName,
+                               model.staticResources.size())))
+    return failure();
+
+  LLVM::GlobalOp dataGlobal;
+  if (!model.staticRuntimeData.empty()) {
+    Type i32Type = IntegerType::get(module.getContext(), 32);
+    dataGlobal = emitArrayGlobal(
+        module, kStaticRuntimeDataGlobalName, i32Type,
+        model.staticRuntimeData.size(),
+        [&](OpBuilder &builder, unsigned index) -> Value {
+          return buildI32(builder, module.getLoc(),
+                          model.staticRuntimeData[index]);
+        });
+  }
+  if (failed(emitPointerAccessor(module, kStaticRuntimeDataAccessorName,
+                                 dataGlobal)) ||
+      failed(emitCountAccessor(module, kStaticRuntimeDataCountAccessorName,
+                               model.staticRuntimeData.size())))
     return failure();
   return success();
 }
@@ -533,6 +944,12 @@ LogicalResult emitTileTables(ModuleOp module, const TileModel &model) {
       failed(emitDMADescriptorTable(module, model)) ||
       failed(emitResourceTable(module, model)) ||
       failed(emitResourceDimensionTable(module, model)) ||
+      failed(emitMemoryOwnerTable(module, model)) ||
+      failed(emitMemoryViewTable(module, model)) ||
+      failed(emitMemoryViewGeometryTable(module, model)) ||
+      failed(emitRouteViewTable(module, model)) ||
+      failed(emitAssemblyTables(module, model)) ||
+      failed(emitSegmentedMovementTables(module, model)) ||
       failed(emitWorkspaceSizeAccessor(module, model.workspaceSize)) ||
       failed(emitTaskTable(module, model, model.bootTaskIndices,
                            kBootTasksGlobalName, kBootTasksAccessorName,
@@ -542,6 +959,7 @@ LogicalResult emitTileTables(ModuleOp module, const TileModel &model) {
                            kDispatchTaskCountAccessorName)) ||
       failed(emitTaskBindingTable(module, model)) ||
       failed(emitTaskBindingDataTable(module, model)) ||
+      failed(emitStaticRuntimeTables(module, model)) ||
       failed(emitRouteTable(
           module, model.incomingRoutes, kIncomingRoutesGlobalName,
           kIncomingRoutesAccessorName, kIncomingRouteCountAccessorName)) ||

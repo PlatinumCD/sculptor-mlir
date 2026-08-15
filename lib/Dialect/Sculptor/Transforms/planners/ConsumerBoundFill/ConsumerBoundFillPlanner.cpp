@@ -5,6 +5,8 @@
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <optional>
+#include <set>
+#include <tuple>
 
 namespace {
 
@@ -276,6 +278,14 @@ private:
 
 FailureOr<ResourceAllocationTree>
 bindFillsToConsumers(const MappingProblem &problem) {
+  using WorkUnitEdgeKey =
+      std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
+  auto getEdgeKey = [](const MappingWorkUnitEdge &edge) {
+    return WorkUnitEdgeKey{edge.sourceOperationId, edge.sourceWorkUnitId,
+                           edge.targetOperationId, edge.targetWorkUnitId,
+                           edge.targetOperandNumber};
+  };
+
   DenseMap<int64_t, SmallVector<int64_t>> leavesByOperation;
   DenseMap<int64_t, const StructuralRATreeNode *> nodesById;
   for (const StructuralRATreeNode &node : problem.currentTree.nodes) {
@@ -308,6 +318,14 @@ bindFillsToConsumers(const MappingProblem &problem) {
   DenseMap<int64_t, SmallVector<int64_t>> fillLeavesByTarget;
   DenseSet<int64_t> movedFillLeaves;
   SmallVector<MappingWorkUnitEdge> exactFillEdges;
+  // A detector-sized sharded graph can contain millions of fill/consumer
+  // pairs and work-unit edges. Scanning every existing edge for every pair is
+  // quadratic and dominated mapping time without changing the plan. Keep the
+  // same five-field identity in an ordered index and update it as exact edges
+  // are added.
+  std::set<WorkUnitEdgeKey> existingEdgeKeys;
+  for (const MappingWorkUnitEdge &edge : problem.currentTree.workUnitEdges)
+    existingEdgeKeys.insert(getEdgeKey(edge));
   for (const ComputeOperation &operation : problem.graph.operations) {
     if (!isFill(operation))
       continue;
@@ -362,16 +380,7 @@ bindFillsToConsumers(const MappingProblem &problem) {
           problem, *fillLeaf, *consumerLeaf, workUnitsById);
       if (failed(edge))
         return failure();
-      bool alreadyPresent = llvm::any_of(
-          problem.currentTree.workUnitEdges,
-          [&](const MappingWorkUnitEdge &existing) {
-            return existing.sourceOperationId == edge->sourceOperationId &&
-                   existing.sourceWorkUnitId == edge->sourceWorkUnitId &&
-                   existing.targetOperationId == edge->targetOperationId &&
-                   existing.targetWorkUnitId == edge->targetWorkUnitId &&
-                   existing.targetOperandNumber == edge->targetOperandNumber;
-          });
-      if (!alreadyPresent)
+      if (existingEdgeKeys.insert(getEdgeKey(*edge)).second)
         exactFillEdges.push_back(*edge);
     }
   }

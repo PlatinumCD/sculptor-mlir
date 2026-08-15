@@ -1,6 +1,7 @@
 #include "SetupFirstPlanner.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <optional>
@@ -123,6 +124,25 @@ namespace mapping {
 FailureOr<MappingPlan>
 SetupFirstPlanner::refine(const MappingProblem &problem,
                           const MappingEvaluator &evaluator) const {
+  bool hasMatrixSetup = llvm::any_of(
+      problem.graph.operations, [](const ComputeOperation &operation) {
+        return operation.kind == ComputeOperationKind::MatrixSetup;
+      });
+  if (!hasMatrixSetup) {
+    FailureOr<MappingEvaluation> evaluation =
+        evaluator.evaluate(problem, problem.currentTree);
+    if (failed(evaluation))
+      return failure();
+    MappingPlan plan;
+    plan.plannerName = getName().str();
+    plan.objective = problem.objective;
+    plan.selectedTree = problem.currentTree;
+    plan.evaluation = *evaluation;
+    plan.candidates.push_back(
+        {/*name=*/"setup-first-no-matrices", *evaluation, /*selected=*/true});
+    return plan;
+  }
+
   DenseMap<int64_t, const StructuralRATreeNode *> delegatedNodes;
   for (const StructuralRATreeNode &node : problem.currentTree.nodes)
     delegatedNodes[node.id] = &node;

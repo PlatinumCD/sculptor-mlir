@@ -20,6 +20,8 @@ namespace mapping {
 
 inline constexpr StringLiteral kMappingOperationIdAttrName =
     "sculptor.mapping.operation_id";
+inline constexpr StringLiteral kLayerRegionIdAttrName =
+    "sculptor.mapping.layer_region_id";
 inline constexpr StringLiteral kExpandedDigitalWorkAttrName =
     "sculptor.mapping.expanded_digital_work";
 inline constexpr StringLiteral kRALeafIdAttrName =
@@ -92,6 +94,12 @@ struct ComputeOperation {
   std::optional<int64_t> reductionLevel;
   std::optional<int64_t> reductionOrdinal;
   std::optional<int64_t> reductionWidth;
+  // Stable semantic parent assigned before layer decomposition. The dense
+  // layerRegionId indexes ComputeGraph::layerRegions; semanticLayerId remains
+  // the compiler-visible identity carried by the IR.
+  std::optional<int64_t> semanticLayerId;
+  std::string semanticLayerKind;
+  int64_t layerRegionId = -1;
   std::string semanticTaskKind;
   std::string stageName;
 };
@@ -121,12 +129,42 @@ struct ComputeTensor {
   Value value;
   Type type;
   SmallVector<int64_t> producerOperations;
+  // Static bytes contributed by each producer operation through the support
+  // operation closure that forms `value`. This vector is parallel to
+  // producerOperations. For example, each input of tensor.concat contributes
+  // only its own shard rather than the complete concat result.
+  SmallVector<int64_t> producerByteSizes;
   SmallVector<int64_t> consumerOperations;
   int64_t byteSize = -1;
   bool isLogicalArray = false;
   bool isFunctionInput = false;
   bool isFunctionOutput = false;
 };
+
+// A semantic layer region is the strategic mapping boundary above individual
+// compute operations. Tagged operations with the same stable layer ID share a
+// region. An untagged, all-parallel structured epilogue may inherit the one
+// semantic producer region that feeds it. One-use destination initializers
+// belong to their consuming region; all other untagged operations receive
+// explicit singleton fallback regions.
+struct LayerRegion {
+  int64_t id = -1;
+  std::optional<int64_t> semanticLayerId;
+  std::string semanticLayerKind;
+  SmallVector<int64_t> operationIds;
+  SmallVector<int64_t> inputTensors;
+  SmallVector<int64_t> outputTensors;
+  SmallVector<int64_t> internalTensors;
+  int64_t analogLaneDemand = 0;
+  int64_t estimatedDigitalWorkItems = 0;
+  int64_t estimatedStaticMemoryBytes = 0;
+  int64_t estimatedInputBytes = 0;
+  int64_t estimatedOutputBytes = 0;
+  bool isSingletonFallback = false;
+};
+
+int64_t getProducerContributionByteSize(const ComputeTensor &tensor,
+                                        int64_t producerOperationId);
 
 struct ComputeGraph {
   std::string functionSymbol;
@@ -135,6 +173,8 @@ struct ComputeGraph {
   SmallVector<int64_t, 0> topologicalOrder;
   SmallVector<LaneBindingGroup, 0> laneBindingGroups;
   SmallVector<MVMWave, 0> mvmWaves;
+  SmallVector<LayerRegion, 0> layerRegions;
+  SmallVector<int64_t, 0> topologicalLayerRegionOrder;
 };
 
 FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func);

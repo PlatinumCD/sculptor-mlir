@@ -6,6 +6,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTaskGraphAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/SemanticOperationNames.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileMemoryPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
 
@@ -48,6 +49,8 @@ constexpr StringLiteral kInputResourceIdsAttr =
     "sculptor.deployment.input_resource_ids";
 constexpr StringLiteral kOutputResourceIdsAttr =
     "sculptor.deployment.output_resource_ids";
+constexpr StringLiteral kControlDependencyIdsAttr =
+    "sculptor.deployment.control_dependency_ids";
 constexpr StringLiteral kLocalBindingsAttr =
     "sculptor.deployment.local_bindings";
 
@@ -155,6 +158,14 @@ FailureOr<SmallVector<RoutineInfo, 0>> collectRoutines(ModuleOp module) {
         requireI64Array(function, kInputResourceIdsAttr);
     FailureOr<SmallVector<int64_t>> outputs =
         requireI64Array(function, kOutputResourceIdsAttr);
+    SmallVector<int64_t> dependencies;
+    if (function->hasAttr(kControlDependencyIdsAttr)) {
+      FailureOr<SmallVector<int64_t>> parsed =
+          requireI64Array(function, kControlDependencyIdsAttr);
+      if (failed(parsed))
+        return failure();
+      dependencies = std::move(*parsed);
+    }
     if (failed(globalId) || failed(inputs) || failed(outputs) || !kind) {
       if (!kind)
         function.emitError("expected string attribute '")
@@ -177,7 +188,8 @@ FailureOr<SmallVector<RoutineInfo, 0>> collectRoutines(ModuleOp module) {
       return failure();
     }
     routines.push_back(RoutineInfo{function, *globalId, boot,
-                                   std::move(*inputs), std::move(*outputs)});
+                                   std::move(*inputs), std::move(*outputs),
+                                   std::move(dependencies)});
   }
   if (routines.empty()) {
     module.emitError("expected at least one outlined tile routine");
@@ -355,6 +367,9 @@ Value createResource(OpBuilder &builder, Location loc, Value graph, Type type,
 }
 
 LogicalResult materializeRuntimeGraph(ModuleOp module) {
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::verifyTileMemoryPlan(module)))
+    return failure();
   auto kind = module->getAttrOfType<StringAttr>(kKindAttr);
   if (!kind || kind.getValue() != "tile_routine_core") {
     return module.emitError(
@@ -396,6 +411,50 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
   if (failed(incoming) || failed(outgoing) || failed(bindings) ||
       failed(modelInputs) || failed(modelOutputs))
     return failure();
+
+  // A route describes one remote task input, but the runtime transfer is
+  // owned by the produced resource.  Several routines on the same
+  // destination tile can consume that resource without retransmitting it.
+  // Keep the original routes for task-port binding and collapse only the
+  // physical transfer manifest/resource slot.
+  using TransferKey =
+      std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
+  auto transferKey = [](TileRoutineRouteAttr route) {
+    return TransferKey{route.getSourceTile().getInt(),
+                       route.getSourceRoutine().getInt(),
+                       route.getSourceOutput().getInt(),
+                       route.getDestinationTile().getInt(),
+                       route.getResourceId().getInt()};
+  };
+  using TransferGroups =
+      std::map<TransferKey, SmallVector<TileRoutineRouteAttr>>;
+  auto groupTransfers = [&](ArrayRef<TileRoutineRouteAttr> routes)
+      -> FailureOr<TransferGroups> {
+    TransferGroups groups;
+    for (TileRoutineRouteAttr route : routes) {
+      auto &group = groups[transferKey(route)];
+      if (!group.empty() &&
+          group.front().getByteSize() != route.getByteSize()) {
+        module.emitError(
+            "routes for one destination-local resource have inconsistent "
+            "payload sizes");
+        return failure();
+      }
+      group.push_back(route);
+    }
+    return groups;
+  };
+  FailureOr<TransferGroups> incomingTransfers = groupTransfers(*incoming);
+  FailureOr<TransferGroups> outgoingTransfers = groupTransfers(*outgoing);
+  if (failed(incomingTransfers) || failed(outgoingTransfers))
+    return failure();
+  auto canonicalRoute = [](ArrayRef<TileRoutineRouteAttr> routes) {
+    return *std::min_element(
+        routes.begin(), routes.end(),
+        [](TileRoutineRouteAttr lhs, TileRoutineRouteAttr rhs) {
+          return lhs.getId().getInt() < rhs.getId().getInt();
+        });
+  };
 
   std::map<int64_t, Type> nonRouteTypes;
   DenseSet<int64_t> modelInputResourceIds;
@@ -588,10 +647,14 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
         route.getDestinationInput(), route.getResourceId(),
         route.getByteSize());
   };
-  for (TileRoutineRouteAttr route : *incoming)
-    incomingManifest.push_back(convertRoute(route));
-  for (TileRoutineRouteAttr route : *outgoing)
-    outgoingManifest.push_back(convertRoute(route));
+  for (const auto &[key, routes] : *incomingTransfers) {
+    static_cast<void>(key);
+    incomingManifest.push_back(convertRoute(canonicalRoute(routes)));
+  }
+  for (const auto &[key, routes] : *outgoingTransfers) {
+    static_cast<void>(key);
+    outgoingManifest.push_back(convertRoute(canonicalRoute(routes)));
+  }
   module->setAttr(deployment_attrs::kIncomingRoutesAttrName,
                   builder.getArrayAttr(incomingManifest));
   module->setAttr(deployment_attrs::kOutgoingRoutesAttrName,
@@ -650,33 +713,58 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
   }
 
   std::map<int64_t, Value> incomingResources;
-  for (TileRoutineRouteAttr route : *incoming) {
+  for (const auto &[key, routes] : *incomingTransfers) {
+    static_cast<void>(key);
+    TileRoutineRouteAttr canonical = canonicalRoute(routes);
+    Type type = incomingTypes.at(canonical.getId().getInt());
+    for (TileRoutineRouteAttr route : routes) {
+      if (incomingTypes.at(route.getId().getInt()) != type) {
+        return module.emitError(
+            "coalesced incoming routes have inconsistent tensor types");
+      }
+    }
     Value resource = createResource<TaskGraphRouteInputOp>(
-        builder, module.getLoc(), graph,
-        incomingTypes.at(route.getId().getInt()),
-        route.getResourceId().getInt());
+        builder, module.getLoc(), graph, type,
+        canonical.getResourceId().getInt());
     resource.getDefiningOp()->setAttr(deployment_attrs::kRouteIdAttrName,
-                                      route.getId());
-    incomingResources.emplace(route.getId().getInt(), resource);
+                                      canonical.getId());
+    for (TileRoutineRouteAttr route : routes)
+      incomingResources.emplace(route.getId().getInt(), resource);
   }
   std::map<int64_t, Value> outgoingResources;
   for (const auto &[key, routes] : outgoingGroups) {
-    TileRoutineRouteAttr canonicalRoute = *std::min_element(
-        routes.begin(), routes.end(),
-        [](TileRoutineRouteAttr lhs, TileRoutineRouteAttr rhs) {
-          return lhs.getId().getInt() < rhs.getId().getInt();
-        });
-    Value resource = createResource<TaskGraphRouteOutputOp>(
-        builder, module.getLoc(), graph, outgoingGroupTypes.at(key),
-        canonicalRoute.getResourceId().getInt());
-    resource.getDefiningOp()->setAttr(deployment_attrs::kRouteIdAttrName,
-                                      canonicalRoute.getId());
+    TileRoutineRouteAttr canonical = canonicalRoute(routes);
+    int64_t resourceId = canonical.getResourceId().getInt();
+    Value resource;
+    if (modelOutputResourceIds.contains(resourceId)) {
+      auto modelOutput = nonRouteResources.find(resourceId);
+      if (modelOutput == nonRouteResources.end())
+        return module.emitError(
+            "outgoing model output has no runtime boundary resource");
+      // The external model-output buffer already contains the producer result.
+      // Route directly from that slot instead of creating a second workspace
+      // buffer and asking the task to write the same result twice.
+      resource = modelOutput->second;
+    } else {
+      resource = createResource<TaskGraphRouteOutputOp>(
+          builder, module.getLoc(), graph, outgoingGroupTypes.at(key),
+          resourceId);
+      resource.getDefiningOp()->setAttr(deployment_attrs::kRouteIdAttrName,
+                                        canonical.getId());
+    }
 
     FailureOr<int64_t> computedByteSize = getTaskResourceByteSize(resource);
-    if (failed(computedByteSize) ||
-        *computedByteSize != canonicalRoute.getByteSize().getInt()) {
+    if (failed(computedByteSize)) {
       return module.emitError(
-          "outgoing route byte size does not match its static tensor type");
+          "outgoing route payload is not a supported statically sized "
+          "numeric tensor");
+    }
+    if (*computedByteSize != canonical.getByteSize().getInt()) {
+      return module.emitError(
+                 "outgoing route byte size does not match its static tensor "
+                 "type: route declares ")
+             << canonical.getByteSize().getInt() << " bytes but type "
+             << outgoingGroupTypes.at(key) << " requires " << *computedByteSize;
     }
     for (TileRoutineRouteAttr route : routes)
       outgoingResources.emplace(route.getId().getInt(), resource);
@@ -825,6 +913,9 @@ LogicalResult materializeRuntimeGraph(ModuleOp module) {
     module.emitError("materialized tile runtime graph failed verification");
     return failure();
   }
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::verifyTileMemoryPlan(module)))
+    return failure();
   return success();
 }
 

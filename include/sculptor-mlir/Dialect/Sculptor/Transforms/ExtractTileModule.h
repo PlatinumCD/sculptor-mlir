@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 
 #include <cstdint>
@@ -39,6 +40,12 @@ struct ExtractTileModulePass
 };
 
 void registerExtractTileModulePass();
+
+/// Clone one active tile from an outlined deployment into the same standalone
+/// module shape produced by ExtractTileModulePass. The source deployment is
+/// not mutated, allowing callers to parse once and extract every tile.
+FailureOr<OwningOpRef<ModuleOp>>
+cloneExtractedTileModule(ModuleOp deployment, int64_t tileId);
 
 } // namespace sculptor
 } // namespace mlir

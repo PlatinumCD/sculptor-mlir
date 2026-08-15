@@ -365,8 +365,10 @@ LogicalResult decomposeInlineRNNCellLayers(func::FuncOp func) {
   SmallVector<NNRNNCellOp> ops;
   func.walk([&](NNRNNCellOp op) { ops.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNRNNCellOp op : ops) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerRNNCellOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline RNNCell");
       return failure();

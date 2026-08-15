@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/FinalizeTileRuntimeGraph.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileMemoryPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeLayout.h"
 
 #include "mlir/Pass/PassRegistry.h"
@@ -20,6 +21,11 @@ namespace sculptor {
 
 void FinalizeTileRuntimeGraphPass::runOnOperation() {
   ModuleOp module = getOperation();
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::verifyTileMemoryPlan(module))) {
+    signalPassFailure();
+    return;
+  }
   func::FuncOp taskGraph;
 
   for (func::FuncOp func : module.getOps<func::FuncOp>()) {
@@ -43,7 +49,21 @@ void FinalizeTileRuntimeGraphPass::runOnOperation() {
   if (failed(rebuildTileRuntimeLayout(taskGraph))) {
     taskGraph.emitError("failed to finalize tile runtime layout");
     signalPassFailure();
+    return;
   }
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::rebuildTileMemoryCapacitySummary(module))) {
+    signalPassFailure();
+    return;
+  }
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::validateTileMemoryCapacity(module))) {
+    signalPassFailure();
+    return;
+  }
+  if (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+      failed(tile_memory::verifyTileMemoryPlan(module)))
+    signalPassFailure();
 }
 
 void registerFinalizeTileRuntimeGraphPass() {

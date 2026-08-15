@@ -2,6 +2,7 @@
 
 #include "ConsumerBoundFill/ConsumerBoundFillPlanner.h"
 #include "FanOutCut/FanOutCutPlanner.h"
+#include "LayerCut/LayerCutPlanner.h"
 #include "MVMWave/MVMWavePlanner.h"
 #include "RecursiveForkJoin/RecursiveForkJoinPlanner.h"
 #include "SetupFirst/SetupFirstPlanner.h"
@@ -26,6 +27,10 @@ void registerMappingPlanners() {
       llvm::report_fatal_error(llvm::StringRef(error));
     if (failed(registry.registerPlanner(
             "fan-out-cut", [] { return std::make_unique<FanOutCutPlanner>(); },
+            &error)))
+      llvm::report_fatal_error(llvm::StringRef(error));
+    if (failed(registry.registerPlanner(
+            "layer-cut", [] { return std::make_unique<LayerCutPlanner>(); },
             &error)))
       llvm::report_fatal_error(llvm::StringRef(error));
     if (failed(registry.registerPlanner(

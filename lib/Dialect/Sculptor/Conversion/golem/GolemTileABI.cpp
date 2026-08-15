@@ -2,6 +2,7 @@
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileMemoryPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileScratchpadAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
@@ -25,6 +26,7 @@ namespace sculptor {
 namespace golem_tile_abi {
 
 namespace scratchpad_attrs = mlir::sculptor::scratchpad_attrs;
+namespace tile_memory = mlir::sculptor::tile_memory;
 
 namespace {
 
@@ -128,10 +130,19 @@ FailureOr<ShapedType> getSupportedTensorType(Operation *op, Type type) {
   auto resourceType = dyn_cast<TaskResourceType>(type);
   Type valueType = resourceType ? resourceType.getValueType() : type;
   auto shapedType = dyn_cast<ShapedType>(valueType);
-  if (!shapedType || !shapedType.hasStaticShape() ||
-      !shapedType.getElementType().isF32()) {
+  if (!shapedType || !shapedType.hasStaticShape()) {
     op->emitError(
-        "Golem tile task ABI supports only statically shaped f32 tensors");
+        "Golem tile task ABI supports only statically shaped tensors");
+    return failure();
+  }
+  Type elementType = shapedType.getElementType();
+  auto integerType = dyn_cast<IntegerType>(elementType);
+  bool supportedInteger =
+      integerType && llvm::is_contained({8u, 16u, 32u, 64u},
+                                       integerType.getWidth());
+  if (!elementType.isF32() && !supportedInteger) {
+    op->emitError("Golem tile task ABI supports f32 and byte-addressable "
+                  "i8/i16/i32/i64 tensor elements");
     return failure();
   }
   if (!hasRepresentableContiguousStrides(shapedType)) {
@@ -140,6 +151,31 @@ FailureOr<ShapedType> getSupportedTensorType(Operation *op, Type type) {
     return failure();
   }
   return shapedType;
+}
+
+FailureOr<uint32_t> getElementTypeCode(Operation *op, Type elementType) {
+  if (elementType.isF32())
+    return kFloat32ElementType;
+  auto integerType = dyn_cast<IntegerType>(elementType);
+  if (!integerType)
+    return op->emitError("unsupported Golem tile ABI element type ")
+               << elementType,
+           failure();
+  bool isUnsigned = integerType.isUnsigned();
+  switch (integerType.getWidth()) {
+  case 8:
+    return isUnsigned ? kUInt8ElementType : kInt8ElementType;
+  case 16:
+    return isUnsigned ? kUInt16ElementType : kInt16ElementType;
+  case 32:
+    return isUnsigned ? kUInt32ElementType : kInt32ElementType;
+  case 64:
+    return isUnsigned ? kUInt64ElementType : kInt64ElementType;
+  default:
+    return op->emitError("unsupported Golem tile ABI integer width ")
+               << integerType.getWidth(),
+           failure();
+  }
 }
 
 bool isRouteResourceKind(ResourceKind kind) {
@@ -226,7 +262,11 @@ LogicalResult collectResources(TileModel &model) {
         &op, tile_runtime_attrs::kResourceSlotAttrName);
     auto byteSize = getRequiredUnsignedAttr<uint64_t>(
         &op, tile_runtime_attrs::kResourceByteSizeAttrName);
-    if (failed(shapedType) || failed(globalId) || failed(slot) ||
+    auto elementType = succeeded(shapedType)
+                           ? getElementTypeCode(&op,
+                                                (*shapedType).getElementType())
+                           : FailureOr<uint32_t>(failure());
+    if (failed(shapedType) || failed(elementType) || failed(globalId) || failed(slot) ||
         failed(byteSize))
       return failure();
 
@@ -287,8 +327,9 @@ LogicalResult collectResources(TileModel &model) {
     unsigned resourceIndex = model.resources.size();
     model.resourceIndexByValue.try_emplace(kindAndValue->second, resourceIndex);
     model.resources.push_back(ResourceModel{
-        &op, kindAndValue->second, *shapedType, kindAndValue->first, *globalId,
-        routeId, *slot, 0, *byteSize, workspaceOffset, scratchpad});
+        &op, kindAndValue->second, *shapedType, *elementType,
+        kindAndValue->first, *globalId, routeId, *slot, 0, *byteSize,
+        workspaceOffset, scratchpad});
     if (kindAndValue->first == ResourceKind::RouteInput) {
       model.routeInputResourceIndexByRouteId.try_emplace(*routeId,
                                                          resourceIndex);
@@ -355,8 +396,8 @@ LogicalResult collectResources(TileModel &model) {
 FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
                                                   unsigned outputCount) {
   SmallVector<unsigned> result;
-  auto attr =
-      task->getAttrOfType<ArrayAttr>(tile_runtime_attrs::kTaskResultIndicesAttrName);
+  auto attr = task->getAttrOfType<ArrayAttr>(
+      tile_runtime_attrs::kTaskResultIndicesAttrName);
   if (!attr) {
     result.reserve(outputCount);
     for (unsigned index = 0; index < outputCount; ++index)
@@ -365,8 +406,9 @@ FailureOr<SmallVector<unsigned>> getResultIndices(TaskCreateOp task,
   }
 
   if (attr.size() != outputCount) {
-    task.emitError("expected '") << tile_runtime_attrs::kTaskResultIndicesAttrName
-                                 << "' to match the number of task outputs";
+    task.emitError("expected '")
+        << tile_runtime_attrs::kTaskResultIndicesAttrName
+        << "' to match the number of task outputs";
     return failure();
   }
 
@@ -523,10 +565,10 @@ LogicalResult collectTasks(ModuleOp module, TileModel &model) {
         task, tile_runtime_attrs::kTaskLocalArrayIdAttrName);
     auto physicalArrayId = getOptionalUnsignedAttr<uint32_t>(
         task, tile_runtime_attrs::kTaskPhysicalArrayIdAttrName);
-    auto inputSlots =
-        getRequiredU32ArrayAttr(task, tile_runtime_attrs::kTaskInputSlotsAttrName);
-    auto outputSlots =
-        getRequiredU32ArrayAttr(task, tile_runtime_attrs::kTaskOutputSlotsAttrName);
+    auto inputSlots = getRequiredU32ArrayAttr(
+        task, tile_runtime_attrs::kTaskInputSlotsAttrName);
+    auto outputSlots = getRequiredU32ArrayAttr(
+        task, tile_runtime_attrs::kTaskOutputSlotsAttrName);
     if (failed(globalId) || failed(localIndex) || failed(coreId) ||
         failed(localArrayId) || failed(physicalArrayId) || failed(inputSlots) ||
         failed(outputSlots))
@@ -915,6 +957,150 @@ LogicalResult buildTaskBindings(TileModel &model) {
   return success();
 }
 
+LogicalResult buildStaticRuntime(TileModel &model) {
+  const size_t taskCount = model.taskBindings.size();
+  const size_t resourceCount = model.resources.size();
+  if (taskCount > UINT32_MAX || resourceCount > UINT32_MAX)
+    return model.taskGraphFunc.emitError(
+        "static runtime table count exceeds the Golem tile ABI");
+
+  DenseMap<uint32_t, uint32_t> taskIndexById;
+  model.taskIdIndex.reserve(taskCount);
+  for (auto indexed : llvm::enumerate(model.taskBindings)) {
+    const uint32_t taskIndex = static_cast<uint32_t>(indexed.index());
+    const uint32_t taskId = indexed.value().taskId;
+    if (!taskIndexById.try_emplace(taskId, taskIndex).second)
+      return model.taskGraphFunc.emitError(
+          "static runtime found a duplicate task ID");
+    model.taskIdIndex.push_back({taskId, taskIndex});
+  }
+  llvm::sort(model.taskIdIndex,
+             [](const IdIndexModel &left, const IdIndexModel &right) {
+               return left.id < right.id;
+             });
+
+  for (const RouteModel &route : model.outgoingRoutes) {
+    const uint32_t sourceTask =
+        static_cast<uint32_t>(route.route.getSourceTask().getInt());
+    if (!taskIndexById.count(sourceTask))
+      return model.taskGraphFunc.emitError(
+          "outgoing route source is not a local dispatch task");
+  }
+  // Group routes by local source task. One task can then transmit from one
+  // contiguous range without searching the complete outgoing route table.
+  llvm::sort(model.outgoingRoutes,
+             [&](const RouteModel &left, const RouteModel &right) {
+               const uint32_t leftId = static_cast<uint32_t>(
+                   left.route.getSourceTask().getInt());
+               const uint32_t rightId = static_cast<uint32_t>(
+                   right.route.getSourceTask().getInt());
+               const uint32_t leftTask = taskIndexById.lookup(leftId);
+               const uint32_t rightTask = taskIndexById.lookup(rightId);
+               return std::make_tuple(leftTask,
+                                      left.route.getId().getInt()) <
+                      std::make_tuple(rightTask,
+                                      right.route.getId().getInt());
+             });
+
+  model.staticTasks.resize(taskCount);
+  model.staticResources.resize(resourceCount);
+  SmallVector<SmallVector<uint32_t>> readyConsumers(resourceCount);
+  SmallVector<SmallVector<uint32_t>> boundConsumers(resourceCount);
+  SmallVector<SmallVector<uint32_t>> dependents(taskCount);
+
+  for (auto indexed : llvm::enumerate(model.taskBindings)) {
+    const uint32_t taskIndex = static_cast<uint32_t>(indexed.index());
+    const TaskBindingModel &binding = indexed.value();
+    const uint64_t readiness = static_cast<uint64_t>(binding.inputCount) +
+                               binding.outputCount + binding.dependencyCount;
+    if (readiness > UINT32_MAX)
+      return model.taskGraphFunc.emitError(
+          "static task readiness count exceeds the Golem tile ABI");
+    model.staticTasks[taskIndex].initialReadiness =
+        static_cast<uint32_t>(readiness);
+
+    ArrayRef<uint32_t> inputs(model.taskBindingData.data() +
+                                  binding.inputOffset,
+                              binding.inputCount);
+    ArrayRef<uint32_t> outputs(model.taskBindingData.data() +
+                                   binding.outputOffset,
+                               binding.outputCount);
+    ArrayRef<uint32_t> dependencies(model.taskBindingData.data() +
+                                        binding.dependencyOffset,
+                                    binding.dependencyCount);
+    for (uint32_t slot : inputs)
+      readyConsumers[slot].push_back(taskIndex);
+    for (uint32_t slot : outputs)
+      boundConsumers[slot].push_back(taskIndex);
+    for (uint32_t dependencyId : dependencies) {
+      auto dependency = taskIndexById.find(dependencyId);
+      if (dependency == taskIndexById.end())
+        return model.taskGraphFunc.emitError(
+            "static runtime dependency is not a local task");
+      dependents[dependency->second].push_back(taskIndex);
+    }
+  }
+
+  uint32_t routeIndex = 0;
+  for (uint32_t taskIndex = 0; taskIndex < taskCount; ++taskIndex) {
+    StaticTaskModel &task = model.staticTasks[taskIndex];
+    task.outgoingRouteOffset = routeIndex;
+    while (routeIndex < model.outgoingRoutes.size()) {
+      const uint32_t sourceId = static_cast<uint32_t>(
+          model.outgoingRoutes[routeIndex].route.getSourceTask().getInt());
+      if (taskIndexById.lookup(sourceId) != taskIndex)
+        break;
+      ++routeIndex;
+    }
+    task.outgoingRouteCount = routeIndex - task.outgoingRouteOffset;
+
+    llvm::sort(dependents[taskIndex]);
+    task.dependentOffset =
+        static_cast<uint32_t>(model.staticRuntimeData.size());
+    task.dependentCount = static_cast<uint32_t>(dependents[taskIndex].size());
+    model.staticRuntimeData.append(dependents[taskIndex]);
+  }
+  if (routeIndex != model.outgoingRoutes.size())
+    return model.taskGraphFunc.emitError(
+        "outgoing route table is not grouped by local task");
+
+  for (uint32_t slot = 0; slot < resourceCount; ++slot) {
+    StaticResourceModel &resource = model.staticResources[slot];
+    llvm::sort(readyConsumers[slot]);
+    llvm::sort(boundConsumers[slot]);
+    resource.readyConsumerOffset =
+        static_cast<uint32_t>(model.staticRuntimeData.size());
+    resource.readyConsumerCount =
+        static_cast<uint32_t>(readyConsumers[slot].size());
+    model.staticRuntimeData.append(readyConsumers[slot]);
+    resource.boundConsumerOffset =
+        static_cast<uint32_t>(model.staticRuntimeData.size());
+    resource.boundConsumerCount =
+        static_cast<uint32_t>(boundConsumers[slot].size());
+    model.staticRuntimeData.append(boundConsumers[slot]);
+  }
+  if (model.staticRuntimeData.size() > UINT32_MAX)
+    return model.taskGraphFunc.emitError(
+        "static runtime data exceeds the Golem tile ABI");
+
+  auto buildRouteIndex = [](ArrayRef<RouteModel> routes,
+                            SmallVectorImpl<IdIndexModel> &entries) {
+    entries.reserve(routes.size());
+    for (auto indexed : llvm::enumerate(routes))
+      entries.push_back(
+          {static_cast<uint32_t>(indexed.value().route.getId().getInt()),
+           static_cast<uint32_t>(indexed.index())});
+    llvm::sort(entries,
+               [](const IdIndexModel &left, const IdIndexModel &right) {
+                 return left.id < right.id;
+               });
+  };
+  buildRouteIndex(model.incomingRoutes, model.incomingRouteIdIndex);
+  buildRouteIndex(model.outgoingRoutes, model.outgoingRouteIdIndex);
+  model.abiFeatures |= kStaticRuntimeFeature;
+  return success();
+}
+
 LogicalResult validateDeploymentPlan(TileModel &model) {
   for (const ResourceModel &resource : model.resources) {
     uint64_t offset = resource.dimensionOffset;
@@ -984,6 +1170,48 @@ LogicalResult validateDeploymentPlan(TileModel &model) {
       }
     }
   }
+
+  DenseSet<uint32_t> ownerIds;
+  for (const MemoryOwnerModel &owner : model.memoryOwners) {
+    if (!ownerIds.insert(owner.id).second ||
+        (owner.localSlot != kInvalidABIId &&
+         !resourceSlots.contains(owner.localSlot)))
+      return model.taskGraphFunc.emitError("invalid memory owner ABI record");
+  }
+  DenseSet<uint32_t> viewIds;
+  for (const MemoryViewModel &view : model.memoryViews) {
+    uint64_t geometryCount = static_cast<uint64_t>(view.rank) * 3;
+    if (!viewIds.insert(view.id).second || !ownerIds.contains(view.ownerId) ||
+        view.geometryOffset > model.memoryViewGeometry.size() ||
+        geometryCount > model.memoryViewGeometry.size() - view.geometryOffset ||
+        (view.ownerSlot != kInvalidABIId &&
+         !resourceSlots.contains(view.ownerSlot)))
+      return model.taskGraphFunc.emitError("invalid memory view ABI record");
+  }
+  DenseSet<uint32_t> routeViewIds;
+  for (const RouteViewModel &view : model.routeViews) {
+    if (!routeViewIds.insert(view.routeId).second ||
+        !resourceSlots.contains(view.localResourceSlot) ||
+        !resourceSlots.contains(view.ownerSlot) ||
+        !viewIds.contains(view.viewId) || view.byteSize == 0)
+      return model.taskGraphFunc.emitError("invalid route-view ABI record");
+  }
+  DenseSet<uint32_t> assemblyIds;
+  for (const AssemblyModel &assembly : model.assemblies) {
+    if (!assemblyIds.insert(assembly.id).second ||
+        !resourceSlots.contains(assembly.ownerSlot) ||
+        assembly.contributionOffset > model.assemblyContributions.size() ||
+        assembly.contributionCount >
+            model.assemblyContributions.size() - assembly.contributionOffset)
+      return model.taskGraphFunc.emitError("invalid assembly ABI record");
+  }
+  for (const AssemblyContributionModel &contribution :
+       model.assemblyContributions) {
+    if (!assemblyIds.contains(contribution.assemblyId) ||
+        !viewIds.contains(contribution.destinationViewId))
+      return model.taskGraphFunc.emitError(
+          "invalid assembly contribution ABI record");
+  }
   return success();
 }
 
@@ -1034,13 +1262,22 @@ FailureOr<ResourceModel *> findRouteResource(TileModel &model, uint32_t routeId,
   if (expectedKind == ResourceKind::RouteOutput) {
     auto resourceIt =
         model.routeOutputResourceIndexByGlobalId.find(globalResourceId);
-    if (resourceIt == model.routeOutputResourceIndexByGlobalId.end()) {
-      diagnosticOp->emitError("cannot match outgoing deployment route ")
-          << routeId << " to a local route boundary resource with global ID "
-          << globalResourceId;
-      return failure();
+    if (resourceIt != model.routeOutputResourceIndexByGlobalId.end())
+      return &model.resources[resourceIt->second];
+
+    // A model output can also be consumed by a remote tile. In that case the
+    // materialized graph intentionally routes from the external model-output
+    // slot, avoiding a duplicate workspace allocation and result copy.
+    auto boundaryIt = model.nonRouteResourceIndexByGlobalId.find(globalResourceId);
+    if (boundaryIt != model.nonRouteResourceIndexByGlobalId.end()) {
+      ResourceModel &resource = model.resources[boundaryIt->second];
+      if (resource.kind == ResourceKind::ModelOutput)
+        return &resource;
     }
-    return &model.resources[resourceIt->second];
+    diagnosticOp->emitError("cannot match outgoing deployment route ")
+        << routeId << " to a local route or model-output resource with global ID "
+        << globalResourceId;
+    return failure();
   }
   diagnosticOp->emitError(
       "internal error: route lookup requested for a non-route resource");
@@ -1183,10 +1420,15 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
       llvm::count_if(model.resources, [&](const ResourceModel &resource) {
         return resource.kind == resourceKind;
       });
-  unsigned expectedResourceCount =
-      incoming ? routes.size() : matchedResourceIndices.size();
-  if (localRouteCount != expectedResourceCount ||
-      matchedResourceIndices.size() != expectedResourceCount) {
+  unsigned matchedLocalRouteCount =
+      llvm::count_if(matchedResourceIndices, [&](unsigned index) {
+        return model.resources[index].kind == resourceKind;
+      });
+  bool completeResourceCoverage =
+      incoming ? (localRouteCount == routes.size() &&
+                  matchedResourceIndices.size() == routes.size())
+               : (localRouteCount == matchedLocalRouteCount);
+  if (!completeResourceCoverage) {
     module.emitError("route manifest does not account for every local route "
                      "resource in the isolated core");
     return failure();
@@ -1195,9 +1437,11 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
   if (!incoming) {
     for (const auto &[resourceId, minimumRouteId] :
          minimumOutgoingRouteByResource) {
-      ResourceModel &resource =
-          model.resources[model.routeOutputResourceIndexByGlobalId.lookup(
-              resourceId)];
+      auto routeResource =
+          model.routeOutputResourceIndexByGlobalId.find(resourceId);
+      if (routeResource == model.routeOutputResourceIndexByGlobalId.end())
+        continue;
+      ResourceModel &resource = model.resources[routeResource->second];
       if (resource.routeId != std::optional<uint32_t>(minimumRouteId)) {
         resource.op->emitError(
             "coalesced route output must use the minimum route ID as its "
@@ -1210,6 +1454,409 @@ LogicalResult collectRoutes(ModuleOp module, TileModel &model,
   llvm::sort(routes, [](const RouteModel &lhs, const RouteModel &rhs) {
     return lhs.route.getId().getInt() < rhs.route.getId().getInt();
   });
+  return success();
+}
+
+template <typename AttrTy>
+FailureOr<SmallVector<AttrTy>> getTypedMemoryArray(ModuleOp module,
+                                                   StringRef name) {
+  auto values = module->getAttrOfType<ArrayAttr>(name);
+  if (!values) {
+    module.emitError("expected tile memory-plan attribute '") << name << "'";
+    return failure();
+  }
+  SmallVector<AttrTy> result;
+  result.reserve(values.size());
+  for (Attribute value : values) {
+    auto typed = dyn_cast<AttrTy>(value);
+    if (!typed) {
+      module.emitError("tile memory-plan attribute '")
+          << name << "' contains an invalid record";
+      return failure();
+    }
+    result.push_back(typed);
+  }
+  return result;
+}
+
+FailureOr<SmallVector<int64_t>>
+getMemoryI64Array(ModuleOp module, Attribute value, StringRef description) {
+  auto array = dyn_cast_or_null<ArrayAttr>(value);
+  if (!array) {
+    module.emitError("expected integer array for ") << description;
+    return failure();
+  }
+  SmallVector<int64_t> result;
+  result.reserve(array.size());
+  for (Attribute element : array) {
+    auto integer = dyn_cast<IntegerAttr>(element);
+    if (!integer) {
+      module.emitError("expected integer element in ") << description;
+      return failure();
+    }
+    result.push_back(integer.getInt());
+  }
+  return result;
+}
+
+FailureOr<uint32_t> getMemoryU32(ModuleOp module, IntegerAttr value,
+                                 StringRef description,
+                                 bool allowInvalid = false) {
+  int64_t integer = value.getInt();
+  if (allowInvalid && integer == -1)
+    return kInvalidABIId;
+  if (integer < 0 || static_cast<uint64_t>(integer) > UINT32_MAX) {
+    module.emitError("memory-plan ")
+        << description << " is outside the Golem tile ABI range";
+    return failure();
+  }
+  return static_cast<uint32_t>(integer);
+}
+
+ResourceModel *findMemoryOwnerResource(TileModel &model,
+                                       TileMemoryOwnerAttr owner) {
+  if (owner.getResourceId().getInt() < 0)
+    return nullptr;
+  uint32_t resourceId = static_cast<uint32_t>(owner.getResourceId().getInt());
+  ResourceModel *match = nullptr;
+  bool routeOwner = owner.getKind() == MemoryOwnerKind::RouteInput ||
+                    owner.getKind() == MemoryOwnerKind::RouteOutput;
+  for (ResourceModel &resource : model.resources) {
+    if (resource.globalId != resourceId)
+      continue;
+    bool kindMatches = true;
+    if (owner.getKind() == MemoryOwnerKind::RouteInput)
+      kindMatches = resource.kind == ResourceKind::RouteInput;
+    else if (owner.getKind() == MemoryOwnerKind::RouteOutput)
+      kindMatches = resource.kind == ResourceKind::RouteOutput;
+    else
+      kindMatches = resource.kind != ResourceKind::RouteInput &&
+                    resource.kind != ResourceKind::RouteOutput;
+    if (!kindMatches)
+      continue;
+    if (resource.byteSize !=
+        static_cast<uint64_t>(owner.getByteSize().getInt()))
+      continue;
+    if (match && !routeOwner)
+      return nullptr;
+    if (!match || resource.slot < match->slot)
+      match = &resource;
+  }
+  return match;
+}
+
+LogicalResult collectTileMemoryABI(ModuleOp module, TileModel &model) {
+  if (failed(tile_memory::verifyTileMemoryPlan(module)))
+    return failure();
+  auto owners = getTypedMemoryArray<TileMemoryOwnerAttr>(
+      module, tile_memory::kOwnersAttrName);
+  auto views = getTypedMemoryArray<TileMemoryViewAttr>(
+      module, tile_memory::kViewsAttrName);
+  auto movements = getTypedMemoryArray<TileMemoryMovementAttr>(
+      module, tile_memory::kMovementsAttrName);
+  auto segments = getTypedMemoryArray<TileMemorySegmentAttr>(
+      module, tile_memory::kSegmentsAttrName);
+  auto assemblies = getTypedMemoryArray<TileMemoryAssemblyAttr>(
+      module, tile_memory::kAssembliesAttrName);
+  auto completions = getTypedMemoryArray<TileMemoryCompletionEventAttr>(
+      module, tile_memory::kCompletionEventsAttrName);
+  if (failed(owners) || failed(views) || failed(movements) ||
+      failed(segments) || failed(assemblies) || failed(completions))
+    return failure();
+
+  DenseMap<uint32_t, unsigned> ownerIndexById;
+  DenseMap<uint32_t, unsigned> viewIndexById;
+  DenseMap<uint32_t, TileMemoryCompletionEventAttr> completionById;
+  for (TileMemoryOwnerAttr owner : *owners) {
+    auto id = getMemoryU32(module, owner.getId(), "owner ID");
+    auto resourceId =
+        getMemoryU32(module, owner.getResourceId(), "owner resource ID", true);
+    if (failed(id) || failed(resourceId) || owner.getByteSize().getInt() < 0)
+      return failure();
+    if (ownerIndexById.count(*id))
+      return module.emitError("duplicate tile memory owner ID ") << *id;
+    ResourceModel *resource = findMemoryOwnerResource(model, owner);
+    bool metadataOnly = owner.getKind() == MemoryOwnerKind::Persistent;
+    if (*resourceId != kInvalidABIId && !resource && !metadataOnly) {
+      module.emitError("cannot match tile memory owner ")
+          << *id << " to one local runtime resource";
+      return failure();
+    }
+    MemoryOwnerModel record;
+    record.id = *id;
+    record.globalResourceId = *resourceId;
+    record.localSlot = resource ? resource->slot : kInvalidABIId;
+    record.kind = static_cast<uint32_t>(owner.getKind());
+    record.byteSize = static_cast<uint64_t>(owner.getByteSize().getInt());
+    ownerIndexById[*id] = model.memoryOwners.size();
+    model.memoryOwners.push_back(record);
+  }
+
+  for (TileMemoryViewAttr view : *views) {
+    auto id = getMemoryU32(module, view.getId(), "view ID");
+    auto ownerId = getMemoryU32(module, view.getOwnerId(), "view owner ID");
+    auto offsets = getMemoryI64Array(module, view.getOffsets(), "view offsets");
+    auto sizes = getMemoryI64Array(module, view.getSizes(), "view sizes");
+    auto strides = getMemoryI64Array(module, view.getStrides(), "view strides");
+    if (failed(id) || failed(ownerId) || failed(offsets) || failed(sizes) ||
+        failed(strides) || view.getByteOffset().getInt() < 0 ||
+        view.getByteSize().getInt() < 0)
+      return failure();
+    auto ownerIt = ownerIndexById.find(*ownerId);
+    const uint64_t geometryCount = static_cast<uint64_t>(offsets->size()) * 3;
+    if (ownerIt == ownerIndexById.end() || viewIndexById.count(*id) ||
+        offsets->size() != sizes->size() || sizes->size() != strides->size() ||
+        offsets->size() > UINT32_MAX || geometryCount > UINT32_MAX ||
+        model.memoryViewGeometry.size() > UINT32_MAX - geometryCount) {
+      module.emitError("invalid tile memory view ") << *id;
+      return failure();
+    }
+    MemoryViewModel record;
+    record.id = *id;
+    record.ownerId = *ownerId;
+    record.ownerSlot = model.memoryOwners[ownerIt->second].localSlot;
+    record.rank = static_cast<uint32_t>(offsets->size());
+    record.geometryOffset = model.memoryViewGeometry.size();
+    record.contiguity = static_cast<uint32_t>(view.getContiguity());
+    record.byteOffset = static_cast<uint64_t>(view.getByteOffset().getInt());
+    record.byteSize = static_cast<uint64_t>(view.getByteSize().getInt());
+    model.memoryViewGeometry.append(offsets->begin(), offsets->end());
+    model.memoryViewGeometry.append(sizes->begin(), sizes->end());
+    model.memoryViewGeometry.append(strides->begin(), strides->end());
+    viewIndexById[*id] = model.memoryViews.size();
+    model.memoryViews.push_back(record);
+  }
+
+  for (TileMemoryCompletionEventAttr completion : *completions) {
+    auto id = getMemoryU32(module, completion.getId(), "completion event ID");
+    if (failed(id) || completionById.count(*id))
+      return module.emitError("invalid or duplicate completion event ID");
+    completionById[*id] = completion;
+  }
+
+  DenseMap<uint32_t, unsigned> assemblyIndexById;
+  DenseMap<uint32_t, uint32_t> assemblyByRoute;
+  for (TileMemoryAssemblyAttr assembly : *assemblies) {
+    auto id = getMemoryU32(module, assembly.getId(), "assembly ID");
+    auto ownerId =
+        getMemoryU32(module, assembly.getOwnerId(), "assembly owner ID");
+    auto sources = getMemoryI64Array(module, assembly.getContributingViewIds(),
+                                     "assembly source views");
+    auto destinations = getMemoryI64Array(
+        module, assembly.getDestinationViewIds(), "assembly destination views");
+    auto events = getMemoryI64Array(module, assembly.getCompletionEventIds(),
+                                    "assembly completion events");
+    auto readiness = getMemoryU32(module, assembly.getReadinessEventId(),
+                                  "assembly readiness event ID");
+    if (failed(id) || failed(ownerId) || failed(sources) ||
+        failed(destinations) || failed(events) || failed(readiness) ||
+        sources->size() != destinations->size() ||
+        sources->size() != events->size() || sources->size() > UINT32_MAX ||
+        model.assemblyContributions.size() > UINT32_MAX - sources->size() ||
+        assemblyIndexById.count(*id))
+      return module.emitError("invalid tile memory assembly");
+    auto ownerIt = ownerIndexById.find(*ownerId);
+    if (ownerIt == ownerIndexById.end() ||
+        model.memoryOwners[ownerIt->second].localSlot == kInvalidABIId)
+      return module.emitError("assembly owner has no local runtime slot");
+
+    AssemblyModel record;
+    record.id = *id;
+    record.ownerSlot = model.memoryOwners[ownerIt->second].localSlot;
+    record.contributionOffset = model.assemblyContributions.size();
+    record.contributionCount = sources->size();
+    record.readinessEventId = *readiness;
+    for (size_t index = 0; index < sources->size(); ++index) {
+      if ((*sources)[index] < 0 || (*destinations)[index] < 0 ||
+          (*events)[index] < 0 ||
+          static_cast<uint64_t>((*sources)[index]) > UINT32_MAX ||
+          static_cast<uint64_t>((*destinations)[index]) > UINT32_MAX ||
+          static_cast<uint64_t>((*events)[index]) > UINT32_MAX)
+        return module.emitError("assembly contribution exceeds ABI range");
+      uint32_t sourceView = static_cast<uint32_t>((*sources)[index]);
+      uint32_t destinationView = static_cast<uint32_t>((*destinations)[index]);
+      uint32_t eventId = static_cast<uint32_t>((*events)[index]);
+      if (!viewIndexById.count(destinationView) ||
+          !completionById.count(eventId))
+        return module.emitError(
+            "assembly contribution references unknown metadata");
+      int64_t routeValue = completionById[eventId].getRouteId().getInt();
+      uint32_t routeId =
+          routeValue < 0 ? kInvalidABIId : static_cast<uint32_t>(routeValue);
+      uint32_t flags = routeId == kInvalidABIId
+                           ? 0U
+                           : static_cast<uint32_t>(RouteViewIncoming);
+      model.assemblyContributions.push_back(AssemblyContributionModel{
+          *id, sourceView, destinationView, eventId, routeId, flags});
+      if (routeId != kInvalidABIId) {
+        if (assemblyByRoute.count(routeId))
+          return module.emitError(
+              "one route contributes to multiple assemblies");
+        assemblyByRoute[routeId] = *id;
+      }
+    }
+    assemblyIndexById[*id] = model.assemblies.size();
+    model.assemblies.push_back(record);
+  }
+
+  auto findRouteMovement =
+      [&](uint32_t routeId,
+          bool incoming) -> std::optional<TileMemoryMovementAttr> {
+    std::optional<TileMemoryMovementAttr> match;
+    std::optional<TileMemoryMovementAttr> assemblyMatch;
+    for (TileMemoryMovementAttr movement : *movements) {
+      if (movement.getRouteId().getInt() != routeId)
+        continue;
+      if (movement.getAssemblyId().getInt() >= 0) {
+        if (incoming && movement.getMode() != MemoryMovementMode::Packed &&
+            assemblyByRoute.lookup(routeId) ==
+                static_cast<uint32_t>(movement.getAssemblyId().getInt())) {
+          if (assemblyMatch)
+            return std::nullopt;
+          assemblyMatch = movement;
+        }
+        continue;
+      }
+      if (match)
+        return std::nullopt;
+      match = movement;
+    }
+    return assemblyMatch ? assemblyMatch : match;
+  };
+  auto appendRouteViews = [&](ArrayRef<RouteModel> routes,
+                              bool incoming) -> LogicalResult {
+    for (const RouteModel &routeModel : routes) {
+      uint32_t routeId = routeModel.route.getId().getInt();
+      std::optional<TileMemoryMovementAttr> movement =
+          findRouteMovement(routeId, incoming);
+      if (!movement) {
+        module.emitError("route ")
+            << routeId << " has no unique memory movement record";
+        return failure();
+      }
+      int64_t selectedViewValue =
+          incoming ? movement->getDestinationViewId().getInt()
+                   : movement->getSourceViewId().getInt();
+      int64_t completionValue =
+          incoming ? movement->getDestinationCompletionEventId().getInt()
+                   : movement->getSourceCompletionEventId().getInt();
+      if (completionValue < 0 ||
+          static_cast<uint64_t>(completionValue) > UINT32_MAX)
+        return module.emitError("route completion event exceeds ABI range");
+      uint32_t completionEvent = static_cast<uint32_t>(completionValue);
+      uint32_t assemblyId =
+          movement->getAssemblyId().getInt() < 0
+              ? kInvalidABIId
+              : static_cast<uint32_t>(movement->getAssemblyId().getInt());
+      uint32_t flags = incoming ? RouteViewIncoming : RouteViewOutgoing;
+      if (incoming && assemblyId != kInvalidABIId)
+        flags |= RouteViewAssemblyDestination;
+      if (selectedViewValue < 0 ||
+          static_cast<uint64_t>(selectedViewValue) > UINT32_MAX)
+        return module.emitError("route view ID exceeds ABI range");
+      uint32_t selectedView = static_cast<uint32_t>(selectedViewValue);
+      auto viewIt = viewIndexById.find(selectedView);
+      if (viewIt == viewIndexById.end())
+        return module.emitError("route local view is absent from tile plan");
+      const MemoryViewModel &view = model.memoryViews[viewIt->second];
+      if (view.ownerSlot == kInvalidABIId ||
+          view.byteSize !=
+              static_cast<uint64_t>(routeModel.route.getByteSize().getInt()))
+        return module.emitError(
+            "route view has no owner slot or mismatched size");
+      if (view.contiguity !=
+              static_cast<uint32_t>(MemoryContiguity::Contiguous) &&
+          movement->getMode() != MemoryMovementMode::Segmented &&
+          movement->getMode() != MemoryMovementMode::Packed)
+        return module.emitError(
+            "non-contiguous route requires segmented or packed movement");
+      model.routeViews.push_back(RouteViewModel{
+          routeId, routeModel.localSlot, view.ownerSlot, selectedView,
+          static_cast<uint32_t>(movement->getId().getInt()),
+          static_cast<uint32_t>(movement->getMode()), completionEvent,
+          assemblyId, flags, view.byteOffset, view.byteSize});
+    }
+    return success();
+  };
+  if (failed(appendRouteViews(model.incomingRoutes, true)) ||
+      failed(appendRouteViews(model.outgoingRoutes, false)))
+    return failure();
+  llvm::sort(model.routeViews,
+             [](const RouteViewModel &left, const RouteViewModel &right) {
+               return std::tie(left.routeId, left.flags) <
+                      std::tie(right.routeId, right.flags);
+             });
+
+  DenseMap<uint32_t, SmallVector<TileMemorySegmentAttr>> segmentsByMovement;
+  for (TileMemorySegmentAttr segment : *segments) {
+    auto movementId =
+        getMemoryU32(module, segment.getMovementId(), "segment movement ID");
+    if (failed(movementId))
+      return failure();
+    segmentsByMovement[*movementId].push_back(segment);
+  }
+  for (const RouteViewModel &routeView : model.routeViews) {
+    if (routeView.movementMode !=
+        static_cast<uint32_t>(MemoryMovementMode::Segmented))
+      continue;
+    auto group = segmentsByMovement.find(routeView.movementId);
+    if (group == segmentsByMovement.end() || group->second.size() < 2 ||
+        group->second.size() > UINT32_MAX ||
+        model.memorySegments.size() > UINT32_MAX - group->second.size())
+      return module.emitError(
+          "segmented route has no ABI-representable segment table");
+    SegmentedMovementModel record;
+    record.movementId = routeView.movementId;
+    record.routeId = routeView.routeId;
+    record.segmentOffset = model.memorySegments.size();
+    record.segmentCount = group->second.size();
+    record.completionEventId = routeView.completionEventId;
+    record.assemblyId = routeView.assemblyId;
+    record.flags = routeView.flags;
+    record.byteSize = routeView.byteSize;
+    uint64_t totalBytes = 0;
+    for (TileMemorySegmentAttr segment : group->second) {
+      if (segment.getSourceByteOffset().getInt() < 0 ||
+          segment.getDestinationByteOffset().getInt() < 0 ||
+          segment.getByteSize().getInt() <= 0)
+        return module.emitError("memory segment exceeds the tile ABI range");
+      uint64_t bytes = static_cast<uint64_t>(segment.getByteSize().getInt());
+      if (totalBytes > UINT64_MAX - bytes)
+        return module.emitError("memory segment byte total overflowed");
+      totalBytes += bytes;
+      model.memorySegments.push_back(MemorySegmentModel{
+          static_cast<uint64_t>(segment.getSourceByteOffset().getInt()),
+          static_cast<uint64_t>(segment.getDestinationByteOffset().getInt()),
+          bytes});
+    }
+    if (totalBytes != record.byteSize)
+      return module.emitError(
+          "segmented route byte total disagrees with route payload");
+    model.segmentedMovements.push_back(record);
+  }
+  model.abiFeatures |= kMemoryViewFeature;
+  if (!model.assemblies.empty())
+    model.abiFeatures |= kAssemblyJoinFeature;
+  if (!model.segmentedMovements.empty())
+    model.abiFeatures |= kSegmentedMovementFeature;
+  llvm::sort(model.memoryOwners,
+             [](const MemoryOwnerModel &left, const MemoryOwnerModel &right) {
+               return left.id < right.id;
+             });
+  llvm::sort(model.memoryViews,
+             [](const MemoryViewModel &left, const MemoryViewModel &right) {
+               return left.id < right.id;
+             });
+  llvm::sort(model.assemblies,
+             [](const AssemblyModel &left, const AssemblyModel &right) {
+               return left.id < right.id;
+             });
+  llvm::sort(model.segmentedMovements,
+             [](const SegmentedMovementModel &left,
+                const SegmentedMovementModel &right) {
+               return std::tie(left.routeId, left.flags) <
+                      std::tie(right.routeId, right.flags);
+             });
   return success();
 }
 
@@ -1305,6 +1952,23 @@ LLVM::LLVMStructType getTaskBindingType(MLIRContext *context) {
       {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type});
 }
 
+LLVM::LLVMStructType getIdIndexType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(context, {i32Type, i32Type});
+}
+
+LLVM::LLVMStructType getStaticTaskType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type});
+}
+
+LLVM::LLVMStructType getStaticResourceType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type});
+}
+
 LLVM::LLVMStructType getRouteType(MLIRContext *context) {
   Type i32Type = IntegerType::get(context, 32);
   Type i64Type = IntegerType::get(context, 64);
@@ -1326,6 +1990,54 @@ LLVM::LLVMStructType getDMADescriptorType(MLIRContext *context) {
   return LLVM::LLVMStructType::getLiteral(
       context, {i32Type, i32Type, i32Type, i32Type, i64Type, i64Type, i32Type,
                 i32Type, i32Type, i32Type, i32Type, i32Type, i64Type});
+}
+
+LLVM::LLVMStructType getMemoryOwnerType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i64Type});
+}
+
+LLVM::LLVMStructType getMemoryViewType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type,
+                i32Type, i64Type, i64Type});
+}
+
+LLVM::LLVMStructType getRouteViewType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type, i32Type,
+                i32Type, i64Type, i64Type});
+}
+
+LLVM::LLVMStructType getAssemblyType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type});
+}
+
+LLVM::LLVMStructType getAssemblyContributionType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  return LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type});
+}
+
+LLVM::LLVMStructType getSegmentedMovementType(MLIRContext *context) {
+  Type i32Type = IntegerType::get(context, 32);
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(context, {i32Type, i32Type, i32Type,
+                                                    i32Type, i32Type, i32Type,
+                                                    i32Type, i32Type, i64Type});
+}
+
+LLVM::LLVMStructType getMemorySegmentType(MLIRContext *context) {
+  Type i64Type = IntegerType::get(context, 64);
+  return LLVM::LLVMStructType::getLiteral(context, {i64Type, i64Type, i64Type});
 }
 
 LLVM::LLVMStructType getMemRefDescriptorType(MLIRContext *context,
@@ -1367,9 +2079,12 @@ FailureOr<TileModel> collectTileModel(ModuleOp module) {
       failed(collectModelIO(
           module, model, deployment_attrs::kModelOutputsAttrName,
           "output_index", ResourceKind::ModelOutput, model.modelOutputs)) ||
+      (module->hasAttr(tile_memory::kPlanVersionAttrName) &&
+       failed(collectTileMemoryABI(module, model))) ||
       failed(collectWorkspaceMetadata(model)) ||
       failed(collectScratchpadMetadata(model)) ||
-      failed(buildTaskBindings(model)) || failed(validateDeploymentPlan(model)))
+      failed(buildTaskBindings(model)) || failed(buildStaticRuntime(model)) ||
+      failed(validateDeploymentPlan(model)))
     return failure();
 
   return model;

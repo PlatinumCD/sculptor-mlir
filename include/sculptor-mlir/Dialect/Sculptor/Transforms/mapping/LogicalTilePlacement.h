@@ -35,6 +35,10 @@ inline constexpr StringLiteral kLogicalTileGreedyCandidateScopeAttrName =
     "sculptor.mapping.logical_tile_greedy_candidate_scope";
 inline constexpr StringLiteral kLogicalTileGreedyLookaheadAttrName =
     "sculptor.mapping.logical_tile_greedy_lookahead";
+inline constexpr StringLiteral kLogicalTileMemoryEstimateMethodAttrName =
+    "sculptor.mapping.memory_estimate_method";
+inline constexpr StringLiteral kScheduleAwareMemoryEstimateMethod =
+    "schedule-aware-lifetimes-v1";
 
 struct PhysicalMeshGeometry {
   int64_t rows = 0;
@@ -42,7 +46,23 @@ struct PhysicalMeshGeometry {
   int64_t arraysPerCore = 0;
 };
 
+struct LogicalTileMemoryEstimate {
+  int64_t logicalTileId = -1;
+  int64_t persistentBytes = 0;
+  // Transient bytes live at the peak-memory event. These are not cumulative
+  // bytes touched over the complete schedule.
+  int64_t producedBytes = 0;
+  int64_t incomingBytes = 0;
+  int64_t requiredBytes = 0;
+  bool complete = false;
+  std::string incompleteReason;
+};
+
 struct LogicalTilePlacementProblem {
+  LogicalTilePlacementProblem(const LogicalTileGraph &tileGraph,
+                              PhysicalMeshGeometry mesh, Operation *anchor)
+      : tileGraph(tileGraph), mesh(mesh), anchor(anchor) {}
+
   const LogicalTileGraph &tileGraph;
   PhysicalMeshGeometry mesh;
   Operation *anchor = nullptr;
@@ -53,6 +73,9 @@ struct LogicalTilePlacementProblem {
   TemporalNetworkMode networkMode = TemporalNetworkMode::Finite;
   TemporalTimingScope timingScope = TemporalTimingScope::Warm;
   int64_t temporalCandidateLimit = 8;
+  int64_t tileMemoryCapacityBytes = 0;
+  SmallVector<LogicalTileMemoryEstimate, 0> memoryEstimates;
+  DenseMap<int64_t, unsigned> memoryEstimateIndexByTileId;
 };
 
 enum class LogicalTileScheduleKind {
@@ -136,7 +159,7 @@ struct LogicalTileAnnealingTrace {
 };
 
 struct LogicalTilePlacementPlan {
-  int64_t version = 2;
+  int64_t version = 3;
   std::string schedule;
   PlacementObjectiveKind objective = PlacementObjectiveKind::TransferCost;
   TemporalNetworkMode networkMode = TemporalNetworkMode::Finite;
@@ -145,6 +168,9 @@ struct LogicalTilePlacementPlan {
   std::string costProfileName;
   std::string costProfileHash;
   PhysicalMeshGeometry mesh;
+  int64_t tileMemoryCapacityBytes = 0;
+  SmallVector<LogicalTileMemoryEstimate, 0> memoryEstimates;
+  DenseMap<int64_t, unsigned> memoryEstimateIndexByTileId;
   int64_t initialScore = 0;
   int64_t objectiveScore = 0;
   int64_t totalTransferCost = 0;

@@ -33,6 +33,13 @@ DependencyKey getDependencyKey(const LogicalTileDependency &dependency) {
           dependency.byteSize};
 }
 
+DependencyKey getDependencyKey(const MappingWorkUnitEdge &edge) {
+  return {edge.sourceOperationId, edge.sourceWorkUnitId,
+          edge.targetOperationId, edge.targetWorkUnitId,
+          edge.tensorId,          edge.targetOperandNumber,
+          edge.byteSize};
+}
+
 FailureOr<int64_t> checkedAddBytes(int64_t current, int64_t increment,
                                    Operation *anchor) {
   std::optional<int64_t> result = llvm::checkedAdd(current, increment);
@@ -436,7 +443,8 @@ private:
                                            /*targetWorkUnitId=*/-1,
                                            tensor.id,
                                            /*targetOperandNumber=*/-1,
-                                           tensor.byteSize};
+                                           getProducerContributionByteSize(
+                                               tensor, producer)};
           for (int64_t source : *sourceTiles)
             for (int64_t target : *targetTiles)
               if (failed(recordDependency(source, target, dependency)))
@@ -463,7 +471,7 @@ private:
 
 LogicalResult verifyDependency(const LogicalTileDependency &dependency,
                                const ComputeGraph &graph,
-                               const ResourceAllocationTree &tree,
+                               const std::set<DependencyKey> &workUnitEdges,
                                Operation *anchor) {
   auto validOperation = [&](int64_t id) {
     return id >= 0 && id < static_cast<int64_t>(graph.operations.size());
@@ -492,23 +500,15 @@ LogicalResult verifyDependency(const LogicalTileDependency &dependency,
           graph.operations[dependency.targetOperationId].operation->getOperand(
               dependency.targetOperandNumber) != tensor.value)) ||
         ((dependency.sourceWorkUnitId < 0 && dependency.targetWorkUnitId < 0)
-             ? tensor.byteSize != dependency.byteSize
+             ? getProducerContributionByteSize(
+                   tensor, dependency.sourceOperationId) != dependency.byteSize
              : dependency.byteSize > tensor.byteSize)) {
       anchor->emitError("logical-tile dependency does not match its compute "
                         "tensor");
       return failure();
     }
     if (dependency.sourceWorkUnitId >= 0 || dependency.targetWorkUnitId >= 0) {
-      bool matches = llvm::any_of(tree.workUnitEdges, [&](const auto &edge) {
-        return edge.sourceOperationId == dependency.sourceOperationId &&
-               edge.sourceWorkUnitId == dependency.sourceWorkUnitId &&
-               edge.targetOperationId == dependency.targetOperationId &&
-               edge.targetWorkUnitId == dependency.targetWorkUnitId &&
-               edge.tensorId == dependency.tensorId &&
-               edge.targetOperandNumber == dependency.targetOperandNumber &&
-               edge.byteSize == dependency.byteSize;
-      });
-      if (!matches) {
+      if (!workUnitEdges.contains(getDependencyKey(dependency))) {
         anchor->emitError(
             "logical-tile shard dependency has no exact RA-tree edge");
         return failure();
@@ -516,16 +516,7 @@ LogicalResult verifyDependency(const LogicalTileDependency &dependency,
     }
     return success();
   }
-  bool matches = llvm::any_of(tree.workUnitEdges, [&](const auto &edge) {
-    return edge.sourceOperationId == dependency.sourceOperationId &&
-           edge.sourceWorkUnitId == dependency.sourceWorkUnitId &&
-           edge.targetOperationId == dependency.targetOperationId &&
-           edge.targetWorkUnitId == dependency.targetWorkUnitId &&
-           edge.tensorId == dependency.tensorId &&
-           edge.targetOperandNumber == dependency.targetOperandNumber &&
-           edge.byteSize == dependency.byteSize;
-  });
-  if (!matches) {
+  if (!workUnitEdges.contains(getDependencyKey(dependency))) {
     anchor->emitError("logical-tile dependency does not match an RA work-unit "
                       "edge");
     return failure();
@@ -580,12 +571,15 @@ LogicalResult verifyLogicalTileGraph(const LogicalTileGraph &tileGraph,
   }
 
   DenseMap<int64_t, const StructuralRATreeNode *> nodes;
+  std::set<DependencyKey> workUnitEdges;
   int64_t treeLeafCount = 0;
   for (const StructuralRATreeNode &node : tree.nodes) {
     nodes[node.id] = &node;
     if (node.kind == RATreeNodeKind::Leaf)
       ++treeLeafCount;
   }
+  for (const MappingWorkUnitEdge &edge : tree.workUnitEdges)
+    workUnitEdges.insert(getDependencyKey(edge));
 
   std::set<int64_t> tileIds;
   std::set<int64_t> leafIds;
@@ -669,7 +663,7 @@ LogicalResult verifyLogicalTileGraph(const LogicalTileGraph &tileGraph,
       }
     }
     for (const LogicalTileDependency &dependency : tile.internalDependencies)
-      if (failed(verifyDependency(dependency, graph, tree, anchor)))
+      if (failed(verifyDependency(dependency, graph, workUnitEdges, anchor)))
         return failure();
   }
   if (static_cast<int64_t>(leafIds.size()) != treeLeafCount) {
@@ -689,7 +683,7 @@ LogicalResult verifyLogicalTileGraph(const LogicalTileGraph &tileGraph,
     int64_t totalBytes = 0;
     for (const LogicalTileDependency &dependency : edge.dependencies) {
       if (dependency.byteSize < 0 ||
-          failed(verifyDependency(dependency, graph, tree, anchor)))
+          failed(verifyDependency(dependency, graph, workUnitEdges, anchor)))
         return failure();
       FailureOr<int64_t> updated =
           checkedAddBytes(totalBytes, dependency.byteSize, anchor);

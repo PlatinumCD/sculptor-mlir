@@ -4,12 +4,17 @@ add_subdirectory(planners)
 add_mlir_library(MLIRSculptorTransforms
   Passes.cpp
   ApplyMappingPlan.cpp
+  AuditTileBufferization.cpp
+  BindTileRoutineDestinations.cpp
   BuildRATree.cpp
   CanonicalizeLayers.cpp
   ConvertLayers.cpp
   ExpandDigitalWork.cpp
   ExtractTileModule.cpp
   ExtractLayers.cpp
+  FoldAttentionLayouts.cpp
+  FoldInferenceParameters.cpp
+  FuseElementwiseRegions.cpp
   FinalizeTileRuntimeGraph.cpp
   MaterializeTileRuntimeGraph.cpp
   ${SCULPTOR_MAPPING_SOURCES}
@@ -18,6 +23,10 @@ add_mlir_library(MLIRSculptorTransforms
   PlaceLogicalTiles.cpp
   PlanTileScratchpad.cpp
   PlanMapping.cpp
+  ReportTileMemory.cpp
+  VectorizeDigitalKernels.cpp
+  VectorizeTileCopies.cpp
+  tile_runtime/TileMemoryPlan.cpp
   tile_runtime/TileRuntimeResourceUtils.cpp
   tile_runtime/TileRuntimeOrder.cpp
   tile_runtime/TileRuntimeLayout.cpp
@@ -25,6 +34,8 @@ add_mlir_library(MLIRSculptorTransforms
   canonicalizers/Conv2DCanonicalizer.cpp
   canonicalizers/Conv2DGroupedCanonicalizer.cpp
   canonicalizers/Conv3DCanonicalizer.cpp
+  canonicalizers/ContiguousGatherCanonicalizer.cpp
+  canonicalizers/StaticNearestNeighborCanonicalizer.cpp
   canonicalizers/RNNCanonicalizer.cpp
   canonicalizers/LSTMCanonicalizer.cpp
   canonicalizers/GRUCanonicalizer.cpp
@@ -66,9 +77,14 @@ add_mlir_library(MLIRSculptorTransforms
   SculptorIR
   MLIRIR
   MLIRPass
+  MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRLinalgDialect
   MLIRLinalgTransforms
+  MLIRMathDialect
   MLIRTensorTransforms
   MLIRTilingInterface
+  MLIRMemRefDialect
+  MLIRSCFDialect
   MLIRVectorDialect
 )

@@ -50,7 +50,8 @@ void annotateReductionOperation(Operation *operation, Operation *source,
                                 int64_t level, int64_t ordinal, int64_t width,
                                 OpBuilder &builder) {
   static constexpr StringLiteral copiedPrefixes[] = {
-      "sculptor.semantic.", "sculptor.source_", "sculptor.task.reduction"};
+      "sculptor.semantic.", "sculptor.source_", "sculptor.task.reduction",
+      "sculptor.mapping.mvm_wave_"};
   for (NamedAttribute attribute : source->getAttrs()) {
     StringRef name = attribute.getName().strref();
     if (llvm::any_of(copiedPrefixes, [&](StringRef prefix) {
@@ -137,8 +138,97 @@ FailureOr<int64_t> buildReductionTrees(func::FuncOp function,
       nextStageId = std::max(nextStageId, stage.getInt() + 1);
   });
 
+  int64_t treeCount = 0;
+  int64_t totalNodeCount = 0;
+  auto buildTree = [&](Operation *source, ArrayRef<Value> leaves,
+                       RankedTensorType tensorType) -> Value {
+    OpBuilder builder(source);
+    builder.setInsertionPoint(source);
+    SmallVector<Value> levelValues(leaves.begin(), leaves.end());
+    int64_t treeId = treeCount++;
+    int64_t nodeId = 0;
+    int64_t level = 0;
+    while (levelValues.size() > 1) {
+      SmallVector<Value> nextLevel;
+      for (size_t index = 0; index < levelValues.size(); index += 2) {
+        if (index + 1 == levelValues.size()) {
+          nextLevel.push_back(levelValues[index]);
+          continue;
+        }
+        auto empty = builder.create<tensor::EmptyOp>(
+            source->getLoc(), tensorType.getShape(), tensorType.getElementType());
+        auto add = builder.create<linalg::AddOp>(
+            source->getLoc(),
+            ValueRange{levelValues[index], levelValues[index + 1]},
+            ValueRange{empty.getResult()});
+        int64_t stageId = nextStageId++;
+        annotateReductionOperation(empty, source, stageId, treeId, nodeId,
+                                   level, index / 2, leaves.size(), builder);
+        annotateReductionOperation(add, source, stageId, treeId, nodeId, level,
+                                   index / 2, leaves.size(), builder);
+        nextLevel.push_back(add.getResult(0));
+        ++nodeId;
+        ++totalNodeCount;
+      }
+      levelValues = std::move(nextLevel);
+      ++level;
+    }
+    return levelValues.front();
+  };
+
+  // Current MVM expansion emits one N-input elementwise generic for tile
+  // recombination.  The task-reduction attribute is the explicit semantic
+  // contract that permits reassociation; normalize that canonical form before
+  // handling already-binary linalg.add chains below.
+  SmallVector<linalg::GenericOp> genericReductions;
+  function.walk([&](linalg::GenericOp generic) {
+    TaskReductionAttr reduction = getReduction(generic);
+    if (!reduction || !reduction.getReassociate().getValue() ||
+        reduction.getKind() != TaskReductionKind::Add ||
+        generic->getNumResults() != 1 ||
+        static_cast<int64_t>(generic.getNumDpsInputs()) < minimumWidth)
+      return;
+    Type resultType = generic->getResult(0).getType();
+    bool uniformInputs = llvm::all_of(
+        generic.getDpsInputOperands(), [&](OpOperand *operand) {
+          return operand->get().getType() == resultType;
+        });
+    bool identityMaps = llvm::all_of(generic.getIndexingMapsArray(),
+                                     [](AffineMap map) {
+                                       return map.isIdentity();
+                                     });
+    if (uniformInputs && identityMaps)
+      genericReductions.push_back(generic);
+  });
+  for (linalg::GenericOp generic : genericReductions) {
+    auto tensorType = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    if (!tensorType || !tensorType.hasStaticShape())
+      return generic.emitOpError(
+                 "balanced reduction requires a static ranked tensor"),
+             failure();
+    SmallVector<Value> leaves;
+    for (OpOperand *input : generic.getDpsInputOperands())
+      leaves.push_back(input->get());
+    Value result = buildTree(generic, leaves, tensorType);
+    generic->getResult(0).replaceAllUsesWith(result);
+    SmallVector<Operation *> oldInitializers;
+    for (Value init : generic.getDpsInits())
+      if (Operation *defining = init.getDefiningOp())
+        oldInitializers.push_back(defining);
+    generic.erase();
+    for (Operation *initializer : oldInitializers)
+      if (llvm::all_of(initializer->getResults(),
+                       [](Value value) { return value.use_empty(); }))
+        initializer->erase();
+  }
+
   SmallVector<linalg::AddOp> candidates;
   function.walk([&](linalg::AddOp add) {
+    // Nodes emitted by buildTree already form the requested balanced tree.
+    // Do not rediscover and rebuild that fresh chain in the legacy binary-add
+    // path below.
+    if (add->hasAttr(kReductionTreeIdAttrName))
+      return;
     TaskReductionAttr reduction = getReduction(add);
     if (reduction && reduction.getReassociate().getValue() &&
         reduction.getKind() == TaskReductionKind::Add)
@@ -158,8 +248,6 @@ FailureOr<int64_t> buildReductionTrees(func::FuncOp function,
       roots.push_back(candidate);
   }
 
-  int64_t treeCount = 0;
-  int64_t totalNodeCount = 0;
   llvm::SmallPtrSet<Operation *, 32> rewritten;
   for (linalg::AddOp root : roots) {
     if (rewritten.contains(root))
@@ -197,39 +285,8 @@ FailureOr<int64_t> buildReductionTrees(func::FuncOp function,
                  "balanced reduction requires a static ranked tensor"),
              failure();
 
-    OpBuilder builder(root);
-    builder.setInsertionPoint(root);
-    SmallVector<Value> levelValues = leaves;
-    int64_t treeId = treeCount++;
-    int64_t nodeId = 0;
-    int64_t level = 0;
-    while (levelValues.size() > 1) {
-      SmallVector<Value> nextLevel;
-      for (size_t index = 0; index < levelValues.size(); index += 2) {
-        if (index + 1 == levelValues.size()) {
-          nextLevel.push_back(levelValues[index]);
-          continue;
-        }
-        auto empty = builder.create<tensor::EmptyOp>(
-            root.getLoc(), tensorType.getShape(), tensorType.getElementType());
-        auto add = builder.create<linalg::AddOp>(
-            root.getLoc(),
-            ValueRange{levelValues[index], levelValues[index + 1]},
-            ValueRange{empty.getResult()});
-        int64_t stageId = nextStageId++;
-        annotateReductionOperation(empty, root, stageId, treeId, nodeId, level,
-                                   index / 2, leaves.size(), builder);
-        annotateReductionOperation(add, root, stageId, treeId, nodeId, level,
-                                   index / 2, leaves.size(), builder);
-        nextLevel.push_back(add.getResult(0));
-        ++nodeId;
-        ++totalNodeCount;
-      }
-      levelValues = std::move(nextLevel);
-      ++level;
-    }
-
-    root.getResult(0).replaceAllUsesWith(levelValues.front());
+    Value result = buildTree(root, leaves, tensorType);
+    root.getResult(0).replaceAllUsesWith(result);
     llvm::SmallPtrSet<Operation *, 16> oldEmptyOperations;
     for (linalg::AddOp add : oldAdds) {
       for (Value init : add.getDpsInits()) {

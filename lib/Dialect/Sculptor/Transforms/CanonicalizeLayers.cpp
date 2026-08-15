@@ -18,7 +18,7 @@ void CanonicalizeLayersPass::runOnOperation() {
   mlir::sculptor::registerConv1DCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerConv2DCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerConv2DGroupedCanonicalizer(canonicalizers,
-                                                   &getContext());
+                                                     &getContext());
   mlir::sculptor::registerConv3DCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerRNNCanonicalizer(canonicalizers, &getContext());
   mlir::sculptor::registerLSTMCanonicalizer(canonicalizers, &getContext());
@@ -34,6 +34,12 @@ void CanonicalizeLayersPass::runOnOperation() {
   for (mlir::func::FuncOp func : getOperation().getOps<mlir::func::FuncOp>()) {
     if (func.getName() != "forward")
       continue;
+
+    if (failed(canonicalizeStaticNearestNeighborResizes(func))) {
+      signalPassFailure();
+      return;
+    }
+    canonicalizeContiguousGathers(func);
 
     // Let each canonicalizer rewrite all matches it owns before the next
     // family runs.

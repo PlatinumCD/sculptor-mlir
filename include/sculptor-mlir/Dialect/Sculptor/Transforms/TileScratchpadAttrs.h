@@ -20,6 +20,14 @@ inline constexpr llvm::StringLiteral
     kScratchpadABIVersionAttrName("sculptor.runtime.scratchpad_abi_version");
 inline constexpr llvm::StringLiteral
     kScratchpadFeatureBitsAttrName("sculptor.runtime.scratchpad_feature_bits");
+inline constexpr llvm::StringLiteral
+    kScratchpadCandidatesAttrName("sculptor.memory.scratchpad_candidates");
+inline constexpr llvm::StringLiteral
+    kScratchpadAllocationsAttrName("sculptor.memory.scratchpad_allocations");
+inline constexpr llvm::StringLiteral kScratchpadEstimatedSavingsAttrName(
+    "sculptor.memory.scratchpad_estimated_savings");
+inline constexpr llvm::StringLiteral
+    kScratchpadCapacityAttrName("sculptor.memory.scratchpad_capacity");
 
 inline constexpr llvm::StringLiteral kDMAIdFieldName("descriptor_id");
 inline constexpr llvm::StringLiteral kDMADirectionFieldName("direction");

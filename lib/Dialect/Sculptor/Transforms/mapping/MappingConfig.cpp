@@ -89,8 +89,13 @@ FailureOr<MVMBodyPolicy> parseMVMBodyPolicy(StringRef value,
     return MVMBodyPolicy::Packed;
   if (value == "spread")
     return MVMBodyPolicy::Spread;
+  if (value == "first-use-window")
+    return MVMBodyPolicy::FirstUseWindow;
+  if (value == "first-use-adaptive")
+    return MVMBodyPolicy::FirstUseAdaptive;
   anchor->emitError("unknown MVM body policy '")
-      << value << "'; expected 'packed' or 'spread'";
+      << value << "'; expected 'packed', 'spread', 'first-use-window', or "
+                  "'first-use-adaptive'";
   return failure();
 }
 
@@ -102,6 +107,24 @@ FailureOr<SetupBindingPolicy> parseSetupBindingPolicy(StringRef value,
     return SetupBindingPolicy::ConsumerAnchored;
   anchor->emitError("unknown setup binding policy '")
       << value << "'; expected 'global' or 'consumer-anchored'";
+  return failure();
+}
+
+FailureOr<DigitalSchedulingPolicy>
+parseDigitalSchedulingPolicy(StringRef value, Operation *anchor) {
+  if (value == "affinity")
+    return DigitalSchedulingPolicy::Affinity;
+  if (value == "balanced")
+    return DigitalSchedulingPolicy::Balanced;
+  if (value == "earliest-finish")
+    return DigitalSchedulingPolicy::EarliestFinish;
+  if (value == "progressive")
+    return DigitalSchedulingPolicy::Progressive;
+  if (value == "sliding-window")
+    return DigitalSchedulingPolicy::SlidingWindow;
+  anchor->emitError("unknown digital scheduling policy '")
+      << value << "'; expected 'affinity', 'balanced', 'earliest-finish', or "
+                     "'progressive', or 'sliding-window'";
   return failure();
 }
 
@@ -129,6 +152,10 @@ StringRef stringifyMVMBodyPolicy(MVMBodyPolicy policy) {
     return "packed";
   case MVMBodyPolicy::Spread:
     return "spread";
+  case MVMBodyPolicy::FirstUseWindow:
+    return "first-use-window";
+  case MVMBodyPolicy::FirstUseAdaptive:
+    return "first-use-adaptive";
   }
   llvm_unreachable("unknown MVM body policy");
 }
@@ -141,6 +168,22 @@ StringRef stringifySetupBindingPolicy(SetupBindingPolicy policy) {
     return "consumer-anchored";
   }
   llvm_unreachable("unknown setup binding policy");
+}
+
+StringRef stringifyDigitalSchedulingPolicy(DigitalSchedulingPolicy policy) {
+  switch (policy) {
+  case DigitalSchedulingPolicy::Affinity:
+    return "affinity";
+  case DigitalSchedulingPolicy::Balanced:
+    return "balanced";
+  case DigitalSchedulingPolicy::EarliestFinish:
+    return "earliest-finish";
+  case DigitalSchedulingPolicy::Progressive:
+    return "progressive";
+  case DigitalSchedulingPolicy::SlidingWindow:
+    return "sliding-window";
+  }
+  llvm_unreachable("unknown digital scheduling policy");
 }
 
 } // namespace mapping

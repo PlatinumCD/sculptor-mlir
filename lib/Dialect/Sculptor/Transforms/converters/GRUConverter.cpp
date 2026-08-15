@@ -834,8 +834,10 @@ LogicalResult decomposeInlineGRULayers(func::FuncOp func) {
   SmallVector<NNGRUOp> stacks;
   func.walk([&](NNGRUOp op) { stacks.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNGRUOp op : stacks) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(splitGRUStack(op, rewriter))) {
       op.emitOpError("cannot split supported inline GRU stack");
       return failure();
@@ -845,6 +847,7 @@ LogicalResult decomposeInlineGRULayers(func::FuncOp func) {
   SmallVector<NNGRULayerOp> layers;
   func.walk([&](NNGRULayerOp op) { layers.push_back(op); });
   for (NNGRULayerOp op : layers) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerGRULayerOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline GRU layer");
       return failure();

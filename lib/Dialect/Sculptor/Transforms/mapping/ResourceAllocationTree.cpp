@@ -5,6 +5,7 @@
 #include "mlir/IR/Diagnostics.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/SHA256.h"
@@ -44,40 +45,74 @@ void collectSubtreeEndpoints(int64_t nodeId, const ResourceAllocationTree &tree,
 }
 
 LogicalResult verifyTemporalOrders(const ResourceAllocationTree &tree,
-                                   const ComputeGraph &graph,
                                    const DenseMap<int64_t, size_t> &nodeIndices,
+                                   const DenseMap<int64_t,
+                                                  SmallVector<int64_t>>
+                                       &graphConsumersByProducer,
                                    Operation *anchor) {
+  DenseSet<std::pair<int64_t, int64_t>> refinedOperationEdges;
+  DenseMap<int64_t, SmallVector<const MappingWorkUnitEdge *>>
+      workUnitEdgesBySource;
+  for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
+    refinedOperationEdges.insert(
+        {edge.sourceOperationId, edge.targetOperationId});
+    workUnitEdgesBySource[edge.sourceOperationId].push_back(&edge);
+  }
+
   for (const StructuralRATreeNode &node : tree.nodes) {
     if (node.kind != RATreeNodeKind::TemporalCut)
       continue;
 
-    std::map<LeafEndpoint, int64_t> endpointToChild;
-    std::map<int64_t, std::set<int64_t>> operationToChildren;
+    DenseMap<LeafEndpoint, int64_t> endpointToChild;
+    DenseMap<int64_t, SmallVector<int64_t>> operationToChildren;
     for (auto [childOrder, childId] : llvm::enumerate(node.childIds)) {
+      int64_t order = static_cast<int64_t>(childOrder);
       SmallVector<LeafEndpoint> descendants;
       collectSubtreeEndpoints(childId, tree, nodeIndices, descendants);
       for (LeafEndpoint endpoint : descendants) {
-        endpointToChild[endpoint] = childOrder;
-        operationToChildren[endpoint.first].insert(childOrder);
+        endpointToChild[endpoint] = order;
+        SmallVector<int64_t> &children = operationToChildren[endpoint.first];
+        if (children.empty() || children.back() != order)
+          children.push_back(order);
       }
     }
 
-    auto endpointChildren = [&](int64_t operationId,
-                                int64_t workUnitId) -> std::set<int64_t> {
-      if (workUnitId < 0)
-        return operationToChildren[operationId];
-      auto child = endpointToChild.find({operationId, workUnitId});
-      return child == endpointToChild.end() ? std::set<int64_t>{}
-                                            : std::set<int64_t>{child->second};
-    };
     auto verifyForward = [&](int64_t sourceOperationId,
                              int64_t sourceWorkUnitId,
                              int64_t targetOperationId,
                              int64_t targetWorkUnitId) -> LogicalResult {
-      for (int64_t source :
-           endpointChildren(sourceOperationId, sourceWorkUnitId)) {
-        for (int64_t target :
-             endpointChildren(targetOperationId, targetWorkUnitId)) {
+      SmallVector<int64_t, 1> exactSource;
+      SmallVector<int64_t, 1> exactTarget;
+      ArrayRef<int64_t> sourceChildren;
+      ArrayRef<int64_t> targetChildren;
+      if (sourceWorkUnitId < 0) {
+        auto source = operationToChildren.find(sourceOperationId);
+        if (source == operationToChildren.end())
+          return success();
+        sourceChildren = source->second;
+      } else {
+        auto source =
+            endpointToChild.find({sourceOperationId, sourceWorkUnitId});
+        if (source == endpointToChild.end())
+          return success();
+        exactSource.push_back(source->second);
+        sourceChildren = exactSource;
+      }
+      if (targetWorkUnitId < 0) {
+        auto target = operationToChildren.find(targetOperationId);
+        if (target == operationToChildren.end())
+          return success();
+        targetChildren = target->second;
+      } else {
+        auto target =
+            endpointToChild.find({targetOperationId, targetWorkUnitId});
+        if (target == endpointToChild.end())
+          return success();
+        exactTarget.push_back(target->second);
+        targetChildren = exactTarget;
+      }
+      for (int64_t source : sourceChildren) {
+        for (int64_t target : targetChildren) {
           if (source <= target)
             continue;
           return emitTreeError(anchor, Twine("T-Cut node ") + Twine(node.id) +
@@ -92,24 +127,29 @@ LogicalResult verifyTemporalOrders(const ResourceAllocationTree &tree,
       return success();
     };
 
-    std::set<std::pair<int64_t, int64_t>> refinedOperationEdges;
-    for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
-      refinedOperationEdges.insert(
-          {edge.sourceOperationId, edge.targetOperationId});
-      if (failed(verifyForward(edge.sourceOperationId, edge.sourceWorkUnitId,
-                               edge.targetOperationId, edge.targetWorkUnitId)))
-        return failure();
-    }
-
-    for (const ComputeTensor &tensor : graph.tensors) {
-      for (int64_t producerId : tensor.producerOperations) {
-        for (int64_t consumerId : tensor.consumerOperations) {
-          if (refinedOperationEdges.contains({producerId, consumerId}))
-            continue;
-          if (failed(verifyForward(producerId, /*sourceWorkUnitId=*/-1,
-                                   consumerId, /*targetWorkUnitId=*/-1)))
+    // Only dependencies whose source occurs below this cut can constrain its
+    // child order.  Indexing by source avoids rescanning the complete graph for
+    // every temporal cut, which is quadratic for models with many MVM waves.
+    for (const auto &[producerId, children] : operationToChildren) {
+      (void)children;
+      auto refined = workUnitEdgesBySource.find(producerId);
+      if (refined != workUnitEdgesBySource.end()) {
+        for (const MappingWorkUnitEdge *edge : refined->second) {
+          if (failed(verifyForward(
+                  edge->sourceOperationId, edge->sourceWorkUnitId,
+                  edge->targetOperationId, edge->targetWorkUnitId)))
             return failure();
         }
+      }
+      auto consumers = graphConsumersByProducer.find(producerId);
+      if (consumers == graphConsumersByProducer.end())
+        continue;
+      for (int64_t consumerId : consumers->second) {
+        if (refinedOperationEdges.contains({producerId, consumerId}))
+          continue;
+        if (failed(verifyForward(producerId, /*sourceWorkUnitId=*/-1,
+                                 consumerId, /*targetWorkUnitId=*/-1)))
+          return failure();
       }
     }
   }
@@ -250,25 +290,35 @@ buildTemporalBaselineRATree(const ComputeGraph &graph, Operation *anchor) {
     return tree;
   }
 
-  tree.rootId = 0;
-  StructuralRATreeNode root;
-  root.id = 0;
-  root.kind = RATreeNodeKind::TemporalCut;
-  root.parentId = -1;
-  root.operationId = -1;
-  root.workGroupCount = 1;
-  root.childIds.reserve(graph.operations.size());
-  tree.nodes.push_back(root);
+  auto appendCut = [&](RATreeNodeKind kind, int64_t parentId) -> int64_t {
+    int64_t id = static_cast<int64_t>(tree.nodes.size());
+    StructuralRATreeNode node;
+    node.id = id;
+    node.kind = kind;
+    node.parentId = parentId;
+    tree.nodes.push_back(std::move(node));
+    if (parentId >= 0)
+      tree.nodes[parentId].childIds.push_back(id);
+    return id;
+  };
 
-  for (int64_t operationId : graph.topologicalOrder)
-    appendNode(RATreeNodeKind::Leaf, tree.rootId, operationId);
+  int64_t modelRoot = -1;
+  if (graph.layerRegions.size() > 1)
+    modelRoot = appendCut(RATreeNodeKind::TemporalCut, /*parentId=*/-1);
 
-  if (tree.nodes.front().childIds.size() == 1) {
-    int64_t promotedRoot = tree.nodes.front().childIds.front();
-    tree.nodes[promotedRoot].parentId = -1;
-    tree.rootId = promotedRoot;
-    tree.nodes.erase(tree.nodes.begin());
+  for (int64_t regionId : graph.topologicalLayerRegionOrder) {
+    const LayerRegion &region = graph.layerRegions[regionId];
+    int64_t regionRoot = modelRoot;
+    if (region.operationIds.size() > 1)
+      regionRoot = appendCut(RATreeNodeKind::TemporalCut, modelRoot);
+    for (int64_t operationId : region.operationIds)
+      appendNode(RATreeNodeKind::Leaf, regionRoot, operationId);
+    if (modelRoot < 0)
+      modelRoot = region.operationIds.size() == 1
+                      ? tree.nodes.back().id
+                      : regionRoot;
   }
+  tree.rootId = modelRoot;
   return tree;
 }
 
@@ -390,6 +440,164 @@ deserializeResourceAllocationTree(RATreeAttr attr, const ComputeGraph &graph,
 ResourceAllocationTree
 cloneResourceAllocationTree(const ResourceAllocationTree &tree) {
   return tree;
+}
+
+FailureOr<ResourceAllocationTree>
+stripLayerRegionNodes(const ResourceAllocationTree &tree, Operation *anchor) {
+  DenseMap<int64_t, const StructuralRATreeNode *> nodesById;
+  for (const StructuralRATreeNode &node : tree.nodes) {
+    if (!nodesById.try_emplace(node.id, &node).second) {
+      anchor->emitError("cannot strip Layer nodes from a Resource Allocation "
+                        "Tree with duplicate node ID ")
+          << node.id;
+      return failure();
+    }
+  }
+
+  ResourceAllocationTree result;
+  result.workUnits = tree.workUnits;
+  result.workUnitEdges = tree.workUnitEdges;
+  std::function<FailureOr<int64_t>(int64_t)> rebuild =
+      [&](int64_t oldId) -> FailureOr<int64_t> {
+    const StructuralRATreeNode *oldNode = nodesById.lookup(oldId);
+    if (!oldNode) {
+      anchor->emitError("cannot strip Layer nodes with unknown child node ")
+          << oldId;
+      return failure();
+    }
+    if (oldNode->kind == RATreeNodeKind::Layer) {
+      if (oldNode->childIds.size() != 1) {
+        anchor->emitError("cannot strip malformed Layer RA node ")
+            << oldNode->id;
+        return failure();
+      }
+      return rebuild(oldNode->childIds.front());
+    }
+
+    StructuralRATreeNode node = *oldNode;
+    node.id = static_cast<int64_t>(result.nodes.size());
+    node.parentId = -1;
+    node.childIds.clear();
+    const int64_t newId = node.id;
+    result.nodes.push_back(std::move(node));
+    for (int64_t childId : oldNode->childIds) {
+      FailureOr<int64_t> rebuiltChild = rebuild(childId);
+      if (failed(rebuiltChild))
+        return failure();
+      result.nodes[newId].childIds.push_back(*rebuiltChild);
+      result.nodes[*rebuiltChild].parentId = newId;
+    }
+    return newId;
+  };
+
+  FailureOr<int64_t> root = rebuild(tree.rootId);
+  if (failed(root))
+    return failure();
+  result.rootId = *root;
+  return reindexResourceAllocationTree(result, anchor);
+}
+
+FailureOr<ResourceAllocationTree>
+materializeLayerRegionNodes(const ResourceAllocationTree &tree,
+                            const ComputeGraph &graph, Operation *anchor) {
+  FailureOr<ResourceAllocationTree> stripped =
+      stripLayerRegionNodes(tree, anchor);
+  if (failed(stripped))
+    return failure();
+
+  DenseMap<int64_t, const StructuralRATreeNode *> nodesById;
+  for (const StructuralRATreeNode &node : stripped->nodes)
+    nodesById[node.id] = &node;
+
+  DenseMap<int64_t, std::optional<int64_t>> uniformRegions;
+  std::function<std::optional<int64_t>(int64_t)> inferUniformRegion =
+      [&](int64_t nodeId) -> std::optional<int64_t> {
+    auto cached = uniformRegions.find(nodeId);
+    if (cached != uniformRegions.end())
+      return cached->second;
+    const StructuralRATreeNode *node = nodesById.lookup(nodeId);
+    if (!node)
+      return std::nullopt;
+    if (node->kind == RATreeNodeKind::Leaf) {
+      const ComputeOperation &operation = graph.operations[node->operationId];
+      std::optional<int64_t> region;
+      if (operation.kind != ComputeOperationKind::MatrixSetup &&
+          operation.layerRegionId >= 0)
+        region = operation.layerRegionId;
+      uniformRegions[nodeId] = region;
+      return region;
+    }
+
+    std::optional<int64_t> region;
+    bool homogeneous = true;
+    for (int64_t childId : node->childIds) {
+      std::optional<int64_t> childRegion = inferUniformRegion(childId);
+      if (!childRegion) {
+        homogeneous = false;
+        continue;
+      }
+      if (region && *region != *childRegion)
+        homogeneous = false;
+      else if (!region)
+        region = childRegion;
+    }
+    if (!homogeneous)
+      region = std::nullopt;
+    uniformRegions[nodeId] = region;
+    return region;
+  };
+  inferUniformRegion(stripped->rootId);
+
+  ResourceAllocationTree result;
+  result.workUnits = stripped->workUnits;
+  result.workUnitEdges = stripped->workUnitEdges;
+  std::function<FailureOr<int64_t>(int64_t, std::optional<int64_t>)> rebuild =
+      [&](int64_t oldId,
+          std::optional<int64_t> parentRegion) -> FailureOr<int64_t> {
+    const StructuralRATreeNode *oldNode = nodesById.lookup(oldId);
+    if (!oldNode) {
+      anchor->emitError("cannot materialize Layer nodes with unknown RA node ")
+          << oldId;
+      return failure();
+    }
+    std::optional<int64_t> region = uniformRegions.lookup(oldId);
+
+    StructuralRATreeNode node = *oldNode;
+    node.id = static_cast<int64_t>(result.nodes.size());
+    node.parentId = -1;
+    node.childIds.clear();
+    const int64_t newId = node.id;
+    result.nodes.push_back(std::move(node));
+    for (int64_t childId : oldNode->childIds) {
+      FailureOr<int64_t> rebuiltChild = rebuild(childId, region);
+      if (failed(rebuiltChild))
+        return failure();
+      result.nodes[newId].childIds.push_back(*rebuiltChild);
+      result.nodes[*rebuiltChild].parentId = newId;
+    }
+
+    if (!region || region == parentRegion)
+      return newId;
+
+    StructuralRATreeNode layer;
+    layer.id = static_cast<int64_t>(result.nodes.size());
+    layer.kind = RATreeNodeKind::Layer;
+    layer.childIds.push_back(newId);
+    result.nodes[newId].parentId = layer.id;
+    result.nodes.push_back(std::move(layer));
+    return result.nodes.back().id;
+  };
+
+  FailureOr<int64_t> root = rebuild(stripped->rootId, std::nullopt);
+  if (failed(root))
+    return failure();
+  result.rootId = *root;
+  FailureOr<ResourceAllocationTree> reindexed =
+      reindexResourceAllocationTree(result, anchor);
+  if (failed(reindexed) ||
+      failed(verifyResourceAllocationTree(*reindexed, graph, anchor)))
+    return failure();
+  return reindexed;
 }
 
 FailureOr<ResourceAllocationTree>
@@ -578,13 +786,16 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
     const MappingWorkUnit *workUnit = workUnitsById.lookup(workUnitId);
     return workUnit && workUnit->operationId == operationId;
   };
-  auto hasGraphDependency = [&](int64_t sourceOperationId,
-                                int64_t targetOperationId) {
-    return llvm::any_of(graph.tensors, [&](const ComputeTensor &tensor) {
-      return llvm::is_contained(tensor.producerOperations, sourceOperationId) &&
-             llvm::is_contained(tensor.consumerOperations, targetOperationId);
-    });
-  };
+  DenseSet<std::pair<int64_t, int64_t>> graphOperationEdges;
+  DenseMap<int64_t, SmallVector<int64_t>> graphConsumersByProducer;
+  for (const ComputeTensor &tensor : graph.tensors) {
+    for (int64_t producerId : tensor.producerOperations) {
+      for (int64_t consumerId : tensor.consumerOperations) {
+        if (graphOperationEdges.insert({producerId, consumerId}).second)
+          graphConsumersByProducer[producerId].push_back(consumerId);
+      }
+    }
+  }
   std::set<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> uniqueEdges;
   for (const MappingWorkUnitEdge &edge : tree.workUnitEdges) {
     if (!endpointIsValid(edge.sourceOperationId, edge.sourceWorkUnitId)) {
@@ -602,7 +813,8 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
     if (edge.byteSize < 0)
       return emitTreeError(anchor,
                            "work-unit edge byte size must be non-negative");
-    if (!hasGraphDependency(edge.sourceOperationId, edge.targetOperationId)) {
+    if (!graphOperationEdges.contains(
+            {edge.sourceOperationId, edge.targetOperationId})) {
       return emitTreeError(anchor,
                            Twine("work-unit edge refines nonexistent operation "
                                  "dependency ") +
@@ -631,7 +843,8 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
                               edge.targetOperationId) ||
           graph.operations[edge.targetOperationId].operation->getOperand(
               edge.targetOperandNumber) != tensor.value ||
-          edge.byteSize > tensor.byteSize) {
+          edge.byteSize > getProducerContributionByteSize(
+                              tensor, edge.sourceOperationId)) {
         return emitTreeError(
             anchor, "work-unit edge does not match its compute tensor");
       }
@@ -680,8 +893,13 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
       }
       coveredOperations.insert(node.operationId);
     } else {
-      if (node.childIds.size() < 2) {
-        return emitTreeError(anchor, Twine("internal node ") + Twine(node.id) +
+      if (node.kind == RATreeNodeKind::Layer) {
+        if (node.childIds.size() != 1) {
+          return emitTreeError(anchor, Twine("Layer node ") + Twine(node.id) +
+                                           " must have exactly one child");
+        }
+      } else if (node.childIds.size() < 2) {
+        return emitTreeError(anchor, Twine("cut node ") + Twine(node.id) +
                                          " must have at least two children");
       }
       if (node.operationId >= 0) {
@@ -756,7 +974,43 @@ LogicalResult verifyResourceAllocationTree(const ResourceAllocationTree &tree,
     return emitTreeError(anchor,
                          "tree contains nodes unreachable from the root");
 
-  return verifyTemporalOrders(tree, graph, nodeIndices, anchor);
+  for (const StructuralRATreeNode &layer : tree.nodes) {
+    if (layer.kind != RATreeNodeKind::Layer)
+      continue;
+    std::optional<int64_t> layerRegionId;
+    SmallVector<int64_t> pending(layer.childIds.begin(), layer.childIds.end());
+    while (!pending.empty()) {
+      const StructuralRATreeNode &descendant =
+          tree.nodes[nodeIndices.lookup(pending.pop_back_val())];
+      if (descendant.kind != RATreeNodeKind::Leaf) {
+        pending.append(descendant.childIds.begin(), descendant.childIds.end());
+        continue;
+      }
+      const ComputeOperation &operation =
+          graph.operations[descendant.operationId];
+      if (operation.kind == ComputeOperationKind::MatrixSetup) {
+        return emitTreeError(anchor, Twine("Layer node ") + Twine(layer.id) +
+                                         " must not contain matrix setup");
+      }
+      if (operation.layerRegionId < 0) {
+        return emitTreeError(anchor, Twine("Layer node ") + Twine(layer.id) +
+                                         " contains an unassigned layer "
+                                         "region");
+      }
+      if (layerRegionId && *layerRegionId != operation.layerRegionId) {
+        return emitTreeError(anchor, Twine("Layer node ") + Twine(layer.id) +
+                                         " spans multiple layer regions");
+      }
+      layerRegionId = operation.layerRegionId;
+    }
+    if (!layerRegionId) {
+      return emitTreeError(anchor, Twine("Layer node ") + Twine(layer.id) +
+                                       " contains no compute operations");
+    }
+  }
+
+  return verifyTemporalOrders(tree, nodeIndices, graphConsumersByProducer,
+                              anchor);
 }
 
 std::string computeGraphFingerprint(const ComputeGraph &graph) {
@@ -806,7 +1060,8 @@ std::string computeGraphFingerprint(const ComputeGraph &graph) {
   for (const ComputeTensor &tensor : graph.tensors) {
     stream << "tensor " << tensor.id << " producers";
     for (int64_t producer : tensor.producerOperations)
-      stream << ' ' << producer;
+      stream << ' ' << producer << ':'
+             << getProducerContributionByteSize(tensor, producer);
     stream << " consumers";
     for (int64_t consumer : tensor.consumerOperations)
       stream << ' ' << consumer;

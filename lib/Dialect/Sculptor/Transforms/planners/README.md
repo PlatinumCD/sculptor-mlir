@@ -12,8 +12,13 @@ Each planner refines the RA tree that the preceding strategy produced.
 
 ## Registered planners
 
-- `setup-first` creates one spatial frontier for every matrix setup. It puts
+- `setup-first` is an unconditional first compiler phase. It creates one
+  spatial frontier for every matrix setup and puts
   this frontier before the current compute subtree.
+- `layer-cut` contracts operation dependencies into the semantic-layer graph.
+  Every ready layer frontier becomes an S-cut, while successive frontiers
+  become children of a T-cut. Existing operation-level S/T structure inside a
+  layer is preserved under the mandatory setup-first frontier.
 - `mvm-wave` preserves wave order with temporal cuts. Within each wave, vector
   preparation occurs first, physical MVM members form one spatial cut, and
   optional tile recombination occurs last.
@@ -59,6 +64,45 @@ in sequence. S-cut children receive disjoint lane subsets. The resulting
 `sculptor.mapping.plan` records every node's inherited resources and every
 leaf's logical tile, lane, and estimated execution interval. This realization
 is the sole source of lane and time coordinates in the S-T report.
+
+`digital-scheduling-policy=earliest-finish` makes that final realization
+schedule-aware. T-cut children retain barrier order, S-cut children receive
+disjoint lanes and may overlap, and each unpinned digital leaf chooses the
+legal lane minimizing `max(lane availability, input arrival) + task cost`.
+Input arrival charges one logical network hop before physical placement.
+MVM-body work remains pinned to its resident array tile; uniform-sibling
+affinity remains a tie-break preference rather than a hard constraint.
+
+`digital-scheduling-policy=progressive` applies the same schedule-aware score
+to a monotonically expanding set of flexible digital lanes. It starts with one
+legal lane per encountered resource pool and opens an unused lane only when
+the resulting completion-time improvement exceeds its incremental estimated
+communication cost. Semantically required MVM-body placements bypass the
+admission mask.
+
+`digital-scheduling-policy=sliding-window` restricts flexible digital leaves
+to a fixed-width, work-progressed window over increasing logical tile IDs.
+`digital-window-size` sets the width. The head advances monotonically from the
+first tile toward the last, so a flexible lane that falls behind the head can
+never receive work again. Required MVM-body tiles bypass the window for
+correctness. Physical `schedule=snake` maps this logical order onto an adjacent
+snake path through the mesh; communication-optimizing placement schedules may
+permute it.
+
+`mvm-body-policy=first-use-window` makes matrix-home selection follow the
+first scheduled physical-MVM wave for each lane-binding group. New matrices
+receive a free analog lane inside the same fixed-width logical window; later
+uses remain pinned to that home. The window advances only between waves and
+never moves backward. When independent S-cut branches share a persistent home
+tile, their digital control work is serialized by the schedule-aware lane
+clock while distinct analog lanes remain available concurrently. This policy
+requires `digital-scheduling-policy=sliding-window`.
+
+`mvm-body-policy=first-use-adaptive` keeps first-use ordering and permanent
+matrix homes, but treats matrix groups in sibling RA spatial branches as hard
+tile conflicts. It prefers the active window and spills to a nearby tile only
+when strict locality would serialize independent work; it never migrates or
+reloads an already-bound matrix.
 
 A setup-only spatial frontier consumes one logical tile for every
 `arrays-per-core` setup leaves. This models analog-lane capacity without

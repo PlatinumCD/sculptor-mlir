@@ -313,8 +313,17 @@ collectChildEdges(ReferenceEvaluationContext &context,
   }
   for (int64_t tensorId : relevantTensorIds) {
     const ComputeTensor &tensor = context.problem.graph.tensors[tensorId];
-    std::set<ChildEdge> tensorEdges;
+    std::map<ChildEdge, int64_t> tensorEdgeBytes;
     for (int64_t producerId : tensor.producerOperations) {
+      int64_t contributionBytes =
+          getProducerContributionByteSize(tensor, producerId);
+      if (contributionBytes < 0) {
+        context.problem.anchor->emitError(
+            "reference mapping evaluation requires static producer "
+            "contribution sizes for crossing tensors");
+        return failure();
+      }
+      std::set<ChildEdge> producerEdges;
       for (int64_t consumerId : tensor.consumerOperations) {
         if (context.refinedOperationEdges.contains({producerId, consumerId}))
           continue;
@@ -326,23 +335,23 @@ collectChildEdges(ReferenceEvaluationContext &context,
         for (int64_t producerChild : producerChildren->second) {
           for (int64_t consumerChild : consumerChildren->second) {
             if (producerChild != consumerChild)
-              tensorEdges.insert({producerChild, consumerChild});
+              producerEdges.insert({producerChild, consumerChild});
           }
         }
       }
+      for (ChildEdge edge : producerEdges) {
+        FailureOr<int64_t> bytes = checkedAddI64(
+            tensorEdgeBytes[edge], contributionBytes, context.problem.anchor,
+            "mapping tensor producer contribution byte count");
+        if (failed(bytes))
+          return failure();
+        tensorEdgeBytes[edge] = *bytes;
+      }
     }
-    if (tensorEdges.empty())
-      continue;
-    if (tensor.byteSize < 0) {
-      context.problem.anchor->emitError(
-          "reference mapping evaluation requires static byte sizes for "
-          "crossing tensors");
-      return failure();
-    }
-    for (ChildEdge edge : tensorEdges) {
-      FailureOr<int64_t> bytes = checkedAddI64(edgeBytes[edge], tensor.byteSize,
-                                               context.problem.anchor,
-                                               "mapping child-edge byte count");
+    for (const auto &[edge, contributionBytes] : tensorEdgeBytes) {
+      FailureOr<int64_t> bytes = checkedAddI64(
+          edgeBytes[edge], contributionBytes, context.problem.anchor,
+          "mapping child-edge byte count");
       if (failed(bytes))
         return failure();
       edgeBytes[edge] = *bytes;
@@ -618,6 +627,18 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
     return result;
   }
 
+  if (node->kind == RATreeNodeKind::Layer) {
+    FailureOr<MappingNodeEvaluation> child =
+        evaluateNode(context, node->childIds.front());
+    if (failed(child))
+      return failure();
+    result = *child;
+    result.nodeId = nodeId;
+    context.childStartOffsets[nodeId] = {0.0};
+    context.evaluations[nodeId] = result;
+    return result;
+  }
+
   SmallVector<MappingNodeEvaluation> children;
   children.reserve(node->childIds.size());
   for (int64_t childId : node->childIds) {
@@ -745,7 +766,11 @@ evaluateNode(ReferenceEvaluationContext &context, int64_t nodeId) {
                           : mvmWaveAnalogLaneCount;
       result.requiredResourceUnits =
           isMVMWaveFrontier &&
-                  context.problem.mvmBodyPolicy == MVMBodyPolicy::Spread
+              (context.problem.mvmBodyPolicy == MVMBodyPolicy::Spread ||
+               context.problem.mvmBodyPolicy ==
+                   MVMBodyPolicy::FirstUseWindow ||
+               context.problem.mvmBodyPolicy ==
+                   MVMBodyPolicy::FirstUseAdaptive)
               ? requiredAnalogLanes
               : llvm::divideCeil(requiredAnalogLanes, analogLaneCount);
     } else {
@@ -934,8 +959,26 @@ ReferenceMappingEvaluator::evaluate(const MappingProblem &problem,
       evaluation.feasible = false;
       evaluation.infeasibilityReason = realization->infeasibilityReason;
     } else {
-      if (failed(assignRealizationTimes(context, *realization)))
+      if (problem.digitalSchedulingPolicy ==
+              DigitalSchedulingPolicy::EarliestFinish ||
+          problem.digitalSchedulingPolicy ==
+              DigitalSchedulingPolicy::Progressive ||
+          problem.digitalSchedulingPolicy ==
+              DigitalSchedulingPolicy::SlidingWindow) {
+        if (!std::isfinite(realization->estimatedMakespanNs) ||
+            realization->estimatedMakespanNs < 0.0 ||
+            !std::isfinite(realization->estimatedCommunicationNs) ||
+            realization->estimatedCommunicationNs < 0.0) {
+          problem.anchor->emitError(
+              "schedule-aware realization produced invalid timing");
+          return failure();
+        }
+        evaluation.estimatedLatencyNs = realization->estimatedMakespanNs;
+        evaluation.estimatedCommunicationNs =
+            realization->estimatedCommunicationNs;
+      } else if (failed(assignRealizationTimes(context, *realization))) {
         return failure();
+      }
       evaluation.realization = std::move(*realization);
     }
   }

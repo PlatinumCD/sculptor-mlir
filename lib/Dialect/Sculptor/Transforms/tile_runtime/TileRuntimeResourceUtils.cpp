@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <climits>
@@ -17,25 +18,32 @@ mlir::FailureOr<int64_t> getStaticPayloadByteSize(mlir::Type payloadType) {
                 mlir::sculptor::LogicalArrayType>(payloadType))
     return int64_t{0};
 
-  if (auto floatType = llvm::dyn_cast<mlir::FloatType>(payloadType)) {
-    unsigned bitWidth = floatType.getWidth();
-    if (bitWidth == 0)
-      return mlir::failure();
-    return static_cast<int64_t>(llvm::divideCeil(bitWidth, CHAR_BIT));
-  }
+  auto getElementByteSize = [](mlir::Type type) -> std::optional<int64_t> {
+    if (!type.isIntOrFloat())
+      return std::nullopt;
+    unsigned bitWidth = type.getIntOrFloatBitWidth();
+    if (bitWidth == 0 || bitWidth % CHAR_BIT != 0)
+      return std::nullopt;
+    return static_cast<int64_t>(bitWidth / CHAR_BIT);
+  };
+
+  if (std::optional<int64_t> bytes = getElementByteSize(payloadType))
+    return *bytes;
 
   auto shapedType = llvm::dyn_cast<mlir::ShapedType>(payloadType);
-  if (!shapedType || !shapedType.hasStaticShape() ||
-      !shapedType.getElementType().isF32())
+  if (!shapedType || !shapedType.hasStaticShape())
     return mlir::failure();
 
   int64_t elementCount = shapedType.getNumElements();
-  constexpr int64_t kF32ByteSize = sizeof(float);
-  if (elementCount < 0 ||
-      elementCount > std::numeric_limits<int64_t>::max() / kF32ByteSize)
+  std::optional<int64_t> elementBytes =
+      getElementByteSize(shapedType.getElementType());
+  if (elementCount < 0 || !elementBytes)
     return mlir::failure();
 
-  return elementCount * kF32ByteSize;
+  std::optional<int64_t> bytes = llvm::checkedMul(elementCount, *elementBytes);
+  if (!bytes)
+    return mlir::failure();
+  return *bytes;
 }
 
 } // namespace

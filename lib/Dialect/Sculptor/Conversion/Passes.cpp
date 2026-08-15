@@ -1,6 +1,7 @@
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/Passes.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/EmitGolemTileABI.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/FinalizeGolemIntrinsics.h"
+#include "sculptor-mlir/Dialect/Sculptor/Conversion/InstrumentTileHeap.h"
 #include "sculptor-mlir/Dialect/Sculptor/Conversion/LowerGolemToLLVMShims.h"
 
 namespace mlir {
@@ -11,6 +12,7 @@ void registerSculptorConversionPasses() {
   registerLowerGolemToLLVMShimsPass();
   registerFinalizeGolemIntrinsicsPass();
   registerEmitGolemTileABIPass();
+  registerInstrumentTileHeapPass();
 }
 
 } // namespace sculptor

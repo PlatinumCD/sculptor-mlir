@@ -1306,15 +1306,15 @@ buildAttentionSoftmaxStage(TransformerBlockLowering &match, mlir::Value scores,
 
 static mlir::Value
 buildAttentionApplyStage(TransformerBlockLowering &match,
-                          mlir::Value probabilities, mlir::Value value,
-                          int64_t queryLength, int64_t keyLength,
-                          llvm::StringRef name, mlir::OpBuilder &builder) {
+                         mlir::Value probabilities, mlir::Value value,
+                         int64_t queryLength, int64_t keyLength,
+                         llvm::StringRef name, mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType headTy = mlir::RankedTensorType::get(
-      {match.batchSize, match.numHeads, queryLength, match.headDim},
+      {match.batchSize, queryLength, match.numHeads, match.headDim},
       match.elementType);
-  mlir::sculptor::SemanticOperationScope scope(
-      builder, "digital.attention_apply", name);
+  mlir::sculptor::SemanticOperationScope scope(builder,
+                                               "digital.attention_apply", name);
   scope.set("head_dim", builder.getI64IntegerAttr(match.headDim));
 
   mlir::Value valueHeads =
@@ -1330,7 +1330,7 @@ buildAttentionApplyStage(TransformerBlockLowering &match,
   mlir::AffineMap valueMap = mlir::AffineMap::get(
       /*dimCount=*/5, /*symbolCount=*/0, {b, k, h, d}, context);
   mlir::AffineMap headMap = mlir::AffineMap::get(
-      /*dimCount=*/5, /*symbolCount=*/0, {b, h, q, d}, context);
+      /*dimCount=*/5, /*symbolCount=*/0, {b, q, h, d}, context);
   llvm::SmallVector<mlir::utils::IteratorType, 5> contractionIterators = {
       mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
       mlir::utils::IteratorType::parallel, mlir::utils::IteratorType::parallel,
@@ -1364,31 +1364,21 @@ buildAttentionApplyStage(TransformerBlockLowering &match,
 }
 
 static mlir::Value buildHeadRecombineStage(TransformerBlockLowering &match,
-                                            mlir::Value heads,
-                                            int64_t sequenceLength,
-                                            llvm::StringRef name,
-                                            mlir::OpBuilder &builder) {
+                                           mlir::Value heads,
+                                           int64_t sequenceLength,
+                                           llvm::StringRef name,
+                                           mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   mlir::RankedTensorType outputTy = mlir::RankedTensorType::get(
       {match.batchSize, sequenceLength, match.hiddenSize}, match.elementType);
-  mlir::sculptor::SemanticOperationScope scope(
-      builder, "digital.head_recombine", name);
+  mlir::sculptor::SemanticOperationScope scope(builder,
+                                               "digital.head_recombine", name);
 
-  mlir::RankedTensorType transposedTy = mlir::RankedTensorType::get(
-      {match.batchSize, sequenceLength, match.numHeads, match.headDim},
-      match.elementType);
-  mlir::Value transposeInit = builder.create<EmptyOp>(
-      loc, transposedTy.getShape(), transposedTy.getElementType());
-  mlir::Value transposed = builder
-                               .create<mlir::linalg::TransposeOp>(
-                                   loc, heads, transposeInit,
-                                   llvm::ArrayRef<int64_t>{0, 2, 1, 3})
-                               ->getResult(0);
   llvm::SmallVector<mlir::ReassociationIndices, 3> reassociation = {
       {0}, {1}, {2, 3}};
   mlir::Value output = builder
                            .create<mlir::tensor::CollapseShapeOp>(
-                               loc, outputTy, transposed, reassociation)
+                               loc, outputTy, heads, reassociation)
                            .getResult();
 
   scope.annotate();
@@ -1396,14 +1386,14 @@ static mlir::Value buildHeadRecombineStage(TransformerBlockLowering &match,
 }
 
 static mlir::Value buildResidualAddStage(TransformerBlockLowering &match,
-                                          mlir::Value residual,
-                                          mlir::Value update,
-                                          llvm::StringRef name,
-                                          mlir::OpBuilder &builder) {
+                                         mlir::Value residual,
+                                         mlir::Value update,
+                                         llvm::StringRef name,
+                                         mlir::OpBuilder &builder) {
   mlir::Location loc = match.blockOp.getLoc();
   auto resultTy = llvm::cast<mlir::RankedTensorType>(residual.getType());
-  mlir::sculptor::SemanticOperationScope scope(
-      builder, "digital.residual_add", name);
+  mlir::sculptor::SemanticOperationScope scope(builder, "digital.residual_add",
+                                               name);
 
   mlir::Value init = builder.create<EmptyOp>(loc, resultTy.getShape(),
                                              resultTy.getElementType());
@@ -1941,10 +1931,12 @@ LogicalResult decomposeInlineTransformerBlocks(func::FuncOp func) {
   SmallVector<NNTransformerBlockOp> blocks;
   func.walk([&](NNTransformerBlockOp block) { blocks.push_back(block); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNTransformerBlockOp block : blocks) {
     if (!block || !block->getBlock())
       continue;
+    SemanticLayerRewriteScope layerScope(layerListener, block);
     if (failed(decomposeTransformerBlock(block, rewriter)))
       return block.emitOpError("failed to decompose inline Transformer block");
   }

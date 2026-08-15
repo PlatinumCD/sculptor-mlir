@@ -18,6 +18,31 @@ struct OutlineTileRoutinesPass
     return "Outline a locked logical-tile placement into per-tile routines";
   }
 
+  Option<bool> fuseProducerConsumer{
+      *this, "fuse-producer-consumer",
+      llvm::cl::desc("Fuse safe linear same-tile digital routine chains"),
+      llvm::cl::init(false)};
+
+  Option<bool> consolidateLayerRegions{
+      *this, "consolidate-layer-regions",
+      llvm::cl::desc("Consolidate connected same-layer digital work on one "
+                     "physical tile into one routine region"),
+      llvm::cl::init(false)};
+
+  Option<int64_t> sequenceWavesInFlight{
+      *this, "sequence-waves-in-flight",
+      llvm::cl::desc(
+          "Maximum sequence-sharded MVM waves simultaneously in flight"),
+      llvm::cl::init(1)};
+
+  OutlineTileRoutinesPass() = default;
+  OutlineTileRoutinesPass(const OutlineTileRoutinesPass &pass)
+      : PassWrapper(pass) {
+    fuseProducerConsumer = pass.fuseProducerConsumer;
+    consolidateLayerRegions = pass.consolidateLayerRegions;
+    sequenceWavesInFlight = pass.sequenceWavesInFlight;
+  }
+
   void runOnOperation() override;
 };
 

@@ -1,12 +1,14 @@
+#include "sculptor-mlir/Dialect/Sculptor/IR/SculptorAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorTypes.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDeploymentAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeLayout.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/TileMemoryPlan.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileRuntimeAttrs.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/TileScratchpadAttrs.h"
-#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeLayout.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeOrder.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/tile_runtime/TileRuntimeResourceUtils.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -18,8 +20,9 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <limits>
+#include <map>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -60,6 +63,8 @@ struct ResourceInfo {
   size_t byteSize = 0;
   std::optional<uint32_t> tempIndex;
   std::optional<uint32_t> routeIndex;
+  std::optional<int64_t> ownerId;
+  std::optional<int64_t> lifetimeId;
   bool scratchpad = false;
 };
 
@@ -69,25 +74,23 @@ struct RouteResource {
   uint32_t routeIndex = 0;
 };
 
-struct TempInterval {
-  uint32_t slot = 0;
-  uint32_t tempIndex = 0;
-  size_t byteSize = 0;
-  unsigned firstUse = std::numeric_limits<unsigned>::max();
-  unsigned lastUse = 0;
-  size_t offset = 0;
-};
-
-struct ActiveAllocation {
-  unsigned lastUse = 0;
-  size_t offset = 0;
-  size_t size = 0;
-};
-
-struct FreeAllocation {
-  size_t offset = 0;
-  size_t size = 0;
-};
+template <typename AttrTy>
+mlir::FailureOr<llvm::SmallVector<AttrTy>>
+getMemoryPlanArray(mlir::ModuleOp module, llvm::StringRef name) {
+  auto values = module->getAttrOfType<mlir::ArrayAttr>(name);
+  if (!values)
+    return module.emitError("expected tile memory-plan array '") << name << "'";
+  llvm::SmallVector<AttrTy> result;
+  result.reserve(values.size());
+  for (mlir::Attribute value : values) {
+    auto typed = mlir::dyn_cast<AttrTy>(value);
+    if (!typed)
+      return module.emitError("tile memory-plan array '")
+             << name << "' contains an invalid record";
+    result.push_back(typed);
+  }
+  return result;
+}
 
 template <typename OpT>
 mlir::LogicalResult
@@ -98,8 +101,8 @@ recordResource(OpT resourceOp, ExecutablePlan &plan,
   mlir::FailureOr<int64_t> byteSize =
       mlir::sculptor::getTaskResourceByteSize(resourceOp.getResult());
   if (failed(byteSize)) {
-    resourceOp.emitError("expected runtime resources to carry runtime handles, "
-                         "float scalars, or static f32 tensor/memref payloads");
+    resourceOp.emitError("expected runtime resources to carry runtime handles "
+                         "or static byte-addressable numeric payloads");
     return mlir::failure();
   }
 
@@ -230,6 +233,61 @@ collectResources(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
   return mlir::success();
 }
 
+mlir::LogicalResult bindResourcesToMemoryPlan(
+    mlir::func::FuncOp taskGraphFunc,
+    llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue) {
+  mlir::ModuleOp module = taskGraphFunc->getParentOfType<mlir::ModuleOp>();
+  auto owners = getMemoryPlanArray<mlir::sculptor::TileMemoryOwnerAttr>(
+      module, mlir::sculptor::tile_memory::kOwnersAttrName);
+  auto lifetimes = getMemoryPlanArray<mlir::sculptor::TileMemoryLifetimeAttr>(
+      module, mlir::sculptor::tile_memory::kLifetimesAttrName);
+  if (failed(owners) || failed(lifetimes))
+    return mlir::failure();
+
+  llvm::DenseMap<int64_t, mlir::sculptor::TileMemoryOwnerAttr> ownerByResource;
+  llvm::DenseMap<int64_t, mlir::sculptor::TileMemoryLifetimeAttr>
+      lifetimeByOwner;
+  for (mlir::sculptor::TileMemoryOwnerAttr owner : *owners) {
+    int64_t resourceId = owner.getResourceId().getInt();
+    if (resourceId < 0)
+      continue;
+    if (!ownerByResource.try_emplace(resourceId, owner).second)
+      return module.emitError(
+          "multiple local memory owners use one global resource ID");
+  }
+  for (mlir::sculptor::TileMemoryLifetimeAttr lifetime : *lifetimes) {
+    if (lifetime.getSubjectKind() !=
+        mlir::sculptor::MemoryLifetimeSubjectKind::Owner)
+      continue;
+    if (!lifetimeByOwner.try_emplace(lifetime.getOwnerId().getInt(), lifetime)
+             .second)
+      return module.emitError("memory owner has multiple lifetime records");
+  }
+
+  for (auto &[value, resource] : resourceInfoByValue) {
+    auto resourceId = value.getDefiningOp()->getAttrOfType<mlir::IntegerAttr>(
+        deployment_attrs::kGlobalResourceIdAttrName);
+    if (!resourceId)
+      return value.getDefiningOp()->emitError(
+          "runtime resource has no global resource ID");
+    auto owner = ownerByResource.find(resourceId.getInt());
+    if (owner == ownerByResource.end())
+      return value.getDefiningOp()->emitError(
+          "runtime resource has no tile memory owner");
+    auto lifetime = lifetimeByOwner.find(owner->second.getId().getInt());
+    if (lifetime == lifetimeByOwner.end())
+      return value.getDefiningOp()->emitError(
+          "runtime resource owner has no lifetime");
+    if (owner->second.getByteSize().getInt() !=
+        static_cast<int64_t>(resource.byteSize))
+      return value.getDefiningOp()->emitError(
+          "runtime resource size disagrees with its memory owner");
+    resource.ownerId = owner->second.getId().getInt();
+    resource.lifetimeId = lifetime->second.getId().getInt();
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult
 collectTasks(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
              llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue) {
@@ -279,173 +337,118 @@ collectTasks(mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
   return mlir::success();
 }
 
-void updateIntervalUse(TempInterval &interval, unsigned taskIndex) {
-  interval.firstUse = std::min(interval.firstUse, taskIndex);
-  interval.lastUse = std::max(interval.lastUse, taskIndex);
-}
-
-void buildTemporaryIntervals(
-    llvm::ArrayRef<mlir::Value> intermediateResources,
-    const llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-    llvm::SmallVectorImpl<TempInterval> &intervals,
-    llvm::DenseMap<uint32_t, uint32_t> &tempIndexBySlot) {
-  intervals.reserve(intermediateResources.size());
-  for (mlir::Value intermediateResource : intermediateResources) {
-    const ResourceInfo &resourceInfo =
-        resourceInfoByValue.lookup(intermediateResource);
-    TempInterval interval;
-    interval.slot = resourceInfo.slot;
-    interval.tempIndex = *resourceInfo.tempIndex;
-    interval.byteSize = resourceInfo.byteSize;
-    tempIndexBySlot.try_emplace(interval.slot, interval.tempIndex);
-    intervals.push_back(interval);
-  }
-}
-
-void recordTemporarySlotUses(
-    llvm::ArrayRef<uint32_t> slots, unsigned taskIndex,
-    const llvm::DenseMap<uint32_t, uint32_t> &tempIndexBySlot,
-    llvm::SmallVectorImpl<TempInterval> &intervals) {
-  for (uint32_t slot : slots) {
-    auto tempIt = tempIndexBySlot.find(slot);
-    if (tempIt == tempIndexBySlot.end())
-      continue;
-
-    updateIntervalUse(intervals[tempIt->second], taskIndex);
-  }
-}
-
-void recordTemporaryUses(
-    llvm::ArrayRef<TaskPlan> tasks,
-    const llvm::DenseMap<uint32_t, uint32_t> &tempIndexBySlot,
-    llvm::SmallVectorImpl<TempInterval> &intervals) {
-  for (const auto &task : llvm::enumerate(tasks)) {
-    recordTemporarySlotUses(task.value().inputSlots, task.index(),
-                            tempIndexBySlot, intervals);
-    recordTemporarySlotUses(task.value().outputSlots, task.index(),
-                            tempIndexBySlot, intervals);
-  }
-}
-
-mlir::LogicalResult
-verifyTemporaryUses(mlir::func::FuncOp taskGraphFunc,
-                    llvm::ArrayRef<TempInterval> intervals) {
-  for (const TempInterval &interval : intervals) {
-    if (interval.firstUse == std::numeric_limits<unsigned>::max()) {
-      taskGraphFunc.emitError("expected every temporary slot to be used by at "
-                              "least one task");
-      return mlir::failure();
-    }
-  }
-
-  return mlir::success();
-}
-
-void sortTemporaryIntervalsByUse(
-    llvm::SmallVectorImpl<TempInterval> &intervals) {
-  std::sort(intervals.begin(), intervals.end(),
-            [](const TempInterval &lhs, const TempInterval &rhs) {
-              if (lhs.firstUse != rhs.firstUse)
-                return lhs.firstUse < rhs.firstUse;
-              return lhs.tempIndex < rhs.tempIndex;
-            });
-}
-
-void releaseExpiredAllocations(
-    unsigned firstUse,
-    llvm::SmallVectorImpl<ActiveAllocation> &activeAllocations,
-    llvm::SmallVectorImpl<FreeAllocation> &freeAllocations) {
-  llvm::erase_if(activeAllocations, [&](const ActiveAllocation &allocation) {
-    if (allocation.lastUse >= firstUse)
-      return false;
-
-    freeAllocations.push_back(
-        FreeAllocation{allocation.offset, allocation.size});
-    return true;
-  });
-}
-
-size_t
-chooseTemporaryOffset(size_t byteSize, size_t workspaceSize,
-                      llvm::SmallVectorImpl<FreeAllocation> &freeAllocations) {
-  auto reusableIt = std::find_if(freeAllocations.begin(), freeAllocations.end(),
-                                 [&](const FreeAllocation &allocation) {
-                                   return allocation.size >= byteSize;
-                                 });
-
-  if (reusableIt != freeAllocations.end()) {
-    size_t chosenOffset = reusableIt->offset;
-    freeAllocations.erase(reusableIt);
-    return chosenOffset;
-  }
-
-  return llvm::alignTo(workspaceSize, kWorkspaceAlignment);
-}
-
-mlir::LogicalResult packTemporaryWorkspace(
-    mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
-    llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
-    llvm::ArrayRef<mlir::Value> intermediateResources) {
-  if (intermediateResources.empty()) {
-    plan.workspaceSize = 0;
-    plan.tempOffsets.clear();
-    return mlir::success();
-  }
-
-  llvm::DenseMap<uint32_t, uint32_t> tempIndexBySlot;
-  llvm::SmallVector<TempInterval> intervals;
-  buildTemporaryIntervals(intermediateResources, resourceInfoByValue, intervals,
-                          tempIndexBySlot);
-  recordTemporaryUses(plan.tasks, tempIndexBySlot, intervals);
-  if (failed(verifyTemporaryUses(taskGraphFunc, intervals)))
-    return mlir::failure();
-
-  sortTemporaryIntervalsByUse(intervals);
-
-  llvm::SmallVector<ActiveAllocation> activeAllocations;
-  llvm::SmallVector<FreeAllocation> freeAllocations;
-  plan.tempOffsets.assign(intermediateResources.size(), 0);
-  plan.workspaceSize = 0;
-
-  for (TempInterval &interval : intervals) {
-    releaseExpiredAllocations(interval.firstUse, activeAllocations,
-                              freeAllocations);
-
-    size_t chosenOffset = chooseTemporaryOffset(
-        interval.byteSize, plan.workspaceSize, freeAllocations);
-    interval.offset = chosenOffset;
-    plan.tempOffsets[interval.tempIndex] = chosenOffset;
-    plan.workspaceSize =
-        std::max(plan.workspaceSize, chosenOffset + interval.byteSize);
-    activeAllocations.push_back(
-        ActiveAllocation{interval.lastUse, chosenOffset, interval.byteSize});
-  }
-
-  return mlir::success();
-}
-
-void packRouteWorkspace(
+void packConservativeWorkspace(
     ExecutablePlan &plan,
     const llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
+    llvm::ArrayRef<mlir::Value> intermediateResources,
     llvm::ArrayRef<RouteResource> routeResources) {
-  llvm::SmallVector<RouteResource, 4> orderedRoutes(routeResources);
-  llvm::sort(orderedRoutes,
-             [](const RouteResource &lhs, const RouteResource &rhs) {
-               if (lhs.routeId != rhs.routeId)
-                 return lhs.routeId < rhs.routeId;
-               return lhs.routeIndex < rhs.routeIndex;
-             });
-
+  plan.workspaceSize = 0;
+  plan.tempOffsets.assign(intermediateResources.size(), 0);
+  for (mlir::Value value : intermediateResources) {
+    const ResourceInfo &resource = resourceInfoByValue.lookup(value);
+    size_t offset = llvm::alignTo(plan.workspaceSize, kWorkspaceAlignment);
+    plan.tempOffsets[*resource.tempIndex] = offset;
+    plan.workspaceSize = offset + std::max<size_t>(resource.byteSize, 1);
+  }
   plan.routeOffsets.assign(routeResources.size(), 0);
-  for (const RouteResource &route : orderedRoutes) {
-    const ResourceInfo &resourceInfo = resourceInfoByValue.lookup(route.value);
-    if (resourceInfo.scratchpad)
+  for (const RouteResource &route : routeResources) {
+    const ResourceInfo &resource = resourceInfoByValue.lookup(route.value);
+    if (resource.scratchpad)
       continue;
     size_t offset = llvm::alignTo(plan.workspaceSize, kWorkspaceAlignment);
     plan.routeOffsets[route.routeIndex] = offset;
-    plan.workspaceSize =
-        offset + std::max<size_t>(resourceInfo.byteSize, size_t{1});
+    plan.workspaceSize = offset + std::max<size_t>(resource.byteSize, 1);
   }
+}
+
+mlir::LogicalResult packProvenWorkspace(
+    mlir::func::FuncOp taskGraphFunc, ExecutablePlan &plan,
+    llvm::DenseMap<mlir::Value, ResourceInfo> &resourceInfoByValue,
+    llvm::ArrayRef<mlir::Value> intermediateResources,
+    llvm::ArrayRef<RouteResource> routeResources) {
+  mlir::ModuleOp module = taskGraphFunc->getParentOfType<mlir::ModuleOp>();
+  auto lifetimes = getMemoryPlanArray<mlir::sculptor::TileMemoryLifetimeAttr>(
+      module, mlir::sculptor::tile_memory::kLifetimesAttrName);
+  if (failed(lifetimes))
+    return mlir::failure();
+
+  std::map<int64_t, mlir::sculptor::TileMemoryLifetimeAttr> lifetimeById;
+  for (mlir::sculptor::TileMemoryLifetimeAttr lifetime : *lifetimes)
+    lifetimeById[lifetime.getId().getInt()] = lifetime;
+
+  llvm::SmallVector<mlir::sculptor::tile_memory::WorkspaceAllocationRequest>
+      requests;
+  for (auto &[value, resource] : resourceInfoByValue) {
+    if (resource.scratchpad || !resource.lifetimeId)
+      continue;
+    bool workspaceResource =
+        resource.tempIndex.has_value() || resource.routeIndex.has_value();
+    if (!workspaceResource)
+      continue;
+    if (!resource.ownerId)
+      return value.getDefiningOp()->emitError(
+          "workspace resource has no memory owner");
+    auto lifetime = lifetimeById.find(*resource.lifetimeId);
+    if (lifetime == lifetimeById.end())
+      return value.getDefiningOp()->emitError(
+          "runtime resource references an unknown lifetime");
+    if (lifetime->second.getStorage() !=
+        mlir::sculptor::MemoryLifetimeStorage::Workspace)
+      continue;
+    requests.push_back({*resource.lifetimeId,
+                        static_cast<int64_t>(resource.byteSize),
+                        lifetime->second.getAlignment().getInt()});
+  }
+  auto exactLayout =
+      mlir::sculptor::tile_memory::buildExactWorkspaceLayout(module, requests);
+  if (failed(exactLayout))
+    return mlir::failure();
+  std::map<int64_t, size_t> offsetByLifetime;
+  for (const auto &allocation : exactLayout->allocations)
+    offsetByLifetime[allocation.lifetimeId] =
+        static_cast<size_t>(allocation.offset);
+  plan.workspaceSize = static_cast<size_t>(exactLayout->workspaceBytes);
+
+  plan.tempOffsets.assign(intermediateResources.size(), 0);
+  for (mlir::Value resourceValue : intermediateResources) {
+    const ResourceInfo &resource = resourceInfoByValue.lookup(resourceValue);
+    if (!resource.lifetimeId || !resource.tempIndex)
+      return resourceValue.getDefiningOp()->emitError(
+          "intermediate resource is missing lifetime metadata");
+    auto offset = offsetByLifetime.find(*resource.lifetimeId);
+    plan.tempOffsets[*resource.tempIndex] =
+        offset == offsetByLifetime.end() ? 0 : offset->second;
+  }
+  plan.routeOffsets.assign(routeResources.size(), 0);
+  for (const RouteResource &route : routeResources) {
+    const ResourceInfo &resource = resourceInfoByValue.lookup(route.value);
+    if (resource.scratchpad)
+      continue;
+    if (!resource.lifetimeId)
+      return route.value.getDefiningOp()->emitError(
+          "route resource is missing lifetime metadata");
+    plan.routeOffsets[route.routeIndex] =
+        offsetByLifetime.at(*resource.lifetimeId);
+  }
+
+  mlir::Builder builder(module.getContext());
+  llvm::SmallVector<mlir::Attribute> updatedLifetimes;
+  updatedLifetimes.reserve(lifetimes->size());
+  for (mlir::sculptor::TileMemoryLifetimeAttr lifetime : *lifetimes) {
+    auto offset = offsetByLifetime.find(lifetime.getId().getInt());
+    updatedLifetimes.push_back(mlir::sculptor::TileMemoryLifetimeAttr::get(
+        module.getContext(), lifetime.getId(), lifetime.getSubjectKind(),
+        lifetime.getStorage(), lifetime.getOwnerId(), lifetime.getRoutine(),
+        lifetime.getAllocationOrdinal(), lifetime.getTile(),
+        lifetime.getByteSize(), lifetime.getAlignment(),
+        builder.getI64IntegerAttr(offset == offsetByLifetime.end()
+                                      ? lifetime.getOffset().getInt()
+                                      : static_cast<int64_t>(offset->second)),
+        lifetime.getViewIds(), lifetime.getAccessEventIds()));
+  }
+  module->setAttr(mlir::sculptor::tile_memory::kLifetimesAttrName,
+                  builder.getArrayAttr(updatedLifetimes));
+  return mlir::success();
 }
 
 mlir::ArrayAttr buildI64ArrayAttr(mlir::Builder &builder,
@@ -482,12 +485,19 @@ buildExecutablePlan(mlir::func::FuncOp taskGraphFunc) {
 
   if (failed(collectResources(taskGraphFunc, plan, resourceInfoByValue,
                               intermediateResources, routeResources)) ||
-      failed(collectTasks(taskGraphFunc, plan, resourceInfoByValue)) ||
-      failed(packTemporaryWorkspace(taskGraphFunc, plan, resourceInfoByValue,
-                                    intermediateResources))) {
+      failed(collectTasks(taskGraphFunc, plan, resourceInfoByValue))) {
     return mlir::failure();
   }
-  packRouteWorkspace(plan, resourceInfoByValue, routeResources);
+  mlir::ModuleOp module = taskGraphFunc->getParentOfType<mlir::ModuleOp>();
+  if (module->hasAttr(mlir::sculptor::tile_memory::kPlanVersionAttrName)) {
+    if (failed(bindResourcesToMemoryPlan(taskGraphFunc, resourceInfoByValue)) ||
+        failed(packProvenWorkspace(taskGraphFunc, plan, resourceInfoByValue,
+                                   intermediateResources, routeResources)))
+      return mlir::failure();
+  } else {
+    packConservativeWorkspace(plan, resourceInfoByValue, intermediateResources,
+                              routeResources);
+  }
 
   return plan;
 }

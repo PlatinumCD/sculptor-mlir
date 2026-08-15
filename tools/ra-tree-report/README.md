@@ -60,6 +60,12 @@ the validated logical mapping, while expanded stages are joined to it by
 embeds all report data and does not require a server or external JavaScript
 package.
 
+For full-model mappings, add `--compact`. Compact reports retain the RA
+hierarchy, compute DAG, S-T graph, leaf assignments, mapping-plan metrics,
+communication, and physical placement. They omit per-operation MLIR text and
+the transitive node-allocation closure, which is redundant with exact leaf
+assignments and is not consumed by the visualizations.
+
 ## Serve the report
 
 ```bash

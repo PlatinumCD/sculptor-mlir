@@ -3,6 +3,7 @@
 #include "golem/runtime/basic_tile_runtime.h"
 #include "golem/runtime/deployment_runtime.h"
 #include "golem/runtime/execution.h"
+#include "golem/runtime/heap_profile.h"
 #include "golem/runtime/ready_queue.h"
 #include "golem/runtime/routed_transport.h"
 #include "golem/runtime/scratchpad_abi.h"

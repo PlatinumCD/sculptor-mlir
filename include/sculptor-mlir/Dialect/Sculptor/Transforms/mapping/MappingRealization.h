@@ -41,12 +41,22 @@ struct MappingLeafAssignment {
   double finishNs = 0.0;
 };
 
+// Compact logical-tile neighborhood available to one semantic layer region.
+// Fine-grained leaf placement remains free inside this pool.
+struct MappingLayerTilePool {
+  int64_t layerRegionId = -1;
+  SmallVector<int64_t> tileIds;
+};
+
 struct MappingRealization {
   bool feasible = true;
   std::string infeasibilityReason;
   int64_t logicalTileCount = 0;
   int64_t analogLanesPerTile = 0;
+  double estimatedMakespanNs = 0.0;
+  double estimatedCommunicationNs = 0.0;
   SmallVector<int64_t> digitalWorkPerTile;
+  SmallVector<MappingLayerTilePool> layerTilePools;
   SmallVector<MappingNodeResourceAllocation> nodeAllocations;
   SmallVector<MappingLeafAssignment> leafAssignments;
 };

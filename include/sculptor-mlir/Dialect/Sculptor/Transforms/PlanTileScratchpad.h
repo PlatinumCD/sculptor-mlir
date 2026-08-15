@@ -55,7 +55,7 @@ struct PlanTileScratchpadPass
     return "sculptor-plan-tile-scratchpad";
   }
   StringRef getDescription() const final {
-    return "Plan one resident producer-consumer region in an extracted core";
+    return "Select and allocate scratchpad regions across an extracted core";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<SculptorDialect, func::FuncDialect>();

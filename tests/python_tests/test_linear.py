@@ -14,6 +14,7 @@ from lowering_harness import (
     LoweringCase,
     LoweringTestCase,
     initialize_parameters,
+    lower_to_ra_tree,
     lower_to_tile_object,
 )
 
@@ -61,7 +62,53 @@ class TwoTokenLinear(torch.nn.Module):
         return torch.cat((first, second), dim=1)
 
 
+class BatchedLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 3, bias=True)
+        initialize_parameters(self)
+
+    def forward(self, value):
+        return self.linear(value)
+
+
 class LinearLoweringTest(LoweringTestCase):
+    def test_partial_matrix_setup_pads_to_physical_array_shape(self):
+        case = LoweringCase(
+            name="partial_linear_matrix_tile",
+            model_factory=lambda: LinearModel(bias=True),
+            input_factory=lambda: (torch.ones(1, 4),),
+            array_rows=8,
+            array_cols=8,
+            mesh_rows=1,
+            mesh_cols=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            lower_to_tile_object(case, output_dir=output_dir)
+            llvm_ir = (output_dir / "10.ll").read_text()
+
+        # The logical 3x4 weights must occupy an 8x8 physical array image.
+        # Without this padding, every analog row after row zero uses the wrong
+        # hardware stride and silently reads zeros.
+        self.assertRegex(llvm_ir, r"call ptr @malloc\(i64 256\)")
+
+    def test_rank3_batched_linear_lowers_through_row_sequence(self):
+        lowered = self.assert_lowers(
+            LoweringCase(
+                name="rank3_batched_linear",
+                model_factory=BatchedLinearModel,
+                input_factory=lambda: (torch.ones(1, 2, 4),),
+                expected_fragments=(
+                    "tensor.collapse_shape",
+                    "scf.for",
+                    "tensor<1x2x3xf32>",
+                    "digital.bias_add",
+                ),
+            )
+        )
+        self.assertNotIn("linalg.batch_matmul", lowered)
+
     def test_one_worker_spread_routine_graph_is_acyclic(self):
         case = LoweringCase(
             name="two_token_linear_one_worker",
@@ -245,6 +292,66 @@ class LinearLoweringTest(LoweringTestCase):
         self.assertEqual(referenced_arrays[3:], [set_arrays[1]] * 3)
         self.assertEqual(matrix_ids, {0})
         self.assertEqual(replica_ids, {0, 1})
+
+    def test_duplicate_matrices_respects_physical_array_capacity(self):
+        lowered = self.assert_lowers(
+            LoweringCase(
+                name="reused_linear_bounded_matrix_replication",
+                model_factory=ReusedLinearModel,
+                input_factory=lambda: (torch.ones(1, 8),),
+                expected_fragments=("tensor<1x8xf32>",),
+                minimum_matrix_setups=1,
+                duplicate_matrices=True,
+                matrix_replication_array_capacity=1,
+            )
+        )
+
+        set_arrays = re.findall(
+            r"(?m)^\s*(%[\w.]+) = sculptor\.array\.set ", lowered
+        )
+        array_lines = [
+            line
+            for line in lowered.splitlines()
+            if any(
+                operation in line
+                for operation in (
+                    "sculptor.array.load ",
+                    "sculptor.array.execute ",
+                    "sculptor.array.store ",
+                )
+            )
+        ]
+        referenced_arrays = [
+            re.search(r", (%[\w.]+) \{", line).group(1)
+            for line in array_lines
+        ]
+        replica_ids = {
+            int(
+                re.search(
+                    r"sculptor\.matrix_replica_id = (\d+)", line
+                ).group(1)
+            )
+            for line in array_lines
+        }
+
+        self.assertEqual(len(set_arrays), 1)
+        self.assertEqual(len(array_lines), 6)
+        self.assertEqual(referenced_arrays, [set_arrays[0]] * 6)
+        self.assertEqual(replica_ids, {0})
+
+    def test_duplicate_matrices_rejects_insufficient_array_capacity(self):
+        case = LoweringCase(
+            name="two_linear_insufficient_replication_capacity",
+            model_factory=TwoLinearModel,
+            input_factory=lambda: (torch.ones(1, 8),),
+            duplicate_matrices=True,
+            matrix_replication_array_capacity=1,
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"requires at least 2 persistent arrays.*array-capacity is 1",
+        ):
+            lower_to_ra_tree(case)
 
     def test_linear_with_bias(self):
         self.assert_lowers(

@@ -34,6 +34,14 @@ public:
 // Owns canonicalizers in the order they should visit forward.
 using LayerCanonicalizers = std::vector<std::unique_ptr<LayerCanonicalizer>>;
 
+// Rewrites provably contiguous index-gather scaffolding emitted by torch-mlir
+// to tensor slices before layer-family matching begins.
+void canonicalizeContiguousGathers(func::FuncOp func);
+
+// Eliminates identity nearest-neighbor resizes and strength-reduces proven
+// power-of-two resize index calculations to integer arithmetic.
+LogicalResult canonicalizeStaticNearestNeighborResizes(func::FuncOp func);
+
 // Rewrites supported linalg layer bodies in forward to inline canonical
 // sculptor.nn operations. Outlining remains the responsibility of
 // sculptor-extract-layers.

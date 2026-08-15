@@ -671,8 +671,10 @@ LogicalResult decomposeInlineRNNLayers(func::FuncOp func) {
   SmallVector<NNRNNOp> stacks;
   func.walk([&](NNRNNOp op) { stacks.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNRNNOp op : stacks) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(splitRNNStack(op, rewriter))) {
       op.emitOpError("cannot split supported inline RNN stack");
       return failure();
@@ -682,6 +684,7 @@ LogicalResult decomposeInlineRNNLayers(func::FuncOp func) {
   SmallVector<NNRNNLayerOp> layers;
   func.walk([&](NNRNNLayerOp op) { layers.push_back(op); });
   for (NNRNNLayerOp op : layers) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerRNNLayerOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline RNN layer");
       return failure();

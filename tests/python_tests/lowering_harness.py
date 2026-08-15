@@ -34,8 +34,15 @@ warnings.filterwarnings(
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ANALOG_ROOT = REPOSITORY_ROOT.parent.parent
-DEFAULT_SCULPTOR_OPT = (
-    ANALOG_ROOT / "build" / "sculptor-mlir-pivot" / "bin" / "sculptor-mlir-opt"
+DEFAULT_SCULPTOR_OPT = Path(
+    os.environ.get(
+        "SCULPTOR_MLIR_OPT",
+        ANALOG_ROOT
+        / "build"
+        / "sculptor-mlir-pivot"
+        / "bin"
+        / "sculptor-mlir-opt",
+    )
 )
 DEFAULT_TORCH_MLIR_PACKAGE = (
     ANALOG_ROOT / "build" / "torch-mlir" / "python_packages" / "torch_mlir"
@@ -70,6 +77,11 @@ class LoweringCase:
     preserve_layer_norm: bool = False
     external_linalg_lowering: bool = False
     duplicate_matrices: bool = False
+    matrix_replication_array_capacity: int = 0
+    matrix_minimum_mvms_per_replica: int = 1
+    matrix_maximum_replicas_per_setup: int = 0
+    sequence_shard_rows: int = 0
+    sequence_shard_bytes: int = 0
 
 
 def initialize_parameters(model: torch.nn.Module) -> None:
@@ -135,6 +147,28 @@ def export_linalg(case: LoweringCase) -> str:
     return result.stdout
 
 
+def duplicate_matrices_option(case: LoweringCase) -> str:
+    option = "--sculptor-duplicate-matrices"
+    values: list[str] = []
+    if case.matrix_replication_array_capacity:
+        values.append(
+            f"array-capacity={case.matrix_replication_array_capacity}"
+        )
+    if case.matrix_minimum_mvms_per_replica != 1:
+        values.append(
+            "minimum-mvms-per-replica="
+            f"{case.matrix_minimum_mvms_per_replica}"
+        )
+    if case.matrix_maximum_replicas_per_setup:
+        values.append(
+            "maximum-replicas-per-setup="
+            f"{case.matrix_maximum_replicas_per_setup}"
+        )
+    if values:
+        option += "=" + " ".join(values)
+    return option
+
+
 def lower_to_ra_tree(case: LoweringCase, digital_workers: int | None = None) -> str:
     """Run the complete pre-placement pivot lowering for one model."""
 
@@ -150,11 +184,13 @@ def lower_to_ra_tree(case: LoweringCase, digital_workers: int | None = None) -> 
         "--sculptor-convert-layers",
         (
             "--sculptor-expand-mvm-to-golem="
-            f"array-rows={case.array_rows} array-cols={case.array_cols}"
+            f"array-rows={case.array_rows} array-cols={case.array_cols} "
+            f"sequence-shard-rows={case.sequence_shard_rows} "
+            f"sequence-shard-bytes={case.sequence_shard_bytes}"
         ),
     ]
     if case.duplicate_matrices:
-        command.append("--sculptor-duplicate-matrices")
+        command.append(duplicate_matrices_option(case))
     if digital_workers is not None:
         command.append(
             "--sculptor-expand-digital-work="
@@ -188,6 +224,8 @@ def lower_to_logical_tile_placement(
     setup_binding_policy: str = "global",
     digital_workers: int | None = None,
     balance_digital_work: bool = False,
+    digital_scheduling_policy: str | None = None,
+    tile_memory_capacity_bytes: int = 0,
 ) -> str:
     """Lower one model through configurable greedy logical-tile placement."""
 
@@ -203,11 +241,13 @@ def lower_to_logical_tile_placement(
         "--sculptor-convert-layers",
         (
             "--sculptor-expand-mvm-to-golem="
-            f"array-rows={case.array_rows} array-cols={case.array_cols}"
+            f"array-rows={case.array_rows} array-cols={case.array_cols} "
+            f"sequence-shard-rows={case.sequence_shard_rows} "
+            f"sequence-shard-bytes={case.sequence_shard_bytes}"
         ),
     ]
     if case.duplicate_matrices:
-        command.append("--sculptor-duplicate-matrices")
+        command.append(duplicate_matrices_option(case))
     if digital_workers is not None:
         command.append(
             "--sculptor-expand-digital-work="
@@ -221,21 +261,30 @@ def lower_to_logical_tile_placement(
         f"arrays-per-core={case.arrays_per_core} "
         f"array-rows={case.array_rows} array-cols={case.array_cols}"
     )
-    if balance_digital_work:
+    if digital_scheduling_policy is not None:
+        plan_options += (
+            f" digital-scheduling-policy={digital_scheduling_policy}"
+        )
+    elif balance_digital_work:
         plan_options += " balance-digital-work"
+    placement_options = (
+        "--sculptor-place-logical-tiles=schedule=greedy "
+        f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
+        f"arrays-per-core={case.arrays_per_core} "
+        f"greedy-tile-order={tile_order} "
+        f"greedy-priority-mode={priority_mode} "
+        f"greedy-candidate-scope={candidate_scope} "
+        f"greedy-lookahead={lookahead}"
+    )
+    if tile_memory_capacity_bytes:
+        placement_options += (
+            f" tile-memory-capacity-bytes={tile_memory_capacity_bytes}"
+        )
     command.extend(
         [
             "--sculptor-build-ra-tree",
             f"--sculptor-plan-mapping={plan_options}",
-            (
-                "--sculptor-place-logical-tiles=schedule=greedy "
-                f"mesh-rows={case.mesh_rows} mesh-cols={case.mesh_cols} "
-                f"arrays-per-core={case.arrays_per_core} "
-                f"greedy-tile-order={tile_order} "
-                f"greedy-priority-mode={priority_mode} "
-                f"greedy-candidate-scope={candidate_scope} "
-                f"greedy-lookahead={lookahead}"
-            ),
+            placement_options,
         ]
     )
     result = subprocess.run(
@@ -271,10 +320,13 @@ def lower_to_tile_object(
     case: LoweringCase,
     output_dir: Path | None = None,
     digital_workers: int | None = None,
+    digital_dataflow: str = "bulk",
     mapping_strategies: str = "setup-first",
     mvm_body_policy: str = "spread",
     setup_binding_policy: str = "global",
     balance_digital_work: bool = False,
+    digital_scheduling_policy: str | None = None,
+    sequence_waves_in_flight: int = 1,
     compile_all_active_tiles: bool = False,
 ) -> Path:
     """Lower one Python fixture through the pivot tile ABI to a RISC-V object.
@@ -325,15 +377,17 @@ def lower_to_tile_object(
         "--sculptor-convert-layers",
         (
             "--sculptor-expand-mvm-to-golem="
-            f"array-rows={case.array_rows} array-cols={case.array_cols}"
+            f"array-rows={case.array_rows} array-cols={case.array_cols} "
+            f"sequence-shard-rows={case.sequence_shard_rows} "
+            f"sequence-shard-bytes={case.sequence_shard_bytes}"
         ),
     ]
     if case.duplicate_matrices:
-        ra_command.append("--sculptor-duplicate-matrices")
+        ra_command.append(duplicate_matrices_option(case))
     if digital_workers is not None:
         ra_command.append(
             "--sculptor-expand-digital-work="
-            f"parallel-workers={digital_workers}"
+            f"parallel-workers={digital_workers} dataflow={digital_dataflow}"
         )
     ra_command.extend(["--sculptor-build-ra-tree", "-o", path("01-ra.mlir")])
     _run_sculptor_stage(
@@ -348,7 +402,11 @@ def lower_to_tile_object(
         f"arrays-per-core={case.arrays_per_core} "
         f"array-rows={case.array_rows} array-cols={case.array_cols}"
     )
-    if balance_digital_work:
+    if digital_scheduling_policy is not None:
+        plan_options += (
+            f" digital-scheduling-policy={digital_scheduling_policy}"
+        )
+    elif balance_digital_work:
         plan_options += " balance-digital-work"
     _run_sculptor_stage(
         [
@@ -378,7 +436,10 @@ def lower_to_tile_object(
         [
             str(sculptor_opt),
             path("03-placed.mlir"),
-            "--sculptor-outline-tile-routines",
+            (
+                "--sculptor-outline-tile-routines="
+                f"sequence-waves-in-flight={sequence_waves_in_flight}"
+            ),
             "-o",
             path("04-outlined.mlir"),
         ],
@@ -436,6 +497,7 @@ def lower_to_tile_object(
                 str(sculptor_opt),
                 runtime,
                 "--sculptor-finalize-tile-runtime-graph",
+                "--sculptor-report-tile-memory=stage=finalized",
                 "-o",
                 finalized,
             ],
@@ -453,10 +515,13 @@ def lower_to_tile_object(
                 "function-boundary-type-conversion=identity-layout-map",
                 "--buffer-results-to-out-params=hoist-static-allocs",
                 "--convert-bufferization-to-memref",
+                "--sculptor-bind-tile-routine-destinations",
                 "--buffer-hoisting",
                 "--buffer-loop-hoisting",
                 "--buffer-deallocation-pipeline",
                 "--optimize-allocation-liveness",
+                "--sculptor-audit-tile-bufferization",
+                "--sculptor-vectorize-tile-copies=vector-bits=256",
                 "--convert-linalg-to-loops",
                 "--lower-affine",
                 "--convert-scf-to-cf",
@@ -471,6 +536,7 @@ def lower_to_tile_object(
                 "--finalize-memref-to-llvm",
                 "--convert-func-to-llvm",
                 "--reconcile-unrealized-casts",
+                "--sculptor-report-tile-memory=stage=llvm",
                 "-o",
                 llvm_dialect,
             ],

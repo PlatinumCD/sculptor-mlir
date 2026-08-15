@@ -174,6 +174,59 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     .decision-selected { color: var(--success); font-weight: 750; }
     .decision-rejected { color: var(--muted); }
 
+    .digital-summary {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .digital-summary-heading {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 10px 13px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-alt);
+      font-size: 12px;
+    }
+    .digital-summary-heading strong { font-weight: 750; }
+    .digital-summary-heading span { color: var(--muted); text-align: right; }
+    .digital-summary-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.8fr) minmax(320px, .8fr);
+      min-height: 250px;
+    }
+    .digital-chart-wrap {
+      min-width: 0;
+      padding: 14px 16px 10px;
+      border-right: 1px solid var(--line);
+    }
+    #digital-load-chart { display: block; width: 100%; height: 220px; }
+    .digital-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin: 0;
+    }
+    .digital-stat {
+      min-width: 0;
+      padding: 12px 13px;
+      border-right: 1px solid #e4e7eb;
+      border-bottom: 1px solid #e4e7eb;
+    }
+    .digital-stat:nth-child(even) { border-right: 0; }
+    .digital-stat dt {
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    .digital-stat dd {
+      margin: 5px 0 0;
+      font-size: 16px;
+      font-weight: 750;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+
     .workbench {
       margin-top: 12px;
       border: 1px solid var(--line);
@@ -453,6 +506,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     .swatch { width: 12px; height: 12px; border: 1px solid rgba(0, 0, 0, .18); }
     .swatch.temporal { background: var(--temporal); }
     .swatch.spatial { background: var(--spatial); }
+    .swatch.tagged-layer { background: #b8860b; }
+    .swatch.fallback-layer { background: #c75b7a; }
     .swatch.leaf { background: #4c8a68; }
     .swatch.dependency { background: var(--dependency); }
     .swatch.setup { background: #245f8f; }
@@ -486,6 +541,10 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       .metrics { grid-template-columns: repeat(2, 1fr); }
       .baseline-note { flex-direction: column; }
       .plan-summary-heading { flex-direction: column; }
+      .digital-summary-heading { flex-direction: column; }
+      .digital-summary-heading span { text-align: left; }
+      .digital-summary-grid { grid-template-columns: 1fr; }
+      .digital-chart-wrap { border-right: 0; border-bottom: 1px solid var(--line); }
       .plan-table thead { display: none; }
       .plan-table, .plan-table tbody, .plan-table tr { display: block; }
       .plan-table tr {
@@ -577,6 +636,30 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       </table>
     </section>
 
+    <section id="digital-summary" class="digital-summary" hidden>
+      <div class="digital-summary-heading">
+        <strong id="digital-summary-title">Digital assignment distribution</strong>
+        <span id="digital-summary-detail"></span>
+      </div>
+      <div class="digital-summary-grid">
+        <div class="digital-chart-wrap">
+          <canvas id="digital-load-chart" aria-label="Digital assignments by logical tile"></canvas>
+        </div>
+        <dl class="digital-stats">
+          <div class="digital-stat"><dt>Scheduling policy</dt><dd id="digital-policy">-</dd></div>
+          <div class="digital-stat"><dt>Active digital tiles</dt><dd id="digital-active-tiles">-</dd></div>
+          <div class="digital-stat"><dt>Median assignments</dt><dd id="digital-median">-</dd></div>
+          <div class="digital-stat"><dt>P99 assignments</dt><dd id="digital-p99">-</dd></div>
+          <div class="digital-stat"><dt>Maximum assignments</dt><dd id="digital-maximum">-</dd></div>
+          <div class="digital-stat"><dt>Maximum / mean</dt><dd id="digital-imbalance">-</dd></div>
+          <div class="digital-stat"><dt>Cross-tile dependencies</dt><dd id="digital-cross-dependencies">-</dd></div>
+          <div class="digital-stat"><dt>Cross-tile bytes</dt><dd id="digital-cross-bytes">-</dd></div>
+          <div class="digital-stat"><dt>Cross-tile dependency share</dt><dd id="digital-cross-share">-</dd></div>
+          <div class="digital-stat"><dt>Placed hop-weighted bytes</dt><dd id="digital-hop-bytes">-</dd></div>
+        </dl>
+      </div>
+    </section>
+
     <section class="baseline-note">
       <strong id="tree-profile">Tree profile</strong>
       <span id="tree-profile-detail"></span>
@@ -592,7 +675,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
             <button type="button" data-view="physical">Physical mesh</button>
           </div>
           <label class="block-control">
-            <span class="control-label">Semantic block</span>
+            <span class="control-label">Layer / block</span>
             <select id="block-select"></select>
           </label>
           <button id="toggle-setup-fill" class="toggle-active" type="button"
@@ -662,6 +745,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       <div class="legend">
         <span><i class="swatch temporal"></i>Temporal cut</span>
         <span><i class="swatch spatial"></i>Spatial cut</span>
+        <span><i class="swatch tagged-layer"></i>Tagged layer</span>
+        <span><i class="swatch fallback-layer"></i>Fallback layer</span>
         <span><i class="swatch leaf"></i>Operation leaf</span>
         <span><i class="swatch dependency"></i>Tensor dependency</span>
         <span><i class="swatch setup"></i>Matrix setup</span>
@@ -704,6 +789,11 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     let dragging = null;
     let annealingFrame = 0;
     let annealingTimer = null;
+    let drawFrame = 0;
+    let viewportPreviewFrame = 0;
+    let viewportPreviewTimer = null;
+    let viewportPreview = null;
+    const viewportPreviewCanvas = document.createElement("canvas");
     const activePointers = new Map();
     let pinchGesture = null;
 
@@ -715,6 +805,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     const annealingChart = document.querySelector("#annealing-chart");
     const annealingSlider = document.querySelector("#annealing-slider");
     const annealingReplay = document.querySelector("#annealing-replay");
+    const digitalSummary = document.querySelector("#digital-summary");
+    const digitalLoadChart = document.querySelector("#digital-load-chart");
 
     function escapeHTML(value) {
       return String(value)
@@ -730,7 +822,9 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       if (!Number.isFinite(value) || value < 0) return "dynamic";
       if (value < 1024) return `${value} B`;
       if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-      return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
+      if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(2)} MiB`;
+      if (value < 1024 ** 4) return `${(value / 1024 ** 3).toFixed(2)} GiB`;
+      return `${(value / 1024 ** 4).toFixed(2)} TiB`;
     }
 
     function formatNanoseconds(value) {
@@ -738,6 +832,148 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       if (value < 1000) return `${value.toFixed(2)} ns`;
       if (value < 1e6) return `${(value / 1000).toFixed(2)} µs`;
       return `${(value / 1e6).toFixed(2)} ms`;
+    }
+
+    function percentile(sortedValues, fraction) {
+      if (!sortedValues.length) return 0;
+      return sortedValues[Math.max(0, Math.ceil(sortedValues.length * fraction) - 1)];
+    }
+
+    function digitalDistribution(func) {
+      const counts = func.logicalTileGraph.tiles.map(tile =>
+        tile.digital_assignments.length
+      );
+      const sorted = [...counts].sort((left, right) => left - right);
+      const crossDependencies = func.logicalTileGraph.edges.reduce(
+        (sum, edge) => sum + edge.dependencies.length, 0
+      );
+      const internalDependencies = func.logicalTileGraph.tiles.reduce(
+        (sum, tile) => sum + tile.internal_dependencies.length, 0
+      );
+      const totalDependencies = crossDependencies + internalDependencies;
+      const totalAssignments = counts.reduce((sum, count) => sum + count, 0);
+      const mean = counts.length ? totalAssignments / counts.length : 0;
+      return {
+        counts,
+        active: counts.filter(count => count > 0).length,
+        mean,
+        median: percentile(sorted, .5),
+        p99: percentile(sorted, .99),
+        maximum: sorted.at(-1) || 0,
+        crossDependencies,
+        crossBytes: func.logicalTileGraph.edges.reduce(
+          (sum, edge) => sum + edge.byte_size, 0
+        ),
+        crossShare: totalDependencies ? crossDependencies / totalDependencies : 0,
+      };
+    }
+
+    function renderDigitalLoadChart() {
+      if (digitalSummary.hidden || !currentFunction) return;
+      const distribution = digitalDistribution(currentFunction);
+      const rect = digitalLoadChart.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      digitalLoadChart.width = Math.max(1, Math.round(rect.width * ratio));
+      digitalLoadChart.height = Math.max(1, Math.round(rect.height * ratio));
+      const ctx = digitalLoadChart.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const margin = {left: 46, right: 12, top: 10, bottom: 31};
+      const width = Math.max(1, rect.width - margin.left - margin.right);
+      const height = Math.max(1, rect.height - margin.top - margin.bottom);
+      const maximum = Math.max(1, distribution.maximum);
+      const y = value => margin.top + height - value / maximum * height;
+
+      ctx.strokeStyle = "#d9dee5";
+      ctx.fillStyle = "#647080";
+      ctx.font = "10px Inter, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let index = 0; index <= 4; ++index) {
+        const value = Math.round(maximum * index / 4);
+        const lineY = y(value);
+        ctx.beginPath();
+        ctx.moveTo(margin.left, lineY);
+        ctx.lineTo(margin.left + width, lineY);
+        ctx.stroke();
+        ctx.fillText(value.toLocaleString(), margin.left - 7, lineY);
+      }
+
+      const barWidth = width / Math.max(1, distribution.counts.length);
+      ctx.fillStyle = "#2f6ea5";
+      distribution.counts.forEach((count, index) => {
+        const barHeight = Math.max(count > 0 ? 1 : 0, count / maximum * height);
+        ctx.fillRect(
+          margin.left + index * barWidth,
+          margin.top + height - barHeight,
+          Math.max(.7, barWidth - Math.min(1, barWidth * .12)),
+          barHeight
+        );
+      });
+
+      const drawReference = (value, color, label) => {
+        const lineY = y(value);
+        ctx.strokeStyle = color;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(margin.left, lineY);
+        ctx.lineTo(margin.left + width, lineY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(`${label} ${value.toLocaleString()}`, margin.left + 5, lineY - 2);
+      };
+      drawReference(distribution.median, "#237052", "median");
+      drawReference(distribution.p99, "#a85d13", "p99");
+
+      ctx.fillStyle = "#647080";
+      ctx.textBaseline = "top";
+      ctx.textAlign = "left";
+      ctx.fillText("logical tile 0", margin.left, margin.top + height + 8);
+      ctx.textAlign = "right";
+      ctx.fillText(
+        `logical tile ${Math.max(0, distribution.counts.length - 1)}`,
+        margin.left + width,
+        margin.top + height + 8
+      );
+    }
+
+    function renderDigitalSummary() {
+      const tiles = currentFunction.logicalTileGraph.tiles;
+      digitalSummary.hidden = tiles.length === 0;
+      if (!tiles.length) return;
+      const distribution = digitalDistribution(currentFunction);
+      const policy = currentFunction.plan?.digital_scheduling_policy || "affinity";
+      document.querySelector("#digital-summary-title").textContent =
+        "Digital assignments by logical tile";
+      document.querySelector("#digital-summary-detail").textContent =
+        "Load spreading exposes parallelism; cross-tile dependencies measure the communication it creates.";
+      document.querySelector("#digital-policy").textContent =
+        currentFunction.plan?.digital_window_size
+          ? `${policy} (${currentFunction.plan.digital_window_size})`
+          : policy;
+      document.querySelector("#digital-active-tiles").textContent =
+        `${distribution.active.toLocaleString()} / ${tiles.length.toLocaleString()}`;
+      document.querySelector("#digital-median").textContent = distribution.median.toLocaleString();
+      document.querySelector("#digital-p99").textContent = distribution.p99.toLocaleString();
+      document.querySelector("#digital-maximum").textContent = distribution.maximum.toLocaleString();
+      document.querySelector("#digital-imbalance").textContent = distribution.mean
+        ? `${(distribution.maximum / distribution.mean).toFixed(2)}×`
+        : "-";
+      document.querySelector("#digital-cross-dependencies").textContent =
+        distribution.crossDependencies.toLocaleString();
+      document.querySelector("#digital-cross-bytes").textContent =
+        formatBytes(distribution.crossBytes);
+      document.querySelector("#digital-cross-share").textContent =
+        `${(distribution.crossShare * 100).toFixed(1)}%`;
+      document.querySelector("#digital-hop-bytes").textContent =
+        currentFunction.physicalPlacement
+          ? formatBytes(currentFunction.physicalPlacement.total_transfer_cost)
+          : "unplaced";
+      renderDigitalLoadChart();
     }
 
     function semanticBlock(operation) {
@@ -774,6 +1010,11 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     function nodeColor(node) {
       if (node.aggregate) return node.aggregateColor;
       if (node.logicalTile) return physicalTileColor(node.logicalTile);
+      if (node.kind === "layer") {
+        const regionId = node.treeNode?.layer_region_id;
+        const region = currentFunction?.layerRegionMap.get(regionId);
+        return region?.semantic_layer_id >= 0 ? "#b8860b" : "#c75b7a";
+      }
       if (node.kind === "temporal_cut") return "#a85d13";
       if (node.kind === "spatial_cut") return "#2669a7";
       if (node.realization) {
@@ -788,19 +1029,26 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       if (node.operation?.kind === "analog_mvm" ||
           node.operation?.kind === "physical_mvm") return "#7c3aed";
       if (node.operation?.kind === "tile_recombine") return "#a85d13";
-      const block = semanticBlock(node.operation);
-      return block === null ? "#4c8a68" : palette[Math.abs(block) % palette.length];
+      return "#4c8a68";
     }
 
     function nodeVisible(node) {
       if (node.aggregate) return true;
       if (node.logicalTile) return true;
       if (blockFilter === "all" || !node.operation) return true;
-      return String(semanticBlock(node.operation)) === blockFilter;
+      if (blockFilter.startsWith("layer:"))
+        return String(node.operation.layer_region_id) === blockFilter.slice(6);
+      if (blockFilter.startsWith("block:"))
+        return String(semanticBlock(node.operation)) === blockFilter.slice(6);
+      return true;
     }
 
     function mapFunctionData(func) {
       func.operationMap = new Map(func.operations.map(operation => [operation.id, operation]));
+      func.layerRegions = func.layer_regions || [];
+      func.layerRegionMap = new Map(
+        func.layerRegions.map(region => [region.id, region])
+      );
       func.tensorMap = new Map(func.tensors.map(tensor => [tensor.id, tensor]));
       func.mvmWaves = func.mvm_waves || [];
       func.mvmWaveMap = new Map(func.mvmWaves.map(wave => [wave.id, wave]));
@@ -830,9 +1078,15 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         logical_tile_count: 0,
         analog_lanes_per_tile: 0,
         digital_work_per_tile: [],
+        layer_tile_pools: [],
         node_allocations: [],
         leaf_assignments: [],
       };
+      func.layerTilePoolMap = new Map(
+        (func.mappingRealization.layer_tile_pools || []).map(pool =>
+          [pool.layer_region_id, pool]
+        )
+      );
       func.mappingNodeAllocationMap = new Map(
         func.mappingRealization.node_allocations.map(allocation =>
           [allocation.node_id, allocation]
@@ -911,6 +1165,20 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
 
     function getRenderedLayout() {
       return layout;
+    }
+
+    function prepareLayoutForRendering(activeLayout) {
+      const linksByNode = new Map(
+        activeLayout.nodes.map(node => [node, []])
+      );
+      for (const link of activeLayout.links) {
+        linksByNode.get(link.source)?.push(link);
+        if (link.target !== link.source)
+          linksByNode.get(link.target)?.push(link);
+      }
+      activeLayout.linksByNode = linksByNode;
+      activeLayout.visibleNodes = activeLayout.nodes;
+      return activeLayout;
     }
 
     const realizationKindOrder = [
@@ -1554,6 +1822,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         },
         timelineBounds,
         resourceLaneCount: laneKeys.length,
+        laneCoordinates: laneKeys.map(lane => lane.y),
         laneLabels,
         tileRanges: [...tileRanges.values()],
         timeGuides,
@@ -1708,6 +1977,10 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
           return {nodes: [], width: 0, height: 0};
         const childIds = childEntries.map(entry => entry.childId);
         const childLayouts = childEntries.map(entry => entry.layout);
+        // Layer nodes carry semantic ownership only. They must not introduce
+        // an S/T scheduling dimension into the inferred execution view.
+        if (treeNode.kind === "layer")
+          return childLayouts[0];
         if (treeNode.kind === "temporal_cut") {
           const height = Math.max(...childLayouts.map(child => child.height), leafHeight);
           let cursor = 0;
@@ -1803,6 +2076,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         links,
         bounds: calculateBounds(arranged.nodes),
         resourceLaneCount: laneCoordinates.length,
+        laneCoordinates,
         cyclicSpatialDependency,
       };
     }
@@ -1878,6 +2152,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       else if (currentView === "dag") layout = buildDAGLayout(currentFunction);
       else if (currentView === "physical") layout = buildPhysicalLayout(currentFunction);
       else layout = buildSTLayout(currentFunction);
+      prepareLayoutForRendering(layout);
       renderedLayout = layout;
       updateViewExplanation();
       if (fit) fitView(true);
@@ -2063,6 +2338,69 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       return {width: rect.width, height: rect.height};
     }
 
+    function captureViewportPreview() {
+      const size = canvasSize();
+      viewportPreviewCanvas.width = canvas.width;
+      viewportPreviewCanvas.height = canvas.height;
+      const previewContext = viewportPreviewCanvas.getContext("2d");
+      previewContext.setTransform(1, 0, 0, 1, 0, 0);
+      previewContext.clearRect(
+        0, 0, viewportPreviewCanvas.width, viewportPreviewCanvas.height
+      );
+      previewContext.drawImage(canvas, 0, 0);
+      viewportPreview = {
+        x: viewport.x,
+        y: viewport.y,
+        scale: viewport.scale,
+        width: size.width,
+        height: size.height,
+      };
+    }
+
+    function drawViewportPreview() {
+      if (!viewportPreview) return;
+      const size = canvasSize();
+      const ratio = window.devicePixelRatio || 1;
+      const scale = viewport.scale / viewportPreview.scale;
+      const offsetX = viewport.x - viewportPreview.x * scale;
+      const offsetY = viewport.y - viewportPreview.y * scale;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, size.width, size.height);
+      context.save();
+      context.translate(offsetX, offsetY);
+      context.scale(scale, scale);
+      context.drawImage(
+        viewportPreviewCanvas,
+        0, 0, viewportPreviewCanvas.width, viewportPreviewCanvas.height,
+        0, 0, viewportPreview.width, viewportPreview.height
+      );
+      context.restore();
+    }
+
+    function scheduleViewportPreview() {
+      if (viewportPreviewFrame) return;
+      viewportPreviewFrame = window.requestAnimationFrame(() => {
+        viewportPreviewFrame = 0;
+        drawViewportPreview();
+      });
+    }
+
+    function beginViewportInteraction() {
+      if (!viewportPreview) captureViewportPreview();
+      if (viewportPreviewTimer !== null)
+        window.clearTimeout(viewportPreviewTimer);
+      viewportPreviewTimer = window.setTimeout(finishViewportInteraction, 120);
+    }
+
+    function finishViewportInteraction() {
+      if (viewportPreviewTimer !== null) {
+        window.clearTimeout(viewportPreviewTimer);
+        viewportPreviewTimer = null;
+      }
+      viewportPreview = null;
+      draw();
+    }
+
     function projectTreeLayout(size) {
       if (currentView !== "tree" || !layout.ordered) return;
       const scale = Math.max(viewport.scale, .000001);
@@ -2097,6 +2435,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     }
 
     function resizeCanvas() {
+      viewportPreview = null;
       const size = canvasSize();
       const ratio = window.devicePixelRatio || 1;
       canvas.width = Math.max(1, Math.floor(size.width * ratio));
@@ -2164,8 +2503,9 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     function nodeAt(clientX, clientY) {
       const point = worldPoint(clientX, clientY);
       const activeLayout = getRenderedLayout();
-      for (let index = activeLayout.nodes.length - 1; index >= 0; --index) {
-        const node = activeLayout.nodes[index];
+      const candidates = activeLayout.visibleNodes || activeLayout.nodes;
+      for (let index = candidates.length - 1; index >= 0; --index) {
+        const node = candidates[index];
         if (point.x >= node.x - node.width / 2 && point.x <= node.x + node.width / 2 &&
             point.y >= node.y - node.height / 2 && point.y <= node.y + node.height / 2) {
           return node;
@@ -2230,8 +2570,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
 
     function drawSTGuides(ctx, activeLayout) {
       if (currentView !== "st" || viewport.scale < .04) return;
-      const laneCoordinates = [...new Set(activeLayout.nodes.map(node => node.y))]
-        .sort((left, right) => left - right);
+      const laneCoordinates = activeLayout.laneCoordinates || [];
       const bounds = activeLayout.timelineBounds || activeLayout.bounds;
       ctx.save();
       for (const [index, tile] of (activeLayout.tileRanges || []).entries()) {
@@ -2446,6 +2785,17 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         return `LOGICAL ${node.logicalTile.id}`;
       if (node.realization) return `stage ${node.realization.stage_index}`;
       if (!node.operation) {
+        if (node.kind === "layer") {
+          const regionId = node.treeNode?.layer_region_id ?? -1;
+          const region = currentFunction?.layerRegionMap.get(regionId);
+          if (region?.semantic_layer_id >= 0) {
+            const kind = region.semantic_layer_kind
+              ? ` · ${region.semantic_layer_kind}`
+              : "";
+            return `LAYER ${region.semantic_layer_id}${kind}`;
+          }
+          return regionId >= 0 ? `LAYER REGION ${regionId}` : `LAYER ${node.id}`;
+        }
         const waveId = node.treeNode?.mvm_wave_id ?? -1;
         if (waveId >= 0) {
           return node.kind === "temporal_cut"
@@ -2504,7 +2854,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       }
       ctx.strokeStyle = selected || hovered
         ? "#111827"
-        : node.aggregate ? node.aggregateColor : "rgba(24, 32, 43, .48)";
+        : node.aggregate ? node.aggregateColor
+        : "rgba(24, 32, 43, .48)";
       ctx.lineWidth = node.aggregate
         ? (selected ? 3 : hovered ? 2 : 1.2) / viewport.scale
         : (selected ? 3 : hovered ? 2 : 1) / viewport.scale;
@@ -2647,9 +2998,23 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       const visibleNodes = renderedLayout.nodes.filter(node =>
         nodeIntersectsBounds(node, visibleBounds)
       );
-      const visibleLinks = renderedLayout.links.filter(link =>
-        linkIntersectsBounds(link, visibleBounds)
-      );
+      renderedLayout.visibleNodes = visibleNodes;
+      let visibleLinks;
+      if (renderedLayout.linksByNode &&
+          visibleNodes.length < renderedLayout.nodes.length / 2) {
+        const candidates = new Set();
+        for (const node of visibleNodes) {
+          for (const link of renderedLayout.linksByNode.get(node) || [])
+            candidates.add(link);
+        }
+        visibleLinks = [...candidates].filter(link =>
+          linkIntersectsBounds(link, visibleBounds)
+        );
+      } else {
+        visibleLinks = renderedLayout.links.filter(link =>
+          linkIntersectsBounds(link, visibleBounds)
+        );
+      }
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.clearRect(0, 0, size.width, size.height);
       context.save();
@@ -2689,7 +3054,15 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         scaleLabel;
     }
 
-    function zoomAt(factor, clientX, clientY) {
+    function scheduleDraw() {
+      if (drawFrame) return;
+      drawFrame = window.requestAnimationFrame(() => {
+        drawFrame = 0;
+        draw();
+      });
+    }
+
+    function zoomAt(factor, clientX, clientY, preview = false) {
       const rect = canvas.getBoundingClientRect();
       const x = clientX - rect.left;
       const y = clientY - rect.top;
@@ -2709,7 +3082,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       } else {
         viewport.y = y - worldY * viewport.scale;
       }
-      draw();
+      if (preview) scheduleViewportPreview();
+      else draw();
     }
 
     function pointerDistance(first, second) {
@@ -2746,6 +3120,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       const midpointY = (first.y + second.y) / 2 - rect.top;
       const scale = pinchGesture.startScale *
         pointerDistance(first, second) / pinchGesture.startDistance;
+      beginViewportInteraction();
       viewport.scale = Math.min(
         6,
         Math.max(currentView === "tree" ? .0001 : .02, scale)
@@ -2760,7 +3135,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       } else {
         viewport.y = midpointY - pinchGesture.worldY * viewport.scale;
       }
-      draw();
+      scheduleViewportPreview();
       return true;
     }
 
@@ -2796,7 +3171,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
           dragging = null;
           canvas.classList.remove("dragging");
         }
-        draw();
+        if (viewportPreview) finishViewportInteraction();
+        else draw();
         return;
       }
 
@@ -2809,7 +3185,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         dragging = null;
       if (activePointers.size === 0)
         canvas.classList.remove("dragging");
-      draw();
+      if (viewportPreview) finishViewportInteraction();
+      else draw();
     }
 
     function centerNode(node) {
@@ -2957,7 +3334,22 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       html += `<dt>Work groups</dt><dd>${treeNode?.work_group_count ?? 1}</dd>`;
       html += `<dt>Work unit</dt><dd>${workUnit?.id ?? "-"}</dd>`;
       html += `<dt>MVM wave</dt><dd>${(treeNode?.mvm_wave_id ?? -1) >= 0 ? treeNode.mvm_wave_id : "-"}</dd>`;
+      html += `<dt>Layer region</dt><dd>${(treeNode?.layer_region_id ?? -1) >= 0 ? treeNode.layer_region_id : "-"}</dd>`;
       html += `</dl></section>`;
+
+      if (treeNode?.kind === "layer") {
+        const layerRegion = currentFunction.layerRegionMap.get(
+          treeNode.layer_region_id
+        );
+        if (layerRegion) {
+          html += `<section class="detail-section"><h3>Semantic layer</h3><dl class="detail-grid">`;
+          html += `<dt>Region</dt><dd>${layerRegion.id}</dd>`;
+          html += `<dt>Stable layer</dt><dd>${layerRegion.semantic_layer_id >= 0 ? layerRegion.semantic_layer_id : "fallback"}</dd>`;
+          html += `<dt>Kind</dt><dd>${escapeHTML(layerRegion.semantic_layer_kind || "unknown")}</dd>`;
+          html += `<dt>Operations</dt><dd>${layerRegion.operation_ids.length}</dd>`;
+          html += `</dl></section>`;
+        }
+      }
 
       if (workUnit) {
         html += `<section class="detail-section"><h3>Selected tile</h3><dl class="detail-grid">`;
@@ -2988,6 +3380,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         html += `<dt>ID</dt><dd>${operation.id}</dd>`;
         html += `<dt>Name</dt><dd>${escapeHTML(operation.name)}</dd>`;
         html += `<dt>Kind</dt><dd>${escapeHTML(operation.kind)}</dd>`;
+        html += `<dt>Layer region</dt><dd>${operation.layer_region_id >= 0 ? operation.layer_region_id : "-"}</dd>`;
+        html += `<dt>Semantic layer</dt><dd>${operation.semantic_layer_id >= 0 ? `${operation.semantic_layer_id} · ${escapeHTML(operation.semantic_layer_kind || "unknown")}` : "fallback"}</dd>`;
         html += `<dt>Required lane</dt><dd>${escapeHTML(operation.required_lane)}</dd>`;
         html += `<dt>Lane-binding group</dt><dd>${operation.lane_binding_group >= 0 ? operation.lane_binding_group : "-"}</dd>`;
         const assignment = node.mappingAssignment;
@@ -2998,6 +3392,23 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         html += `<dt>Inputs</dt><dd>${operation.input_tensors.length}</dd>`;
         html += `<dt>Outputs</dt><dd>${operation.output_tensors.length}</dd>`;
         html += `</dl></section>`;
+
+        const layerRegion = currentFunction.layerRegionMap.get(
+          operation.layer_region_id
+        );
+        if (layerRegion) {
+          const tilePool = currentFunction.layerTilePoolMap.get(layerRegion.id);
+          html += `<section class="detail-section"><h3>Layer-region plan</h3><dl class="detail-grid">`;
+          html += `<dt>Operations</dt><dd>${layerRegion.operation_ids.length}</dd>`;
+          html += `<dt>Analog lanes</dt><dd>${layerRegion.analog_lane_demand}</dd>`;
+          html += `<dt>Digital work</dt><dd>${layerRegion.estimated_digital_work_items.toLocaleString()}</dd>`;
+          html += `<dt>Static memory</dt><dd>${formatBytes(layerRegion.estimated_static_memory_bytes)}</dd>`;
+          html += `<dt>Boundary input</dt><dd>${formatBytes(layerRegion.estimated_input_bytes)}</dd>`;
+          html += `<dt>Boundary output</dt><dd>${formatBytes(layerRegion.estimated_output_bytes)}</dd>`;
+          html += `<dt>Tile pool</dt><dd>${tilePool ? tilePool.tile_ids.join(", ") : "-"}</dd>`;
+          html += `<dt>Fallback</dt><dd>${layerRegion.singleton_fallback ? "yes" : "no"}</dd>`;
+          html += `</dl></section>`;
+        }
 
         if (operation.analog_mvm) {
           html += `<section class="detail-section"><h3>Logical analog MVM</h3><dl class="detail-grid">`;
@@ -3139,12 +3550,22 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     }
 
     function populateBlockFilter() {
+      const regions = currentFunction.layerRegions;
       const blocks = [...new Set(currentFunction.operations.map(semanticBlock).filter(value => value !== null))].sort((a, b) => a - b);
-      blockSelect.innerHTML = `<option value="all">All blocks</option>` + blocks.map(block => {
+      const layerOptions = regions.map(region => {
+        const identity = region.semantic_layer_id >= 0
+          ? `Layer ${region.semantic_layer_id} · ${region.semantic_layer_kind || "unknown"}`
+          : `Region ${region.id} · fallback`;
+        return `<option value="layer:${region.id}">${escapeHTML(identity)} (${region.operation_ids.length} ops)</option>`;
+      }).join("");
+      const blockOptions = blocks.map(block => {
         const operation = currentFunction.operations.find(candidate => semanticBlock(candidate) === block);
         const kind = operation?.semantic?.block_kind ? ` · ${operation.semantic.block_kind}` : "";
-        return `<option value="${block}">Block ${block}${escapeHTML(kind)}</option>`;
+        return `<option value="block:${block}">Block ${block}${escapeHTML(kind)}</option>`;
       }).join("");
+      blockSelect.innerHTML = `<option value="all">All layers and blocks</option>` +
+        (layerOptions ? `<optgroup label="Semantic layer regions">${layerOptions}</optgroup>` : "") +
+        (blockOptions ? `<optgroup label="Semantic blocks">${blockOptions}</optgroup>` : "");
       blockFilter = "all";
     }
 
@@ -3159,6 +3580,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       document.querySelector("#tree-profile-detail").textContent = isFlatTemporal
         ? `One temporal root with ${root.child_ids.length} direct operation leaves.`
         : `${currentFunction.tree.nodes.length} nodes across ${depth + 1} levels.`;
+      document.querySelector("#tree-profile-detail").textContent +=
+        ` ${currentFunction.layerRegions.length} explicit layer regions.`;
       if (currentFunction.realization.stage_count) {
         document.querySelector("#tree-profile-detail").textContent +=
           ` ${currentFunction.realization.stage_count} expanded Golem stages are overlaid.`;
@@ -3182,6 +3605,7 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       }
       document.querySelector("#metric-fingerprint").textContent = currentFunction.tree.fingerprint.slice(0, 16);
       renderPlanSummary();
+      renderDigitalSummary();
     }
 
     function renderPlanSummary() {
@@ -3380,7 +3804,13 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
     canvas.addEventListener("wheel", event => {
       event.preventDefault();
       const factor = currentView === "tree" ? 1.08 : 1.12;
-      zoomAt(event.deltaY < 0 ? factor : 1 / factor, event.clientX, event.clientY);
+      beginViewportInteraction();
+      zoomAt(
+        event.deltaY < 0 ? factor : 1 / factor,
+        event.clientX,
+        event.clientY,
+        true
+      );
     }, {passive: false});
     canvas.addEventListener("pointerdown", event => {
       event.preventDefault();
@@ -3408,15 +3838,17 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
         const dx = event.clientX - dragging.startX;
         const dy = event.clientY - dragging.startY;
         if (Math.abs(dx) + Math.abs(dy) > 3) dragging.moved = true;
+        beginViewportInteraction();
         viewport.x = dragging.viewX + dx;
         viewport.y = dragging.viewY + dy;
         tooltip.hidden = true;
-        draw();
+        scheduleViewportPreview();
         return;
       }
+      const previousHoveredNode = hoveredNode;
       hoveredNode = nodeAt(event.clientX, event.clientY);
       showTooltip(hoveredNode, event);
-      draw();
+      if (hoveredNode !== previousHoveredNode) scheduleDraw();
     });
     canvas.addEventListener("pointerup", event => finishPointer(event, false));
     canvas.addEventListener("pointercancel", event => finishPointer(event, true));
@@ -3434,6 +3866,8 @@ inline constexpr llvm::StringLiteral kRATreeReportHTML = R"HTML(<!doctype html>
       if (!annealingProgress.hidden) renderAnnealingFrame(annealingFrame);
     });
     annealingObserver.observe(annealingChart.parentElement);
+    const digitalChartObserver = new ResizeObserver(renderDigitalLoadChart);
+    digitalChartObserver.observe(digitalLoadChart.parentElement);
     loadFunction(0);
     resizeCanvas();
   </script>

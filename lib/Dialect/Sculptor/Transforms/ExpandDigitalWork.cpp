@@ -242,10 +242,29 @@ buildWorkUnitCandidate(const ComputeOperation &operation,
 
 SmallVector<WorkUnitCandidate, 0>
 buildWorkUnitCandidates(const ComputeOperation &operation,
-                        int64_t parallelWorkers, DigitalTilingPolicy policy,
+                        int64_t parallelWorkers,
+                        int64_t minimumWorkItemsPerUnit,
+                        DigitalTilingPolicy policy,
                         OpBuilder &builder) {
   SmallVector<WorkUnitCandidate, 0> result;
   if (!isExpandableDigitalOperation(operation))
+    return result;
+
+  int64_t totalWorkItems = 1;
+  for (const ComputeIterationDimension &dimension :
+       operation.iterationDomain) {
+    std::optional<int64_t> product =
+        llvm::checkedMul(totalWorkItems, dimension.staticExtent);
+    if (!product) {
+      totalWorkItems = std::numeric_limits<int64_t>::max();
+      break;
+    }
+    totalWorkItems = *product;
+  }
+  int64_t usefulWorkers = std::max<int64_t>(
+      1, totalWorkItems / minimumWorkItemsPerUnit);
+  parallelWorkers = std::min(parallelWorkers, usefulWorkers);
+  if (parallelWorkers < 2)
     return result;
 
   SmallVector<SmallVector<int64_t>> factorVectors;
@@ -284,33 +303,93 @@ std::optional<int64_t> getStaticTensorByteSize(Type type) {
   return bytes;
 }
 
-bool candidatePairHasOneToOneShards(const WorkUnitCandidate &producer,
-                                    const WorkUnitCandidate &consumer,
-                                    AffineMap consumerOperandMap) {
-  if (producer.units.size() != consumer.units.size())
-    return false;
-  SmallVector<bool> matchedConsumers(consumer.units.size(), false);
+std::optional<uint64_t>
+getCandidateShardPenalty(const WorkUnitCandidate &producer,
+                         const WorkUnitCandidate &consumer,
+                         AffineMap consumerOperandMap,
+                         int64_t fullTensorBytes) {
+  uint64_t sourceElements = 0;
   for (const WorkUnitSpec &source : producer.units) {
-    std::optional<size_t> matchingConsumer;
-    for (auto [consumerIndex, target] : llvm::enumerate(consumer.units)) {
-      if (matchedConsumers[consumerIndex])
-        continue;
-      std::optional<StaticTileRegion> inputRegion =
-          mapIterationTileThroughIndexingMap(consumerOperandMap,
-                                             target.iterationOffsets,
-                                             target.iterationSizes);
-      if (!inputRegion || inputRegion->offsets != source.resultOffsets ||
-          inputRegion->sizes != source.resultSizes)
-        continue;
-      if (matchingConsumer)
-        return false;
-      matchingConsumer = consumerIndex;
+    uint64_t elements = 1;
+    for (int64_t size : source.resultSizes) {
+      if (size <= 0 || elements > std::numeric_limits<uint64_t>::max() /
+                                      static_cast<uint64_t>(size))
+        return std::nullopt;
+      elements *= static_cast<uint64_t>(size);
     }
-    if (!matchingConsumer)
-      return false;
-    matchedConsumers[*matchingConsumer] = true;
+    if (sourceElements > std::numeric_limits<uint64_t>::max() - elements)
+      return std::nullopt;
+    sourceElements += elements;
   }
-  return llvm::all_of(matchedConsumers, [](bool matched) { return matched; });
+  if (sourceElements == 0 || fullTensorBytes < 0 ||
+      static_cast<uint64_t>(fullTensorBytes) % sourceElements != 0)
+    return std::nullopt;
+  uint64_t elementBytes =
+      static_cast<uint64_t>(fullTensorBytes) / sourceElements;
+
+  uint64_t routedElements = 0;
+  uint64_t intersections = 0;
+  for (const WorkUnitSpec &target : consumer.units) {
+    std::optional<StaticTileRegion> demand =
+        mapIterationTileThroughIndexingMap(consumerOperandMap,
+                                           target.iterationOffsets,
+                                           target.iterationSizes);
+    if (!demand)
+      return std::nullopt;
+    uint64_t demandedElements = 1;
+    for (int64_t size : demand->sizes) {
+      if (size <= 0 || demandedElements >
+                           std::numeric_limits<uint64_t>::max() /
+                               static_cast<uint64_t>(size))
+        return std::nullopt;
+      demandedElements *= static_cast<uint64_t>(size);
+    }
+    uint64_t coveredElements = 0;
+    for (const WorkUnitSpec &source : producer.units) {
+      uint64_t overlapElements = 1;
+      bool overlaps = true;
+      for (auto [sourceOffset, sourceSize, demandOffset, demandSize] :
+           llvm::zip_equal(source.resultOffsets, source.resultSizes,
+                           demand->offsets, demand->sizes)) {
+        int64_t begin = std::max(sourceOffset, demandOffset);
+        int64_t end =
+            std::min(sourceOffset + sourceSize, demandOffset + demandSize);
+        if (begin >= end) {
+          overlaps = false;
+          break;
+        }
+        uint64_t extent = static_cast<uint64_t>(end - begin);
+        if (overlapElements >
+            std::numeric_limits<uint64_t>::max() / extent)
+          return std::nullopt;
+        overlapElements *= extent;
+      }
+      if (!overlaps)
+        continue;
+      if (coveredElements >
+          std::numeric_limits<uint64_t>::max() - overlapElements)
+        return std::nullopt;
+      coveredElements += overlapElements;
+      ++intersections;
+    }
+    if (coveredElements != demandedElements ||
+        routedElements >
+            std::numeric_limits<uint64_t>::max() - demandedElements)
+      return std::nullopt;
+    routedElements += demandedElements;
+  }
+
+  if (routedElements > std::numeric_limits<uint64_t>::max() / elementBytes)
+    return std::nullopt;
+  uint64_t routedBytes = routedElements * elementBytes;
+  // Preserve byte volume as the primary objective and use the exact number of
+  // routed shard fragments as a deterministic message-overhead tiebreaker.
+  constexpr uint64_t kFragmentScale = 1024;
+  if (routedBytes >
+      (std::numeric_limits<uint64_t>::max() - intersections) /
+          kFragmentScale)
+    return std::nullopt;
+  return routedBytes * kFragmentScale + intersections;
 }
 
 SmallVector<CandidateCommunicationEdge> buildCandidateCommunicationEdges(
@@ -321,21 +400,6 @@ SmallVector<CandidateCommunicationEdge> buildCandidateCommunicationEdges(
     operationIds[operation.operation] = operation.id;
     for (Operation *member : operation.members)
       operationIds[member] = operation.id;
-  }
-
-  DenseMap<int64_t, llvm::DenseSet<int64_t>> producersByConsumer;
-  for (int64_t producerId : graph.topologicalOrder) {
-    if (!candidates.contains(producerId))
-      continue;
-    const ComputeOperation &producer = graph.operations[producerId];
-    if (producer.operation->getNumResults() != 1)
-      continue;
-    for (OpOperand &use : producer.operation->getResult(0).getUses()) {
-      auto consumerId = operationIds.find(use.getOwner());
-      if (consumerId != operationIds.end() &&
-          candidates.contains(consumerId->second))
-        producersByConsumer[consumerId->second].insert(producerId);
-    }
   }
 
   SmallVector<CandidateCommunicationEdge> edges;
@@ -353,16 +417,10 @@ SmallVector<CandidateCommunicationEdge> buildCandidateCommunicationEdges(
     for (OpOperand &use : producer.operation->getResult(0).getUses()) {
       auto consumerId = operationIds.find(use.getOwner());
       if (consumerId == operationIds.end() ||
-          !candidates.contains(consumerId->second) ||
-          producersByConsumer.lookup(consumerId->second).size() != 1)
+          !candidates.contains(consumerId->second))
         continue;
       auto consumer = dyn_cast<linalg::LinalgOp>(use.getOwner());
-      if (!consumer || consumer->getNumResults() != 1 ||
-          llvm::any_of(cast<TilingInterface>(consumer.getOperation())
-                           .getLoopIteratorTypes(),
-                       [](utils::IteratorType iterator) {
-                         return iterator != utils::IteratorType::parallel;
-                       }))
+      if (!consumer || consumer->getNumResults() != 1)
         continue;
       edges.push_back({producerId, consumerId->second, use.getOperandNumber(),
                        *byteSize, consumer.getMatchingIndexingMap(&use)});
@@ -383,11 +441,10 @@ uint64_t getCommunicationPenalty(
     const WorkUnitCandidate &consumer =
         candidates.find(edge.consumerId)
             ->second[selection.lookup(edge.consumerId)];
-    if (candidatePairHasOneToOneShards(producer, consumer,
-                                       edge.consumerOperandMap))
-      continue;
-    uint64_t edgePenalty =
-        static_cast<uint64_t>(std::max<int64_t>(edge.byteSize, 1));
+    std::optional<uint64_t> exactPenalty = getCandidateShardPenalty(
+        producer, consumer, edge.consumerOperandMap, edge.byteSize);
+    uint64_t edgePenalty = exactPenalty.value_or(
+        std::numeric_limits<uint64_t>::max());
     if (std::numeric_limits<uint64_t>::max() - penalty < edgePenalty)
       return std::numeric_limits<uint64_t>::max();
     penalty += edgePenalty;
@@ -475,6 +532,12 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
           *this, "parallel-workers",
           llvm::cl::desc("Target number of independent digital work units"),
           llvm::cl::init(4)),
+      minimumWorkItemsPerUnit(
+          *this, "minimum-work-items-per-unit",
+          llvm::cl::desc(
+              "Minimum static iteration work assigned to each digital work "
+              "unit; reduces workers for small operations"),
+          llvm::cl::init(1)),
       requireChange(
           *this, "require-change",
           llvm::cl::desc("Fail when no digital operation can be expanded"),
@@ -509,6 +572,7 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
           llvm::cl::desc("Minimum number of leaves for reduction balancing"),
           llvm::cl::init(3)) {
   parallelWorkers = pass.parallelWorkers;
+  minimumWorkItemsPerUnit = pass.minimumWorkItemsPerUnit;
   requireChange = pass.requireChange;
   dataflow = pass.dataflow;
   tilingPolicy = pass.tilingPolicy;
@@ -521,8 +585,9 @@ ExpandDigitalWorkPass::ExpandDigitalWorkPass(const ExpandDigitalWorkPass &pass)
 
 void ExpandDigitalWorkPass::runOnOperation() {
   ModuleOp module = getOperation();
-  if (parallelWorkers < 1) {
-    module.emitError("parallel-workers must be positive");
+  if (parallelWorkers < 1 || minimumWorkItemsPerUnit < 1) {
+    module.emitError(
+        "parallel-workers and minimum-work-items-per-unit must be positive");
     signalPassFailure();
     return;
   }
@@ -558,6 +623,8 @@ void ExpandDigitalWorkPass::runOnOperation() {
     });
     dissolveDigitalMappingStages(function);
     function->removeAttr("sculptor.mapping.digital_parallel_workers");
+    function->removeAttr(
+        "sculptor.mapping.digital_minimum_work_items_per_unit");
     function->removeAttr("sculptor.mapping.expanded_digital_operation_count");
     function->removeAttr("sculptor.mapping.expanded_digital_work_unit_count");
     function->removeAttr(kDigitalTilingPolicyAttrName);
@@ -598,6 +665,7 @@ void ExpandDigitalWorkPass::runOnOperation() {
     for (const mapping::ComputeOperation &operation : graph->operations) {
       SmallVector<WorkUnitCandidate, 0> operationCandidates =
           buildWorkUnitCandidates(operation, parallelWorkers,
+                                  minimumWorkItemsPerUnit,
                                   *parsedTilingPolicy, builder);
       if (!operationCandidates.empty())
         candidates[operation.id] = std::move(operationCandidates);
@@ -631,6 +699,9 @@ void ExpandDigitalWorkPass::runOnOperation() {
     if (functionOperations > 0) {
       function->setAttr("sculptor.mapping.digital_parallel_workers",
                         builder.getI64IntegerAttr(parallelWorkers));
+      function->setAttr(
+          "sculptor.mapping.digital_minimum_work_items_per_unit",
+          builder.getI64IntegerAttr(minimumWorkItemsPerUnit));
       function->setAttr("sculptor.mapping.expanded_digital_operation_count",
                         builder.getI64IntegerAttr(functionOperations));
       function->setAttr("sculptor.mapping.expanded_digital_work_unit_count",
@@ -671,6 +742,10 @@ void ExpandDigitalWorkPass::runOnOperation() {
   module->setAttr("sculptor.mapping.expanded_digital_operation_count",
                   IntegerAttr::get(IntegerType::get(&getContext(), 64),
                                    expandedOperations));
+  module->setAttr(
+      "sculptor.mapping.digital_minimum_work_items_per_unit",
+      IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                       minimumWorkItemsPerUnit));
   module->setAttr(
       "sculptor.mapping.expanded_digital_work_unit_count",
       IntegerAttr::get(IntegerType::get(&getContext(), 64), expandedWorkUnits));

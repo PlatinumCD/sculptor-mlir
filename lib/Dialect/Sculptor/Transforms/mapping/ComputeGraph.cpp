@@ -1,9 +1,12 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ComputeGraph.h"
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorOps.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticLayerIdentity.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/mapping/ReductionTree.h"
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/TilingInterface.h"
@@ -13,6 +16,7 @@
 #include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <set>
 
@@ -70,10 +74,59 @@ bool isFunctionArgument(func::FuncOp func, Value value) {
   return argument && argument.getOwner()->getParentOp() == func.getOperation();
 }
 
+bool valueCarriesRequiredData(
+    func::FuncOp func, Value value,
+    const DenseMap<Operation *, int64_t> &operationIds,
+    llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (isFunctionArgument(func, value))
+    return true;
+
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp)
+    return true;
+  if (operationIds.contains(definingOp))
+    return true;
+  if (isa<tensor::EmptyOp>(definingOp))
+    return false;
+  if (definingOp->hasTrait<OpTrait::ConstantLike>())
+    return true;
+  if (!visited.insert(definingOp).second)
+    return true;
+
+  bool hasResourceOperand = false;
+  for (Value operand : definingOp->getOperands()) {
+    if (!isComputeResourceType(operand.getType()))
+      continue;
+    hasResourceOperand = true;
+    if (valueCarriesRequiredData(func, operand, operationIds, visited))
+      return true;
+  }
+  // Unknown tensor-producing sources are conservatively data-bearing. A
+  // support chain is destination-only only when every shaped source traces to
+  // tensor.empty.
+  return !hasResourceOperand;
+}
+
+bool operandCarriesRequiredData(
+    func::FuncOp func, OpOperand &operand,
+    const DenseMap<Operation *, int64_t> &operationIds) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(operand.getOwner())) {
+    if (!linalgOp.payloadUsesValueFromOperand(&operand) &&
+        !linalgOp.isDpsInit(&operand))
+      return false;
+  }
+  // A non-empty DPS destination still carries a conservative storage/order
+  // dependency even when the payload overwrites every element. Empty-backed
+  // destinations fall through to valueCarriesRequiredData and are excluded.
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  return valueCarriesRequiredData(func, operand.get(), operationIds, visited);
+}
+
 void collectUpstreamComputeOperations(
     func::FuncOp func, Value value,
     const DenseMap<Operation *, int64_t> &operationIds,
     SmallVectorImpl<int64_t> &producerOperations, bool &isFunctionInput,
+    DenseMap<int64_t, SmallVector<Value>> &producerValues,
     llvm::SmallPtrSetImpl<Operation *> &visited) {
   if (isFunctionArgument(func, value)) {
     isFunctionInput = true;
@@ -87,6 +140,7 @@ void collectUpstreamComputeOperations(
   auto operationId = operationIds.find(definingOp);
   if (operationId != operationIds.end()) {
     appendUnique(producerOperations, operationId->second);
+    appendUnique(producerValues[operationId->second], value);
     return;
   }
 
@@ -98,7 +152,7 @@ void collectUpstreamComputeOperations(
       continue;
     collectUpstreamComputeOperations(func, operand, operationIds,
                                      producerOperations, isFunctionInput,
-                                     visited);
+                                     producerValues, visited);
   }
 }
 
@@ -106,7 +160,12 @@ std::optional<ComputeOperationKind>
 classifyComputeOperation(Operation *operation) {
   if (isa<sculptor::MVMOp>(operation))
     return ComputeOperationKind::LogicalMVM;
-  if (isa<TilingInterface>(operation))
+  // Do not classify every operation that happens to implement
+  // TilingInterface as independently scheduled work. Interface models can be
+  // attached to shape/view-like operations over time, and those operations
+  // belong in the closure of their consuming routine. Linalg operations and
+  // tensor.pad both materialize payload data and therefore own mapping work.
+  if (isa<linalg::LinalgOp, tensor::PadOp>(operation))
     return ComputeOperationKind::Structured;
   return std::nullopt;
 }
@@ -208,6 +267,15 @@ LogicalResult populateIterationDomain(ComputeOperation &computeOperation) {
     SmallVector<int64_t> linalgExtents = linalgOp.getStaticLoopRanges();
     if (linalgExtents.size() == iteratorTypes.size())
       staticExtents = std::move(linalgExtents);
+  } else if (auto padOp = dyn_cast<tensor::PadOp>(computeOperation.operation)) {
+    // PadOp's external TilingInterface reifies its iteration domain from the
+    // result shape. Avoid manufacturing IR solely to recover information that
+    // is already present in a static result type.
+    RankedTensorType resultType = padOp.getResultType();
+    if (resultType.hasStaticShape() &&
+        static_cast<size_t>(resultType.getRank()) == iteratorTypes.size())
+      staticExtents.assign(resultType.getShape().begin(),
+                           resultType.getShape().end());
   }
 
   computeOperation.iterationDomain.reserve(iteratorTypes.size());
@@ -261,6 +329,59 @@ LogicalResult populateSemanticTaskKind(ComputeOperation &operation) {
     operation.semanticTaskKind =
         operation.operation->getName().getStringRef().str();
     break;
+  }
+  return success();
+}
+
+LogicalResult populateSemanticLayerIdentity(ComputeOperation &operation) {
+  std::optional<int64_t> layerId;
+  std::optional<StringRef> layerKind;
+  SmallVector<Operation *> untaggedMembers;
+
+  for (Operation *member : operation.members) {
+    auto id = member->getAttrOfType<IntegerAttr>(
+        mlir::sculptor::kSemanticLayerIdAttrName);
+    auto kind = member->getAttrOfType<StringAttr>(
+        mlir::sculptor::kSemanticLayerKindAttrName);
+    if (!id && !kind) {
+      untaggedMembers.push_back(member);
+      continue;
+    }
+    if (!id || !kind) {
+      return member->emitError(
+          "semantic layer identity requires both layer_id and layer_kind");
+    }
+    if (id.getInt() < 0)
+      return member->emitError("semantic layer ID must be non-negative");
+    if (kind.getValue().empty())
+      return member->emitError("semantic layer kind must not be empty");
+    if (layerId && *layerId != id.getInt()) {
+      return member->emitError(
+          "one mapping operation contains conflicting semantic layer IDs");
+    }
+    if (layerKind && *layerKind != kind.getValue()) {
+      return member->emitError(
+          "one mapping operation contains conflicting semantic layer kinds");
+    }
+    layerId = id.getInt();
+    layerKind = kind.getValue();
+  }
+
+  if (layerId) {
+    operation.semanticLayerId = *layerId;
+    operation.semanticLayerKind = layerKind->str();
+    // Region-producing rewrites may synthesize a support operation after the
+    // containing stage was annotated (for example affine.apply while slicing
+    // a linalg body). The tagged stage is authoritative, so complete that
+    // identity here before outlining can detach the support operation.
+    for (Operation *member : untaggedMembers) {
+      member->setAttr(mlir::sculptor::kSemanticLayerIdAttrName,
+                      IntegerAttr::get(IntegerType::get(member->getContext(),
+                                                        /*width=*/64),
+                                       *layerId));
+      member->setAttr(mlir::sculptor::kSemanticLayerKindAttrName,
+                      StringAttr::get(member->getContext(), *layerKind));
+    }
   }
   return success();
 }
@@ -517,9 +638,21 @@ LogicalResult buildMVMWaves(ComputeGraph &graph) {
             appendUnique(physicalConsumers, consumerId);
         }
       }
-      if (physicalConsumers.size() == 1) {
-        vectorTile.mvmWaveMember =
-            graph.operations[physicalConsumers.front()].mvmWaveMember;
+      if (!physicalConsumers.empty()) {
+        // A vector tile may feed several physical arrays (for example one
+        // input-column tile broadcast across multiple output-row tiles). Give
+        // it a deterministic execution owner instead of leaving it unowned,
+        // which would pin every shared vector tile in the wave to the same
+        // home core and destroy otherwise valid nested fork/join parallelism.
+        int64_t owner = *std::min_element(
+            physicalConsumers.begin(), physicalConsumers.end(),
+            [&](int64_t left, int64_t right) {
+              return std::pair(
+                         *graph.operations[left].mvmWaveMember, left) <
+                     std::pair(
+                         *graph.operations[right].mvmWaveMember, right);
+            });
+        vectorTile.mvmWaveMember = graph.operations[owner].mvmWaveMember;
       } else {
         vectorTile.mvmWaveMember.reset();
       }
@@ -615,6 +748,332 @@ LogicalResult buildTopologicalOrder(ComputeGraph &graph, Operation *anchor) {
   return success();
 }
 
+// Keep cheap post-layer tensor work (ReLU, clamp, pointwise affine transforms,
+// and layout-preserving copies) with the one semantic layer that produces it.
+// Reductions and joins remain independent: absorbing either would hide a real
+// scheduling boundary or arbitrarily choose among multiple parent layers.
+bool isProducerAffineLayerEpilogue(const ComputeOperation &operation) {
+  return operation.kind == ComputeOperationKind::Structured &&
+         !operation.iterationDomain.empty() &&
+         llvm::all_of(operation.iterationDomain,
+                      [](const ComputeIterationDimension &dimension) {
+                        return dimension.kind == ComputeIteratorKind::Parallel;
+                      });
+}
+
+std::optional<int64_t>
+findUniqueSemanticProducerRegion(const ComputeGraph &graph,
+                                 const ComputeOperation &operation) {
+  std::optional<int64_t> candidateRegion;
+  for (int64_t tensorId : operation.inputTensors) {
+    for (int64_t producerId : graph.tensors[tensorId].producerOperations) {
+      int64_t producerRegion = graph.operations[producerId].layerRegionId;
+      if (producerRegion < 0)
+        continue;
+      const LayerRegion &region = graph.layerRegions[producerRegion];
+      if (!region.semanticLayerId)
+        return std::nullopt;
+      if (candidateRegion && *candidateRegion != producerRegion)
+        return std::nullopt;
+      candidateRegion = producerRegion;
+    }
+  }
+  return candidateRegion;
+}
+
+void inheritSemanticRegion(ComputeOperation &operation, LayerRegion &region) {
+  operation.semanticLayerId = region.semanticLayerId;
+  operation.semanticLayerKind = region.semanticLayerKind;
+  for (Operation *member : operation.members) {
+    member->setAttr(
+        mlir::sculptor::kSemanticLayerIdAttrName,
+        IntegerAttr::get(IntegerType::get(member->getContext(), /*width=*/64),
+                         *region.semanticLayerId));
+    member->setAttr(mlir::sculptor::kSemanticLayerKindAttrName,
+                    StringAttr::get(member->getContext(),
+                                    region.semanticLayerKind));
+  }
+}
+
+std::optional<int64_t> findDestinationInitializerConsumer(
+    const ComputeOperation &operation,
+    const DenseMap<Operation *, int64_t> &operationIds) {
+  auto fill = dyn_cast<linalg::FillOp>(operation.operation);
+  if (!fill || fill->getNumResults() != 1)
+    return std::nullopt;
+
+  Value result = fill->getResult(0);
+  if (!result.hasOneUse())
+    return std::nullopt;
+
+  OpOperand &use = *result.getUses().begin();
+  auto consumer = dyn_cast<linalg::LinalgOp>(use.getOwner());
+  if (!consumer || isa<linalg::FillOp>(consumer.getOperation()) ||
+      !consumer.isDpsInit(&use))
+    return std::nullopt;
+
+  auto found = operationIds.find(consumer.getOperation());
+  if (found == operationIds.end() || found->second == operation.id)
+    return std::nullopt;
+  return found->second;
+}
+
+LogicalResult buildLayerRegions(ComputeGraph &graph, Operation *anchor) {
+  DenseMap<int64_t, int64_t> regionBySemanticLayerId;
+  DenseMap<Operation *, int64_t> operationIds;
+  for (const ComputeOperation &operation : graph.operations) {
+    for (Operation *member : operation.members)
+      operationIds.try_emplace(member, operation.id);
+  }
+
+  // A one-use linalg.fill that feeds a consumer's DPS initialization is the
+  // consumer's prologue, not an independently schedulable layer. Defer these
+  // fills until their consumers have received a layer region.
+  DenseMap<int64_t, int64_t> initializerConsumers;
+  for (const ComputeOperation &operation : graph.operations) {
+    if (std::optional<int64_t> consumer =
+            findDestinationInitializerConsumer(operation, operationIds))
+      initializerConsumers.try_emplace(operation.id, *consumer);
+  }
+
+  for (int64_t operationId : graph.topologicalOrder) {
+    if (initializerConsumers.contains(operationId))
+      continue;
+
+    ComputeOperation &operation = graph.operations[operationId];
+    int64_t regionId = -1;
+    if (operation.semanticLayerId) {
+      auto [entry, inserted] = regionBySemanticLayerId.try_emplace(
+          *operation.semanticLayerId,
+          static_cast<int64_t>(graph.layerRegions.size()));
+      regionId = entry->second;
+      if (inserted) {
+        LayerRegion region;
+        region.id = regionId;
+        region.semanticLayerId = operation.semanticLayerId;
+        region.semanticLayerKind = operation.semanticLayerKind;
+        graph.layerRegions.push_back(std::move(region));
+      } else if (graph.layerRegions[regionId].semanticLayerKind !=
+                 operation.semanticLayerKind) {
+        operation.operation->emitError(
+            "one semantic layer ID is associated with multiple layer kinds");
+        return failure();
+      }
+    } else if (isProducerAffineLayerEpilogue(operation)) {
+      std::optional<int64_t> producerRegion =
+          findUniqueSemanticProducerRegion(graph, operation);
+      if (producerRegion) {
+        regionId = *producerRegion;
+        inheritSemanticRegion(operation, graph.layerRegions[regionId]);
+      }
+    }
+
+    if (regionId < 0) {
+      regionId = static_cast<int64_t>(graph.layerRegions.size());
+      LayerRegion region;
+      region.id = regionId;
+      region.isSingletonFallback = true;
+      graph.layerRegions.push_back(std::move(region));
+    }
+
+    operation.layerRegionId = regionId;
+    graph.layerRegions[regionId].operationIds.push_back(operationId);
+  }
+
+  for (int64_t operationId : graph.topologicalOrder) {
+    auto found = initializerConsumers.find(operationId);
+    if (found == initializerConsumers.end())
+      continue;
+
+    ComputeOperation &operation = graph.operations[operationId];
+    int64_t consumerId = found->second;
+    int64_t regionId = graph.operations[consumerId].layerRegionId;
+    if (regionId < 0 ||
+        static_cast<size_t>(regionId) >= graph.layerRegions.size()) {
+      operation.operation->emitError(
+          "destination initializer consumer has no layer region");
+      return failure();
+    }
+
+    operation.layerRegionId = regionId;
+    LayerRegion &region = graph.layerRegions[regionId];
+    region.isSingletonFallback = false;
+    auto consumerPosition = llvm::find(region.operationIds, consumerId);
+    if (consumerPosition == region.operationIds.end()) {
+      operation.operation->emitError(
+          "destination initializer consumer is missing from its layer region");
+      return failure();
+    }
+    region.operationIds.insert(consumerPosition, operationId);
+  }
+
+  for (const ComputeTensor &tensor : graph.tensors) {
+    SmallVector<int64_t> producerRegions;
+    SmallVector<int64_t> consumerRegions;
+    for (int64_t operationId : tensor.producerOperations)
+      appendUnique(producerRegions,
+                   graph.operations[operationId].layerRegionId);
+    for (int64_t operationId : tensor.consumerOperations)
+      appendUnique(consumerRegions,
+                   graph.operations[operationId].layerRegionId);
+
+    for (int64_t regionId : consumerRegions) {
+      bool hasProducerInRegion = llvm::is_contained(producerRegions, regionId);
+      bool hasProducerOutsideRegion = llvm::any_of(
+          producerRegions, [=](int64_t producerRegion) {
+            return producerRegion != regionId;
+          });
+      if (tensor.isFunctionInput || producerRegions.empty() ||
+          hasProducerOutsideRegion)
+        appendUnique(graph.layerRegions[regionId].inputTensors, tensor.id);
+      if (hasProducerInRegion)
+        appendUnique(graph.layerRegions[regionId].internalTensors, tensor.id);
+    }
+
+    for (int64_t regionId : producerRegions) {
+      bool hasConsumerInRegion = llvm::is_contained(consumerRegions, regionId);
+      bool hasConsumerOutsideRegion = llvm::any_of(
+          consumerRegions, [=](int64_t consumerRegion) {
+            return consumerRegion != regionId;
+          });
+      if (tensor.isFunctionOutput || consumerRegions.empty() ||
+          hasConsumerOutsideRegion)
+        appendUnique(graph.layerRegions[regionId].outputTensors, tensor.id);
+      if (hasConsumerInRegion)
+        appendUnique(graph.layerRegions[regionId].internalTensors, tensor.id);
+    }
+  }
+
+  SmallVector<int64_t> membershipCount(graph.operations.size(), 0);
+  for (const LayerRegion &region : graph.layerRegions) {
+    if (region.id < 0 || static_cast<size_t>(region.id) >=
+                             graph.layerRegions.size()) {
+      anchor->emitError("layer region has an invalid dense ID");
+      return failure();
+    }
+    if (region.operationIds.empty()) {
+      anchor->emitError("layer region contains no compute operations");
+      return failure();
+    }
+    if (region.isSingletonFallback && region.operationIds.size() != 1) {
+      anchor->emitError("fallback layer region is not a singleton");
+      return failure();
+    }
+    for (int64_t operationId : region.operationIds) {
+      if (operationId < 0 || static_cast<size_t>(operationId) >=
+                                 graph.operations.size() ||
+          graph.operations[operationId].layerRegionId != region.id) {
+        anchor->emitError("layer region operation membership is invalid");
+        return failure();
+      }
+      ++membershipCount[operationId];
+    }
+  }
+  if (llvm::any_of(membershipCount,
+                   [](int64_t count) { return count != 1; })) {
+    anchor->emitError(
+        "every compute operation must belong to exactly one layer region");
+    return failure();
+  }
+
+  SmallVector<SmallVector<int64_t>> regionSuccessors(
+      graph.layerRegions.size());
+  SmallVector<int64_t> regionIndegree(graph.layerRegions.size(), 0);
+  for (const ComputeTensor &tensor : graph.tensors) {
+    for (int64_t producerId : tensor.producerOperations) {
+      int64_t producerRegion = graph.operations[producerId].layerRegionId;
+      for (int64_t consumerId : tensor.consumerOperations) {
+        int64_t consumerRegion = graph.operations[consumerId].layerRegionId;
+        if (producerRegion == consumerRegion ||
+            llvm::is_contained(regionSuccessors[producerRegion],
+                               consumerRegion))
+          continue;
+        regionSuccessors[producerRegion].push_back(consumerRegion);
+        ++regionIndegree[consumerRegion];
+      }
+    }
+  }
+  std::set<int64_t> readyRegions;
+  for (auto [regionId, indegree] : llvm::enumerate(regionIndegree)) {
+    if (indegree == 0)
+      readyRegions.insert(static_cast<int64_t>(regionId));
+  }
+  while (!readyRegions.empty()) {
+    int64_t regionId = *readyRegions.begin();
+    readyRegions.erase(readyRegions.begin());
+    graph.topologicalLayerRegionOrder.push_back(regionId);
+    for (int64_t successor : regionSuccessors[regionId]) {
+      if (--regionIndegree[successor] == 0)
+        readyRegions.insert(successor);
+    }
+  }
+  if (graph.topologicalLayerRegionOrder.size() != graph.layerRegions.size()) {
+    anchor->emitError(
+        "semantic layer regions form a cyclic parent-level dependency graph");
+    return failure();
+  }
+  return success();
+}
+
+int64_t addStaticEstimate(int64_t total, int64_t value) {
+  if (total < 0 || value < 0 ||
+      total > std::numeric_limits<int64_t>::max() - value)
+    return -1;
+  return total + value;
+}
+
+int64_t estimateOperationWorkItems(const ComputeOperation &operation) {
+  int64_t workItems = 1;
+  for (const ComputeIterationDimension &dimension : operation.iterationDomain) {
+    if (ShapedType::isDynamic(dimension.staticExtent) ||
+        dimension.staticExtent <= 0 ||
+        workItems >
+            std::numeric_limits<int64_t>::max() / dimension.staticExtent)
+      return -1;
+    workItems *= dimension.staticExtent;
+  }
+  return workItems;
+}
+
+void estimateLayerRegionResources(ComputeGraph &graph) {
+  for (LayerRegion &region : graph.layerRegions) {
+    std::set<int64_t> analogBindingGroups;
+    for (int64_t operationId : region.operationIds) {
+      const ComputeOperation &operation = graph.operations[operationId];
+      if (operation.requiredLane == LogicalLaneKind::Analog &&
+          operation.laneBindingGroup)
+        analogBindingGroups.insert(*operation.laneBindingGroup);
+      if (operation.requiredLane == LogicalLaneKind::Digital) {
+        region.estimatedDigitalWorkItems = addStaticEstimate(
+            region.estimatedDigitalWorkItems,
+            estimateOperationWorkItems(operation));
+      }
+    }
+    region.analogLaneDemand =
+        static_cast<int64_t>(analogBindingGroups.size());
+
+    std::set<int64_t> residentTensorIds;
+    residentTensorIds.insert(region.inputTensors.begin(),
+                             region.inputTensors.end());
+    residentTensorIds.insert(region.outputTensors.begin(),
+                             region.outputTensors.end());
+    residentTensorIds.insert(region.internalTensors.begin(),
+                             region.internalTensors.end());
+    for (int64_t tensorId : residentTensorIds) {
+      region.estimatedStaticMemoryBytes = addStaticEstimate(
+          region.estimatedStaticMemoryBytes, graph.tensors[tensorId].byteSize);
+    }
+    for (int64_t tensorId : region.inputTensors) {
+      region.estimatedInputBytes = addStaticEstimate(
+          region.estimatedInputBytes, graph.tensors[tensorId].byteSize);
+    }
+    for (int64_t tensorId : region.outputTensors) {
+      region.estimatedOutputBytes = addStaticEstimate(
+          region.estimatedOutputBytes, graph.tensors[tensorId].byteSize);
+    }
+  }
+}
+
 } // namespace
 
 namespace mlir {
@@ -659,7 +1118,11 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
   DenseMap<int64_t, int64_t> stageOperationIds;
   auto appendStageMembers = [&](ComputeOperation &computeOperation,
                                 Operation *root, int64_t operationId) {
+    computeOperation.members.push_back(root);
+    operationIds[root] = operationId;
     root->walk([&](Operation *member) {
+      if (member == root)
+        return;
       computeOperation.members.push_back(member);
       operationIds[member] = operationId;
     });
@@ -722,6 +1185,8 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
 
   for (ComputeOperation &operation : graph.operations) {
     operation.requiredLane = classifyLogicalLaneRequirement(operation.kind);
+    if (failed(populateSemanticLayerIdentity(operation)))
+      return failure();
     if (failed(populateSemanticTaskKind(operation)))
       return failure();
     if (failed(populateReductionIdentity(operation)))
@@ -748,11 +1213,28 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
     tensor.type = value.getType();
     tensor.byteSize = getStaticTensorByteSize(tensor.type);
     tensor.isLogicalArray = isa<sculptor::LogicalArrayType>(tensor.type);
+    DenseMap<int64_t, SmallVector<Value>> producerValues;
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectUpstreamComputeOperations(func, value, operationIds,
                                      tensor.producerOperations,
-                                     tensor.isFunctionInput, visited);
+                                     tensor.isFunctionInput, producerValues,
+                                     visited);
     llvm::sort(tensor.producerOperations);
+    tensor.producerByteSizes.reserve(tensor.producerOperations.size());
+    for (int64_t producerId : tensor.producerOperations) {
+      int64_t contributionBytes = 0;
+      for (Value boundary : producerValues.lookup(producerId)) {
+        int64_t boundaryBytes = getStaticTensorByteSize(boundary.getType());
+        if (boundaryBytes < 0 ||
+            contributionBytes >
+                std::numeric_limits<int64_t>::max() - boundaryBytes) {
+          contributionBytes = -1;
+          break;
+        }
+        contributionBytes += boundaryBytes;
+      }
+      tensor.producerByteSizes.push_back(contributionBytes);
+    }
     graph.tensors.push_back(std::move(tensor));
     tensorIds[value] = graph.tensors.back().id;
     return graph.tensors.back().id;
@@ -760,15 +1242,17 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
 
   for (ComputeOperation &computeOperation : graph.operations) {
     for (Operation *member : computeOperation.members) {
-      for (Value operand : member->getOperands()) {
-        if (!isComputeResourceType(operand.getType()))
+      for (OpOperand &operand : member->getOpOperands()) {
+        if (!isComputeResourceType(operand.get().getType()))
           continue;
-        Operation *definingOperation = operand.getDefiningOp();
+        Operation *definingOperation = operand.get().getDefiningOp();
         auto producer = operationIds.find(definingOperation);
         if (producer != operationIds.end() &&
             producer->second == computeOperation.id)
           continue;
-        int64_t tensorId = getOrCreateTensor(operand);
+        if (!operandCarriesRequiredData(func, operand, operationIds))
+          continue;
+        int64_t tensorId = getOrCreateTensor(operand.get());
         appendUnique(computeOperation.inputTensors, tensorId);
         appendUnique(graph.tensors[tensorId].consumerOperations,
                      computeOperation.id);
@@ -797,7 +1281,21 @@ FailureOr<ComputeGraph> buildComputeGraph(func::FuncOp func) {
 
   if (failed(buildTopologicalOrder(graph, func)))
     return failure();
+  if (failed(buildLayerRegions(graph, func)))
+    return failure();
+  estimateLayerRegionResources(graph);
   return graph;
+}
+
+int64_t getProducerContributionByteSize(const ComputeTensor &tensor,
+                                        int64_t producerOperationId) {
+  auto producer = llvm::find(tensor.producerOperations, producerOperationId);
+  if (producer == tensor.producerOperations.end())
+    return -1;
+  size_t index = std::distance(tensor.producerOperations.begin(), producer);
+  if (index >= tensor.producerByteSizes.size())
+    return -1;
+  return tensor.producerByteSizes[index];
 }
 
 } // namespace mapping

@@ -14,8 +14,20 @@ enum class MappingObjectiveKind { Latency };
 enum class AnalogIOPolicy { Shared };
 enum class AnalogArrayExecutionPolicy { Concurrent };
 enum class NetworkContentionModel { None, LinkSerialized };
-enum class MVMBodyPolicy { Packed, Spread };
+enum class MVMBodyPolicy {
+  Packed,
+  Spread,
+  FirstUseWindow,
+  FirstUseAdaptive
+};
 enum class SetupBindingPolicy { Global, ConsumerAnchored };
+enum class DigitalSchedulingPolicy {
+  Affinity,
+  Balanced,
+  EarliestFinish,
+  Progressive,
+  SlidingWindow
+};
 
 struct MappingObjective {
   MappingObjectiveKind kind = MappingObjectiveKind::Latency;
@@ -57,11 +69,14 @@ FailureOr<MVMBodyPolicy> parseMVMBodyPolicy(StringRef value,
                                             Operation *anchor);
 FailureOr<SetupBindingPolicy> parseSetupBindingPolicy(StringRef value,
                                                       Operation *anchor);
+FailureOr<DigitalSchedulingPolicy>
+parseDigitalSchedulingPolicy(StringRef value, Operation *anchor);
 
 StringRef stringifyMappingObjective(MappingObjectiveKind objective);
 StringRef stringifyNetworkContentionModel(NetworkContentionModel model);
 StringRef stringifyMVMBodyPolicy(MVMBodyPolicy policy);
 StringRef stringifySetupBindingPolicy(SetupBindingPolicy policy);
+StringRef stringifyDigitalSchedulingPolicy(DigitalSchedulingPolicy policy);
 
 } // namespace mapping
 } // namespace sculptor

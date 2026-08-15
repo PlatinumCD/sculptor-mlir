@@ -10,6 +10,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
@@ -105,7 +106,7 @@ getSupportedConvolutionAttrs(NNConv2DOp convOp) {
   llvm::SmallVector<int64_t> padding;
   if (!i64_array_attr::extract(convOp.getPadding(), /*expectedSize=*/2,
                                padding) ||
-      !i64_array_attr::allEqual(padding, 0))
+      llvm::any_of(padding, [](int64_t value) { return value < 0; }))
     return mlir::failure();
 
   llvm::SmallVector<int64_t> dilations;
@@ -153,11 +154,11 @@ static mlir::FailureOr<Conv2DShapeInfo> getValidatedShapeInfo(
       filterFlatShape[1] != shapeInfo.c * shapeInfo.kh * shapeInfo.kw)
     return mlir::failure();
 
-  if (shapeInfo.kh > shapeInfo.h || shapeInfo.kw > shapeInfo.w)
-    return mlir::failure();
-
   int64_t effectiveKh = attrs.dilationH * (shapeInfo.kh - 1) + 1;
   int64_t effectiveKw = attrs.dilationW * (shapeInfo.kw - 1) + 1;
+  if (effectiveKh > shapeInfo.h + 2 * attrs.paddingH ||
+      effectiveKw > shapeInfo.w + 2 * attrs.paddingW)
+    return mlir::failure();
   int64_t expectedOh =
       ((shapeInfo.h + 2 * attrs.paddingH - effectiveKh) / attrs.strideH) + 1;
   int64_t expectedOw =
@@ -311,70 +312,82 @@ static mlir::Value buildScaledIndex(mlir::OpBuilder &builder,
 static mlir::Value buildPatchSequence(mlir::OpBuilder &builder,
                                       const Conv2DLoweringState &state,
                                       mlir::Value activation) {
-  int64_t flattenedWidth = state.patchTy.getDimSize(1);
-  int64_t outputPositions = state.shape.oh * state.shape.ow;
   int64_t kernelPlane = state.shape.kh * state.shape.kw;
 
-  mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
-  mlir::Value one = buildIndexConstant(builder, state.loc, 1);
-  mlir::Value outputPositionUpper =
-      buildIndexConstant(builder, state.loc, outputPositions);
-  mlir::Value flattenedWidthUpper =
-      buildIndexConstant(builder, state.loc, flattenedWidth);
-  mlir::Value outputWidth =
-      buildIndexConstant(builder, state.loc, state.shape.ow);
-  mlir::Value kernelPlaneValue =
-      buildIndexConstant(builder, state.loc, kernelPlane);
-  mlir::Value kernelWidth =
-      buildIndexConstant(builder, state.loc, state.shape.kw);
   mlir::Value patchSequenceInit = builder.create<EmptyOp>(
       state.loc, state.patchSequenceTy.getShape(), state.elementType);
-
-  auto positionLoop = builder.create<mlir::scf::ForOp>(
-      state.loc, zero, outputPositionUpper, one,
+  mlir::AffineMap identity = builder.getMultiDimIdentityMap(2);
+  mlir::AffineMap activationDependency = mlir::AffineMap::get(
+      /*dimCount=*/2, /*symbolCount=*/0,
+      {builder.getAffineConstantExpr(0), builder.getAffineConstantExpr(0),
+       builder.getAffineConstantExpr(0), builder.getAffineConstantExpr(0)},
+      builder.getContext());
+  llvm::SmallVector<mlir::utils::IteratorType> iterators(
+      2, mlir::utils::IteratorType::parallel);
+  auto patchSequence = builder.create<mlir::linalg::GenericOp>(
+      state.loc, state.patchSequenceTy, mlir::ValueRange{activation},
       mlir::ValueRange{patchSequenceInit},
-      [&](mlir::OpBuilder &positionBuilder, mlir::Location loopLoc,
-          mlir::Value position, mlir::ValueRange positionIterArgs) {
-        mlir::Value outputH = positionBuilder.create<mlir::arith::DivUIOp>(
-            loopLoc, position, outputWidth);
-        mlir::Value outputW = positionBuilder.create<mlir::arith::RemUIOp>(
-            loopLoc, position, outputWidth);
-
-        auto featureLoop = positionBuilder.create<mlir::scf::ForOp>(
-            loopLoc, zero, flattenedWidthUpper, one,
-            mlir::ValueRange{positionIterArgs[0]},
-            [&](mlir::OpBuilder &featureBuilder, mlir::Location featureLoc,
-                mlir::Value flattenedIndex, mlir::ValueRange featureIterArgs) {
-              mlir::Value channel = featureBuilder.create<mlir::arith::DivUIOp>(
-                  featureLoc, flattenedIndex, kernelPlaneValue);
-              mlir::Value kernelOffset =
-                  featureBuilder.create<mlir::arith::RemUIOp>(
-                      featureLoc, flattenedIndex, kernelPlaneValue);
-              mlir::Value kernelH = featureBuilder.create<mlir::arith::DivUIOp>(
-                  featureLoc, kernelOffset, kernelWidth);
-              mlir::Value kernelW = featureBuilder.create<mlir::arith::RemUIOp>(
-                  featureLoc, kernelOffset, kernelWidth);
-              mlir::Value inputH = buildScaledIndex(
-                  featureBuilder, featureLoc, outputH, state.attrs.strideH,
-                  kernelH, state.attrs.dilationH, state.attrs.paddingH);
-              mlir::Value inputW = buildScaledIndex(
-                  featureBuilder, featureLoc, outputW, state.attrs.strideW,
-                  kernelW, state.attrs.dilationW, state.attrs.paddingW);
-              mlir::Value inputValue =
-                  featureBuilder.create<mlir::tensor::ExtractOp>(
-                      featureLoc, activation,
-                      mlir::ValueRange{zero, channel, inputH, inputW});
-              mlir::Value updated =
-                  featureBuilder.create<mlir::tensor::InsertOp>(
-                      featureLoc, inputValue, featureIterArgs[0],
-                      mlir::ValueRange{position, flattenedIndex});
-              featureBuilder.create<mlir::scf::YieldOp>(featureLoc, updated);
-            });
-
-        positionBuilder.create<mlir::scf::YieldOp>(loopLoc,
-                                                   featureLoop.getResult(0));
+      llvm::ArrayRef<mlir::AffineMap>{activationDependency, identity},
+      iterators,
+      [&](mlir::OpBuilder &bodyBuilder, mlir::Location bodyLoc,
+          mlir::ValueRange) {
+        mlir::Value position =
+            bodyBuilder.create<mlir::linalg::IndexOp>(bodyLoc, 0);
+        mlir::Value flattenedIndex =
+            bodyBuilder.create<mlir::linalg::IndexOp>(bodyLoc, 1);
+        mlir::Value outputWidth =
+            buildIndexConstant(bodyBuilder, bodyLoc, state.shape.ow);
+        mlir::Value kernelPlaneValue =
+            buildIndexConstant(bodyBuilder, bodyLoc, kernelPlane);
+        mlir::Value kernelWidth =
+            buildIndexConstant(bodyBuilder, bodyLoc, state.shape.kw);
+        mlir::Value zero = buildIndexConstant(bodyBuilder, bodyLoc, 0);
+        mlir::Value outputH = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, position, outputWidth);
+        mlir::Value outputW = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, position, outputWidth);
+        mlir::Value channel = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, flattenedIndex, kernelPlaneValue);
+        mlir::Value kernelOffset = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, flattenedIndex, kernelPlaneValue);
+        mlir::Value kernelH = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, kernelOffset, kernelWidth);
+        mlir::Value kernelW = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, kernelOffset, kernelWidth);
+        mlir::Value inputH = buildScaledIndex(
+            bodyBuilder, bodyLoc, outputH, state.attrs.strideH, kernelH,
+            state.attrs.dilationH, state.attrs.paddingH);
+        mlir::Value inputW = buildScaledIndex(
+            bodyBuilder, bodyLoc, outputW, state.attrs.strideW, kernelW,
+            state.attrs.dilationW, state.attrs.paddingW);
+        mlir::Value inputHeight = buildIndexConstant(
+            bodyBuilder, bodyLoc, state.shape.h);
+        mlir::Value inputWidth = buildIndexConstant(
+            bodyBuilder, bodyLoc, state.shape.w);
+        mlir::Value heightInBounds = bodyBuilder.create<mlir::arith::CmpIOp>(
+            bodyLoc, mlir::arith::CmpIPredicate::ult, inputH, inputHeight);
+        mlir::Value widthInBounds = bodyBuilder.create<mlir::arith::CmpIOp>(
+            bodyLoc, mlir::arith::CmpIPredicate::ult, inputW, inputWidth);
+        mlir::Value inBounds = bodyBuilder.create<mlir::arith::AndIOp>(
+            bodyLoc, heightInBounds, widthInBounds);
+        auto selectInput = bodyBuilder.create<mlir::scf::IfOp>(
+            bodyLoc, state.elementType, inBounds,
+            /*addThenBlock=*/true, /*addElseBlock=*/true);
+        mlir::OpBuilder thenBuilder = selectInput.getThenBodyBuilder();
+        mlir::Value inputValue =
+            thenBuilder.create<mlir::tensor::ExtractOp>(
+                bodyLoc, activation,
+                mlir::ValueRange{zero, channel, inputH, inputW});
+        thenBuilder.create<mlir::scf::YieldOp>(bodyLoc, inputValue);
+        mlir::OpBuilder elseBuilder = selectInput.getElseBodyBuilder();
+        mlir::Value zeroValue = elseBuilder.create<mlir::arith::ConstantOp>(
+            bodyLoc, state.elementType,
+            elseBuilder.getZeroAttr(state.elementType));
+        elseBuilder.create<mlir::scf::YieldOp>(bodyLoc, zeroValue);
+        bodyBuilder.create<mlir::linalg::YieldOp>(bodyLoc,
+                                                  selectInput.getResult(0));
       });
-  return positionLoop.getResult(0);
+  return patchSequence.getResult(0);
 }
 
 static mlir::Value
@@ -469,47 +482,44 @@ static mlir::Value buildOutputAssemblyStage(mlir::OpBuilder &builder,
                                    preparedBias.biasConstant.getValue())
                .getResult();
   }
-
-  int64_t scalarResults = state.shape.oh * state.shape.ow * state.shape.f;
-  mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
-  mlir::Value one = buildIndexConstant(builder, state.loc, 1);
-  mlir::Value upper = buildIndexConstant(builder, state.loc, scalarResults);
-  mlir::Value outputChannels =
-      buildIndexConstant(builder, state.loc, state.shape.f);
-  mlir::Value outputWidth =
-      buildIndexConstant(builder, state.loc, state.shape.ow);
   mlir::Value outputInit = builder.create<EmptyOp>(
       state.loc, state.outputTy.getShape(), state.elementType);
-
-  auto outputLoop = builder.create<mlir::scf::ForOp>(
-      state.loc, zero, upper, one, mlir::ValueRange{outputInit},
-      [&](mlir::OpBuilder &loopBuilder, mlir::Location loopLoc,
-          mlir::Value flatIndex, mlir::ValueRange iterArgs) {
-        mlir::Value position = loopBuilder.create<mlir::arith::DivUIOp>(
-            loopLoc, flatIndex, outputChannels);
-        mlir::Value channel = loopBuilder.create<mlir::arith::RemUIOp>(
-            loopLoc, flatIndex, outputChannels);
-        mlir::Value outputH = loopBuilder.create<mlir::arith::DivUIOp>(
-            loopLoc, position, outputWidth);
-        mlir::Value outputW = loopBuilder.create<mlir::arith::RemUIOp>(
-            loopLoc, position, outputWidth);
-        mlir::Value value = loopBuilder.create<mlir::tensor::ExtractOp>(
-            loopLoc, sequenceResult, mlir::ValueRange{position, channel});
-        if (bias) {
-          mlir::Value biasValue = loopBuilder.create<mlir::tensor::ExtractOp>(
-              loopLoc, bias, mlir::ValueRange{channel});
-          value = loopBuilder.create<mlir::arith::AddFOp>(loopLoc, value,
-                                                          biasValue);
-        }
-        mlir::Value updated = loopBuilder.create<mlir::tensor::InsertOp>(
-            loopLoc, value, iterArgs[0],
-            mlir::ValueRange{zero, channel, outputH, outputW});
-        loopBuilder.create<mlir::scf::YieldOp>(loopLoc, updated);
+  mlir::AffineExpr batch = builder.getAffineDimExpr(0);
+  mlir::AffineExpr channel = builder.getAffineDimExpr(1);
+  mlir::AffineExpr outputH = builder.getAffineDimExpr(2);
+  mlir::AffineExpr outputW = builder.getAffineDimExpr(3);
+  mlir::AffineExpr position =
+      batch * (state.shape.oh * state.shape.ow) +
+      outputH * state.shape.ow + outputW;
+  mlir::AffineMap sequenceMap = mlir::AffineMap::get(
+      /*dimCount=*/4, /*symbolCount=*/0, {position, channel},
+      builder.getContext());
+  mlir::AffineMap outputMap = builder.getMultiDimIdentityMap(4);
+  llvm::SmallVector<mlir::AffineMap> indexingMaps{sequenceMap};
+  llvm::SmallVector<mlir::Value> inputs{sequenceResult};
+  if (bias) {
+    indexingMaps.push_back(mlir::AffineMap::get(
+        /*dimCount=*/4, /*symbolCount=*/0, {channel}, builder.getContext()));
+    inputs.push_back(bias);
+  }
+  indexingMaps.push_back(outputMap);
+  llvm::SmallVector<mlir::utils::IteratorType> iterators(
+      4, mlir::utils::IteratorType::parallel);
+  auto output = builder.create<mlir::linalg::GenericOp>(
+      state.loc, state.outputTy, inputs, mlir::ValueRange{outputInit},
+      indexingMaps, iterators,
+      [&](mlir::OpBuilder &bodyBuilder, mlir::Location bodyLoc,
+          mlir::ValueRange arguments) {
+        mlir::Value value = arguments.front();
+        if (bias)
+          value = bodyBuilder.create<mlir::arith::AddFOp>(
+              bodyLoc, value, arguments[1]);
+        bodyBuilder.create<mlir::linalg::YieldOp>(bodyLoc, value);
       });
 
-  builder.setInsertionPointAfter(outputLoop);
+  builder.setInsertionPointAfter(output);
   scope.annotate();
-  return outputLoop.getResult(0);
+  return output.getResult(0);
 }
 
 static mlir::Value emitLoopedConvolution(mlir::RewriterBase &rewriter,
@@ -581,10 +591,12 @@ LogicalResult decomposeInlineConv2DLayers(func::FuncOp func) {
   SmallVector<NNConv2DOp> layerOps;
   func.walk([&](NNConv2DOp layerOp) { layerOps.push_back(layerOp); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNConv2DOp layerOp : layerOps) {
     if (!layerOp || !layerOp->getBlock())
       continue;
+    SemanticLayerRewriteScope layerScope(layerListener, layerOp);
     if (failed(lowerConv2DOp(layerOp, rewriter))) {
       layerOp.emitOpError("failed to decompose inline Conv2D layer");
       return failure();

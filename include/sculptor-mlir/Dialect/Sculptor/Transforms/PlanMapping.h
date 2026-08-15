@@ -16,7 +16,8 @@ struct PlanMappingPass
 
   Option<std::string> strategies{
       *this, "strategies",
-      llvm::cl::desc("Ordered comma-separated mapping strategy pipeline"),
+      llvm::cl::desc("Ordered comma-separated mapping strategy pipeline; "
+                     "setup-first is always prepended"),
       llvm::cl::init("fan-out-cut")};
 
   Option<std::string> objective{
@@ -45,7 +46,11 @@ struct PlanMappingPass
   Option<std::string> mvmBodyPolicy{
       *this, "mvm-body-policy",
       llvm::cl::desc("MVM array placement policy: packed fills each logical "
-                     "tile, spread uses one logical tile per array"),
+                     "tile, spread uses one logical tile per array, and "
+                     "first-use-window binds matrices in scheduled-use order "
+                     "inside the active sliding window; first-use-adaptive "
+                     "permits the minimum spill needed to preserve RA "
+                     "spatial parallelism"),
       llvm::cl::init("spread")};
 
   Option<std::string> setupBindingPolicy{
@@ -59,6 +64,19 @@ struct PlanMappingPass
       llvm::cl::desc("Balance weighted digital work across logical cores "
                      "within and across temporal phases"),
       llvm::cl::init(false)};
+
+  Option<std::string> digitalSchedulingPolicy{
+      *this, "digital-scheduling-policy",
+      llvm::cl::desc("Digital logical-tile scheduling policy: affinity, "
+                     "balanced, earliest-finish, progressive, or "
+                     "sliding-window"),
+      llvm::cl::init("")};
+
+  Option<int64_t> digitalWindowSize{
+      *this, "digital-window-size",
+      llvm::cl::desc("Number of flexible logical digital lanes visible to "
+                     "sliding-window scheduling"),
+      llvm::cl::init(0)};
 
   Option<int64_t> arrayRows{
       *this, "array-rows",
@@ -140,6 +158,8 @@ struct PlanMappingPass
     mvmBodyPolicy = pass.mvmBodyPolicy;
     setupBindingPolicy = pass.setupBindingPolicy;
     balanceDigitalWork = pass.balanceDigitalWork;
+    digitalSchedulingPolicy = pass.digitalSchedulingPolicy;
+    digitalWindowSize = pass.digitalWindowSize;
     arrayRows = pass.arrayRows;
     arrayCols = pass.arrayCols;
     localMemoryBytesPerCore = pass.localMemoryBytesPerCore;

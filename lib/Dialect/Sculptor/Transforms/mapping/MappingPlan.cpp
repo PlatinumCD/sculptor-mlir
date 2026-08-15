@@ -108,11 +108,23 @@ MappingPlanAttr serializeMappingPlan(MLIRContext *context,
   digitalWorkPerTile.reserve(realization.digitalWorkPerTile.size());
   for (int64_t work : realization.digitalWorkPerTile)
     digitalWorkPerTile.push_back(builder.getI64IntegerAttr(work));
+  SmallVector<Attribute> layerTilePools;
+  layerTilePools.reserve(realization.layerTilePools.size());
+  for (const MappingLayerTilePool &pool : realization.layerTilePools) {
+    SmallVector<Attribute> tileIds;
+    tileIds.reserve(pool.tileIds.size());
+    for (int64_t tileId : pool.tileIds)
+      tileIds.push_back(builder.getI64IntegerAttr(tileId));
+    layerTilePools.push_back(MappingLayerTilePoolAttr::get(
+        context, builder.getI64IntegerAttr(pool.layerRegionId),
+        builder.getArrayAttr(tileIds)));
+  }
   MappingRealizationAttr realizationAttr = MappingRealizationAttr::get(
-      context, builder.getI64IntegerAttr(2),
+      context, builder.getI64IntegerAttr(3),
       builder.getI64IntegerAttr(realization.logicalTileCount),
       builder.getI64IntegerAttr(realization.analogLanesPerTile),
       builder.getArrayAttr(digitalWorkPerTile),
+      builder.getArrayAttr(layerTilePools),
       builder.getArrayAttr(nodeAllocations),
       builder.getArrayAttr(leafAssignments));
 

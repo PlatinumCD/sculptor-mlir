@@ -20,7 +20,9 @@ struct MappingProblem {
   MappingObjective objective;
   MVMBodyPolicy mvmBodyPolicy = MVMBodyPolicy::Spread;
   SetupBindingPolicy setupBindingPolicy = SetupBindingPolicy::Global;
-  bool balanceDigitalWork = false;
+  DigitalSchedulingPolicy digitalSchedulingPolicy =
+      DigitalSchedulingPolicy::Affinity;
+  int64_t digitalWindowSize = 0;
   /// Intermediate refinements need costs and structural feasibility, but only
   /// the final tree needs a concrete logical-tile realization.
   bool requireRealization = true;

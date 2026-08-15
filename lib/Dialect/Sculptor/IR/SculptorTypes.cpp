@@ -56,16 +56,22 @@ mlir::LogicalResult verifyPayloadRankAndElementType(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::ArrayRef<int64_t> shape, mlir::Type elementType,
     llvm::StringRef kind) {
-  if (shape.empty() || shape.size() > 5)
+  if (shape.size() > 5)
     return emitError() << "expected " << kind
-                       << " payload rank between 1 and 5";
+                       << " payload rank between 0 and 5";
 
   if (llvm::any_of(shape, [](int64_t dim) { return dim <= 0; }))
     return emitError() << "expected static positive " << kind
                        << " payload shape";
 
-  if (!llvm::isa<mlir::Float32Type>(elementType))
-    return emitError() << "expected f32 " << kind << " payload type";
+  bool supportedFloat = llvm::isa<mlir::Float32Type>(elementType);
+  auto integerType = llvm::dyn_cast<mlir::IntegerType>(elementType);
+  bool supportedInteger =
+      integerType && llvm::is_contained({8u, 16u, 32u, 64u},
+                                       integerType.getWidth());
+  if (!supportedFloat && !supportedInteger)
+    return emitError() << "expected f32 or byte-addressable i8/i16/i32/i64 "
+                       << kind << " payload type";
 
   return mlir::success();
 }
@@ -82,6 +88,12 @@ mlir::LogicalResult verifyTaskResourcePayloadType(
   if (llvm::isa<mlir::FloatType>(valueType))
     return mlir::success();
 
+  if (auto integerType = llvm::dyn_cast<mlir::IntegerType>(valueType)) {
+    if (llvm::is_contained({8u, 16u, 32u, 64u}, integerType.getWidth()))
+      return mlir::success();
+    return emitError() << "expected a byte-addressable integer scalar";
+  }
+
   if (auto rankedTensorType = llvm::dyn_cast<mlir::RankedTensorType>(valueType))
     return verifyPayloadRankAndElementType(
         emitError, rankedTensorType.getShape(),
@@ -94,8 +106,8 @@ mlir::LogicalResult verifyTaskResourcePayloadType(
         emitError, memRefType.getShape(), memRefType.getElementType(), "memref");
   }
 
-  return emitError() << "expected runtime handle, logical array, float scalar, "
-                        "ranked tensor, or memref payload type";
+  return emitError() << "expected runtime handle, logical array, numeric "
+                        "scalar, ranked tensor, or memref payload type";
 }
 
 // Parses the compact shape-and-element spelling shared by matrix and vector.

@@ -6,6 +6,7 @@ namespace sculptor {
 
 void registerFinalizeGolemIntrinsicsPass();
 void registerEmitGolemTileABIPass();
+void registerInstrumentTileHeapPass();
 
 // Registers every Sculptor conversion pass exposed to textual pipelines and
 // pass managers.

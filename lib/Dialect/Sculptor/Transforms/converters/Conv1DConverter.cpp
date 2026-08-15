@@ -456,10 +456,12 @@ LogicalResult decomposeInlineConv1DLayers(func::FuncOp func) {
   SmallVector<NNConv1DOp> layerOps;
   func.walk([&](NNConv1DOp layerOp) { layerOps.push_back(layerOp); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNConv1DOp layerOp : layerOps) {
     if (!layerOp || !layerOp->getBlock())
       continue;
+    SemanticLayerRewriteScope layerScope(layerListener, layerOp);
     if (failed(lowerConv1DOp(layerOp, rewriter))) {
       layerOp.emitOpError("failed to decompose inline Conv1D layer");
       return failure();

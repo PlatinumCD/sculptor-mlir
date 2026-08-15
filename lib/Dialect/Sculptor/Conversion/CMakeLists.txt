@@ -1,6 +1,7 @@
 add_mlir_library(MLIRSculptorConversion
   EmitGolemTileABI.cpp
   FinalizeGolemIntrinsics.cpp
+  InstrumentTileHeap.cpp
   LowerGolemToLLVMShims.cpp
   Passes.cpp
   golem/GolemUtils.cpp

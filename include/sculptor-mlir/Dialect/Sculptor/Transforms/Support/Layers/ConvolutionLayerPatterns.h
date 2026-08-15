@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/SmallVector.h"
@@ -25,6 +26,7 @@ namespace layer_patterns {
 // layer slice.
 struct DirectConvolutionMatch {
   Value input;
+  Operation *inputPad = nullptr;
   Operation *weightConstant = nullptr;
   Operation *biasConstant = nullptr;
   Operation *outputEmpty = nullptr;
@@ -81,8 +83,10 @@ inline Value findDirectConvolutionInput(Operation *op,
   return op->getOperand(0);
 }
 
-// Records the linalg convolution spatial attributes in the canonical sculptor.nn
-// array-attribute form. Direct convolution fixtures currently have no padding.
+// Records the linalg convolution spatial attributes in the canonical
+// sculptor.nn array-attribute form. For Conv2D, absorb an exclusive static,
+// symmetric zero pad into the semantic layer instead of preserving a separate
+// full-tensor preprocessing operation.
 inline bool populateDirectConvolutionSpatialAttrs(DirectConvolutionMatch &match,
                                                   Operation *op,
                                                   unsigned spatialRank) {
@@ -93,6 +97,32 @@ inline bool populateDirectConvolutionSpatialAttrs(DirectConvolutionMatch &match,
     return false;
 
   match.padding.assign(spatialRank, 0);
+  if (spatialRank != 2)
+    return true;
+
+  auto pad = match.input.getDefiningOp<tensor::PadOp>();
+  if (!pad || !pad.getResult().hasOneUse() || !pad.getLow().empty() ||
+      !pad.getHigh().empty())
+    return true;
+  ArrayRef<int64_t> low = pad.getStaticLow();
+  ArrayRef<int64_t> high = pad.getStaticHigh();
+  if (low.size() != spatialRank + 2 || high.size() != spatialRank + 2 ||
+      low[0] != 0 || low[1] != 0 || high[0] != 0 || high[1] != 0)
+    return true;
+  for (unsigned dimension = 0; dimension < spatialRank; ++dimension) {
+    int64_t lowPadding = low[dimension + 2];
+    int64_t highPadding = high[dimension + 2];
+    if (lowPadding < 0 || lowPadding != highPadding)
+      return true;
+  }
+  Value paddingValue = pad.getConstantPaddingValue();
+  if (!paddingValue || !matchPattern(paddingValue, m_AnyZeroFloat()))
+    return true;
+
+  match.inputPad = pad.getOperation();
+  match.input = pad.getSource();
+  for (unsigned dimension = 0; dimension < spatialRank; ++dimension)
+    match.padding[dimension] = low[dimension + 2];
   return true;
 }
 
@@ -100,6 +130,7 @@ inline bool populateDirectConvolutionSpatialAttrs(DirectConvolutionMatch &match,
 inline void collectDirectConvolutionOps(DirectConvolutionMatch &match) {
   match.ops.clear();
 
+  match_utils::appendUniqueOp(match.ops, match.inputPad);
   match_utils::appendUniqueOp(match.ops, match.weightConstant);
   match_utils::appendUniqueOp(match.ops, match.biasConstant);
   match_utils::appendUniqueOp(match.ops, match.outputEmpty);

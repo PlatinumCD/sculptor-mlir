@@ -266,20 +266,21 @@ public:
   }
 
   FailureOr<ResourceAllocationTree> build(const FanOutStructure &structure) {
-    SmallVector<PlannedNode> phases;
+    std::optional<PlannedNode> setupPhase;
     if (structure.setupRootId >= 0) {
       FailureOr<PlannedNode> setup = cloneSubtree(structure.setupRootId);
       if (failed(setup))
         return failure();
-      phases.push_back(std::move(*setup));
+      setupPhase = std::move(*setup);
     }
 
+    SmallVector<PlannedNode> computePhases;
     if (!structure.preparationUnitIds.empty()) {
       FailureOr<SmallVector<PlannedNode>> preparation =
           cloneUnits(structure, structure.preparationUnitIds);
       if (failed(preparation))
         return failure();
-      phases.push_back(makeTemporal(*preparation));
+      computePhases.push_back(makeTemporal(*preparation));
     }
 
     size_t previousWidth = 0;
@@ -291,14 +292,23 @@ public:
         FailureOr<PlannedNode> fanOut = makeParallel(*units);
         if (failed(fanOut))
           return failure();
-        phases.push_back(std::move(*fanOut));
+        computePhases.push_back(std::move(*fanOut));
       } else {
-        phases.push_back(makeTemporal(*units));
+        computePhases.push_back(makeTemporal(*units));
       }
       previousWidth = level.size();
     }
 
-    PlannedNode root = makeTemporal(phases);
+    if (computePhases.empty()) {
+      problem.anchor->emitError("fan-out-cut produced no compute phases");
+      return failure();
+    }
+    PlannedNode computeRoot = makeTemporal(computePhases);
+    PlannedNode root =
+        setupPhase
+            ? addCut(RATreeNodeKind::TemporalCut,
+                     SmallVector<PlannedNode>{*setupPhase, computeRoot})
+            : computeRoot;
     tree.rootId = root.treeNodeId;
     tree.nodes[tree.rootId].parentId = -1;
     return std::move(tree);

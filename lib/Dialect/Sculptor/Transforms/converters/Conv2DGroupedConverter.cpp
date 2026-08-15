@@ -4,9 +4,12 @@
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/NNLayerMatchUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/Conversion/RewriteUtils.h"
 #include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticOperationScope.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/SemanticOperationNames.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectResourceBlobManager.h"
@@ -21,6 +24,7 @@
 namespace nn_layer_match = mlir::sculptor::nn_layer_match;
 namespace converter_conv = mlir::sculptor::converter_conv;
 namespace i64_array_attr = mlir::sculptor::i64_array_attr;
+namespace semantic_operation_names = mlir::sculptor::semantic_operation_names;
 
 namespace {
 
@@ -82,7 +86,9 @@ struct Conv2DGroupedLoweringState {
   mlir::Location loc;
   mlir::Type elementType;
   mlir::RankedTensorType patchTy;
+  mlir::RankedTensorType patchSequenceTy;
   mlir::RankedTensorType matmulResultTy;
+  mlir::RankedTensorType mvmSequenceTy;
   mlir::RankedTensorType outputTy;
   Conv2DGroupedShapeInfo shape;
   Conv2DGroupedConvolutionAttrs attrs;
@@ -336,12 +342,17 @@ buildGroupedLoweringState(const Conv2DGroupedMatch &match) {
   mlir::Location loc = match.rootOp->getLoc();
   mlir::Type elementType = match.sourceActivationTy.getElementType();
   int64_t flattenedWidth = match.shape.cTotal * match.shape.kh * match.shape.kw;
+  int64_t outputPositions = match.shape.oh * match.shape.ow;
   return Conv2DGroupedLoweringState{
       .loc = loc,
       .elementType = elementType,
       .patchTy = mlir::RankedTensorType::get({1, flattenedWidth}, elementType),
+      .patchSequenceTy = mlir::RankedTensorType::get(
+          {outputPositions, flattenedWidth}, elementType),
       .matmulResultTy =
           mlir::RankedTensorType::get({1, match.shape.fTotal}, elementType),
+      .mvmSequenceTy = mlir::RankedTensorType::get(
+          {outputPositions, match.shape.fTotal}, elementType),
       .outputTy = match.outputTy,
       .shape = match.shape,
       .attrs = match.attrs,
@@ -374,176 +385,219 @@ static mlir::Value buildIndexConstant(mlir::OpBuilder &builder,
   return builder.create<mlir::arith::ConstantIndexOp>(loc, value);
 }
 
-static mlir::Value buildGroupedFlattenedPatch(
+static mlir::Value buildScaledIndex(mlir::OpBuilder &builder,
+                                    mlir::Location loc, mlir::Value output,
+                                    int64_t stride, mlir::Value kernel,
+                                    int64_t dilation, int64_t padding) {
+  mlir::Value strideValue = buildIndexConstant(builder, loc, stride);
+  mlir::Value dilationValue = buildIndexConstant(builder, loc, dilation);
+  mlir::Value scaledOutput =
+      builder.create<mlir::arith::MulIOp>(loc, output, strideValue);
+  mlir::Value scaledKernel =
+      builder.create<mlir::arith::MulIOp>(loc, kernel, dilationValue);
+  mlir::Value inputIndex =
+      builder.create<mlir::arith::AddIOp>(loc, scaledOutput, scaledKernel);
+  if (padding == 0)
+    return inputIndex;
+  mlir::Value paddingValue = buildIndexConstant(builder, loc, padding);
+  return builder.create<mlir::arith::SubIOp>(loc, inputIndex, paddingValue);
+}
+
+static mlir::Value buildGroupedPatchSequence(
     mlir::OpBuilder &builder, const Conv2DGroupedLoweringState &state,
-    mlir::Value activation, int64_t outputH, int64_t outputW) {
-  mlir::Value patchInit = builder.create<EmptyOp>(
-      state.loc, state.patchTy.getShape(), state.elementType);
-
-  mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
-  mlir::Value patch = patchInit;
-  for (int64_t channel = 0; channel < state.shape.cTotal; ++channel) {
-    mlir::Value channelIndex = buildIndexConstant(builder, state.loc, channel);
-    for (int64_t kernelH = 0; kernelH < state.shape.kh; ++kernelH) {
-      int64_t inputH = outputH * state.attrs.strideH +
-                       kernelH * state.attrs.dilationH - state.attrs.paddingH;
-      mlir::Value inputHValue = buildIndexConstant(builder, state.loc, inputH);
-      for (int64_t kernelW = 0; kernelW < state.shape.kw; ++kernelW) {
-        int64_t inputW = outputW * state.attrs.strideW +
-                         kernelW * state.attrs.dilationW - state.attrs.paddingW;
-        mlir::Value inputWValue =
-            buildIndexConstant(builder, state.loc, inputW);
-        mlir::Value inputValue = builder.create<mlir::tensor::ExtractOp>(
-            state.loc, activation,
-            mlir::ValueRange{zero, channelIndex, inputHValue, inputWValue});
-
-        int64_t flattenedIndex = channel * state.shape.kh * state.shape.kw +
-                                 kernelH * state.shape.kw + kernelW;
-        mlir::Value flatIndex =
-            buildIndexConstant(builder, state.loc, flattenedIndex);
-        patch = builder.create<mlir::tensor::InsertOp>(
-            state.loc, inputValue, patch, mlir::ValueRange{zero, flatIndex});
-      }
-    }
-  }
-
-  return patch;
+    mlir::Value activation) {
+  int64_t kernelPlane = state.shape.kh * state.shape.kw;
+  mlir::Value init = builder.create<EmptyOp>(
+      state.loc, state.patchSequenceTy.getShape(), state.elementType);
+  mlir::AffineMap identity = builder.getMultiDimIdentityMap(2);
+  mlir::AffineMap activationDependency = mlir::AffineMap::get(
+      /*dimCount=*/2, /*symbolCount=*/0,
+      {builder.getAffineConstantExpr(0), builder.getAffineConstantExpr(0),
+       builder.getAffineConstantExpr(0), builder.getAffineConstantExpr(0)},
+      builder.getContext());
+  llvm::SmallVector<mlir::utils::IteratorType> iterators(
+      2, mlir::utils::IteratorType::parallel);
+  auto patches = builder.create<mlir::linalg::GenericOp>(
+      state.loc, state.patchSequenceTy, mlir::ValueRange{activation},
+      mlir::ValueRange{init},
+      llvm::ArrayRef<mlir::AffineMap>{activationDependency, identity},
+      iterators,
+      [&](mlir::OpBuilder &bodyBuilder, mlir::Location bodyLoc,
+          mlir::ValueRange) {
+        mlir::Value position =
+            bodyBuilder.create<mlir::linalg::IndexOp>(bodyLoc, 0);
+        mlir::Value flattenedIndex =
+            bodyBuilder.create<mlir::linalg::IndexOp>(bodyLoc, 1);
+        mlir::Value outputWidth =
+            buildIndexConstant(bodyBuilder, bodyLoc, state.shape.ow);
+        mlir::Value kernelPlaneValue =
+            buildIndexConstant(bodyBuilder, bodyLoc, kernelPlane);
+        mlir::Value kernelWidth =
+            buildIndexConstant(bodyBuilder, bodyLoc, state.shape.kw);
+        mlir::Value zero = buildIndexConstant(bodyBuilder, bodyLoc, 0);
+        mlir::Value outputH = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, position, outputWidth);
+        mlir::Value outputW = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, position, outputWidth);
+        mlir::Value channel = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, flattenedIndex, kernelPlaneValue);
+        mlir::Value kernelOffset = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, flattenedIndex, kernelPlaneValue);
+        mlir::Value kernelH = bodyBuilder.create<mlir::arith::DivUIOp>(
+            bodyLoc, kernelOffset, kernelWidth);
+        mlir::Value kernelW = bodyBuilder.create<mlir::arith::RemUIOp>(
+            bodyLoc, kernelOffset, kernelWidth);
+        mlir::Value inputH = buildScaledIndex(
+            bodyBuilder, bodyLoc, outputH, state.attrs.strideH, kernelH,
+            state.attrs.dilationH, state.attrs.paddingH);
+        mlir::Value inputW = buildScaledIndex(
+            bodyBuilder, bodyLoc, outputW, state.attrs.strideW, kernelW,
+            state.attrs.dilationW, state.attrs.paddingW);
+        mlir::Value inputValue = bodyBuilder.create<mlir::tensor::ExtractOp>(
+            bodyLoc, activation,
+            mlir::ValueRange{zero, channel, inputH, inputW});
+        bodyBuilder.create<mlir::linalg::YieldOp>(bodyLoc, inputValue);
+      });
+  return patches.getResult(0);
 }
 
-static mlir::StringAttr buildOutputPositionName(mlir::OpBuilder &builder,
-                                                int64_t outputH,
-                                                int64_t outputW) {
-  std::string name = "conv2d_grouped_oh_" + std::to_string(outputH) + "_ow_" +
-                     std::to_string(outputW);
-  return builder.getStringAttr(name);
-}
-
-static mlir::Value buildPatchPreparationStage(
+static mlir::Value buildGroupedPatchPreparationStage(
     mlir::OpBuilder &builder, const Conv2DGroupedMatch &match,
-    const Conv2DGroupedLoweringState &state, int64_t outputH, int64_t outputW) {
+    const Conv2DGroupedLoweringState &state) {
   mlir::sculptor::SemanticOperationScope scope(
-      builder, "digital.conv_patch",
-      buildOutputPositionName(builder, outputH, outputW).getValue());
-  mlir::Value patch = buildGroupedFlattenedPatch(
-      builder, state, match.sourceActivation, outputH, outputW);
+      builder, semantic_operation_names::kConvPatchTaskKind,
+      "conv2d_grouped_patch_sequence");
+  mlir::Value patches = buildGroupedPatchSequence(
+      builder, state, match.sourceActivation);
   scope.annotate();
-  return patch;
+  return patches;
 }
 
-static mlir::Value buildBiasAddStage(mlir::OpBuilder &builder,
-                                      PreparedGroupedBias &preparedBias,
-                                      const Conv2DGroupedLoweringState &state,
-                                      mlir::Value channelResult,
-                                      int64_t outputH, int64_t outputW) {
-  std::string name = "conv2d_grouped_oh_" + std::to_string(outputH) + "_ow_" +
-                     std::to_string(outputW) + "_bias_add";
-  mlir::sculptor::SemanticOperationScope scope(builder, "digital.bias_add",
-                                                name);
-  mlir::Value biasAddResult = channelResult;
-  if (preparedBias.bias) {
-    auto biasConstant = builder.create<ConstantOp>(
-        preparedBias.biasConstant.getLoc(), preparedBias.biasConstant.getType(),
-        preparedBias.biasConstant.getValue());
-    biasAddResult = converter_conv::applyOptionalBias(
-        state.loc, state.matmulResultTy, state.elementType, biasAddResult,
-        biasConstant.getResult(), builder);
-  }
-
-  scope.annotate();
-  return biasAddResult;
+static llvm::SmallVector<mlir::OpFoldResult>
+buildRowSliceOffsets(mlir::OpBuilder &builder, mlir::Value row) {
+  return {row, builder.getIndexAttr(0)};
 }
 
-static mlir::Value
-buildOutputPosition(mlir::OpBuilder &builder, const Conv2DGroupedMatch &match,
-                    const PreparedGroupedFilter &preparedFilter,
-                    PreparedGroupedBias &preparedBias,
-                    const Conv2DGroupedLoweringState &state, int64_t outputH,
-                    int64_t outputW) {
-  mlir::Value patch =
-      buildPatchPreparationStage(builder, match, state, outputH, outputW);
-  mlir::Value channelResult =
-      converter_conv::buildPatchMVM(state.loc, state.matmulResultTy, patch,
-                                    preparedFilter.filterMatrix, builder);
-  return buildBiasAddStage(builder, preparedBias, state, channelResult,
-                            outputH, outputW);
+static llvm::SmallVector<mlir::OpFoldResult>
+buildRowSliceSizes(mlir::OpBuilder &builder, int64_t width) {
+  return {builder.getIndexAttr(1), builder.getIndexAttr(width)};
 }
 
-static mlir::FailureOr<mlir::Value>
-assembleOutputTensor(mlir::OpBuilder &builder,
-                     const Conv2DGroupedLoweringState &state,
-                     llvm::ArrayRef<mlir::Value> positionResults) {
-  if (positionResults.empty())
-    return mlir::failure();
+static llvm::SmallVector<mlir::OpFoldResult>
+buildUnitStrides(mlir::OpBuilder &builder) {
+  return {builder.getIndexAttr(1), builder.getIndexAttr(1)};
+}
 
+static mlir::Value buildGroupedMVMSequenceStage(
+    mlir::OpBuilder &builder, const PreparedGroupedFilter &preparedFilter,
+    const Conv2DGroupedLoweringState &state, mlir::Value patchSequence) {
   mlir::sculptor::SemanticOperationScope scope(
-      builder, "digital.output_recombine",
-      "conv2d_grouped_output_recombine");
-
-  mlir::RankedTensorType positionExpandedTy = mlir::RankedTensorType::get(
-      {state.shape.n, state.shape.fTotal, 1, 1}, state.elementType);
-  mlir::RankedTensorType rowTy = mlir::RankedTensorType::get(
-      {state.shape.n, state.shape.fTotal, 1, state.shape.ow},
-      state.elementType);
-  llvm::SmallVector<mlir::ReassociationIndices, 2> reassociation = {{0},
-                                                                    {1, 2, 3}};
-
-  llvm::SmallVector<mlir::Value> rowResults;
-  rowResults.reserve(state.shape.oh);
-  int64_t positionIndex = 0;
-  for (int64_t outputH = 0; outputH < state.shape.oh; ++outputH) {
-    llvm::SmallVector<mlir::Value> expandedPositions;
-    expandedPositions.reserve(state.shape.ow);
-    for (int64_t outputW = 0; outputW < state.shape.ow; ++outputW) {
-      mlir::Value positionResult = positionResults[positionIndex++];
-      expandedPositions.push_back(
-          builder
-              .create<mlir::tensor::ExpandShapeOp>(
-                  state.loc, positionExpandedTy, positionResult, reassociation)
-              .getResult());
-    }
-
-    mlir::Value row = expandedPositions.front();
-    if (expandedPositions.size() > 1) {
-      row = builder
-                .create<mlir::tensor::ConcatOp>(
-                    state.loc, rowTy, /*dim=*/3,
-                    mlir::ValueRange(expandedPositions))
+      builder, semantic_operation_names::kMVMSequenceTaskKind,
+      "conv2d_grouped_mvm_sequence");
+  int64_t outputPositions = state.shape.oh * state.shape.ow;
+  mlir::Value zero = buildIndexConstant(builder, state.loc, 0);
+  mlir::Value one = buildIndexConstant(builder, state.loc, 1);
+  mlir::Value upper =
+      buildIndexConstant(builder, state.loc, outputPositions);
+  mlir::Value init = builder.create<EmptyOp>(
+      state.loc, state.mvmSequenceTy.getShape(), state.elementType);
+  auto patchSizes = buildRowSliceSizes(builder, state.patchTy.getDimSize(1));
+  auto strides = buildUnitStrides(builder);
+  auto positionLoop = builder.create<mlir::scf::ForOp>(
+      state.loc, zero, upper, one, mlir::ValueRange{init},
+      [&](mlir::OpBuilder &loopBuilder, mlir::Location loopLoc,
+          mlir::Value position, mlir::ValueRange iterArgs) {
+        auto offsets = buildRowSliceOffsets(loopBuilder, position);
+        mlir::Value patch =
+            loopBuilder
+                .create<mlir::tensor::ExtractSliceOp>(
+                    loopLoc, state.patchTy, patchSequence, offsets,
+                    patchSizes, strides)
                 .getResult();
-    }
-    rowResults.push_back(row);
-  }
-
-  mlir::Value output = rowResults.front();
-  if (rowResults.size() > 1) {
-    output = builder
-                 .create<mlir::tensor::ConcatOp>(state.loc, state.outputTy,
-                                                 /*dim=*/2,
-                                                 mlir::ValueRange(rowResults))
-                 .getResult();
-  }
-
+        mlir::Value channelResult = converter_conv::buildPatchMVM(
+            loopLoc, state.matmulResultTy, patch,
+            preparedFilter.filterMatrix, loopBuilder);
+        mlir::Value updated =
+            loopBuilder
+                .create<mlir::tensor::InsertSliceOp>(
+                    loopLoc, channelResult, iterArgs[0], offsets,
+                    buildRowSliceSizes(loopBuilder, state.shape.fTotal),
+                    strides)
+                .getResult();
+        loopBuilder.create<mlir::scf::YieldOp>(loopLoc, updated);
+      });
+  builder.setInsertionPointAfter(positionLoop);
   scope.annotate();
-  return output;
+  return positionLoop.getResult(0);
 }
 
-static mlir::FailureOr<mlir::Value>
-emitUnrolledGroupedOutputPositions(mlir::RewriterBase &rewriter,
-                                   const Conv2DGroupedMatch &match,
-                                   const PreparedGroupedFilter &preparedFilter,
-                                   PreparedGroupedBias &preparedBias,
-                                   const Conv2DGroupedLoweringState &state) {
-  rewriter.setInsertionPointAfter(match.rootOp);
-  llvm::SmallVector<mlir::Value> positionResults;
-  positionResults.reserve(state.shape.oh * state.shape.ow);
-  for (int64_t outputH = 0; outputH < state.shape.oh; ++outputH) {
-    for (int64_t outputW = 0; outputW < state.shape.ow; ++outputW) {
-      positionResults.push_back(
-          buildOutputPosition(rewriter, match, preparedFilter, preparedBias,
-                              state, outputH, outputW));
-    }
+static mlir::Value buildGroupedOutputAssemblyStage(
+    mlir::OpBuilder &builder, PreparedGroupedBias &preparedBias,
+    const Conv2DGroupedLoweringState &state, mlir::Value sequenceResult) {
+  llvm::StringRef kind = "digital.output_recombine";
+  if (preparedBias.bias)
+    kind = semantic_operation_names::kBiasAddTaskKind;
+  mlir::sculptor::SemanticOperationScope scope(
+      builder, kind, "conv2d_grouped_output_assembly");
+  mlir::Value bias;
+  if (preparedBias.bias) {
+    bias = builder
+               .create<ConstantOp>(preparedBias.biasConstant.getLoc(),
+                                   preparedBias.biasConstant.getType(),
+                                   preparedBias.biasConstant.getValue())
+               .getResult();
   }
+  mlir::Value init = builder.create<EmptyOp>(
+      state.loc, state.outputTy.getShape(), state.elementType);
+  mlir::AffineExpr batch = builder.getAffineDimExpr(0);
+  mlir::AffineExpr channel = builder.getAffineDimExpr(1);
+  mlir::AffineExpr outputH = builder.getAffineDimExpr(2);
+  mlir::AffineExpr outputW = builder.getAffineDimExpr(3);
+  mlir::AffineExpr position =
+      batch * (state.shape.oh * state.shape.ow) +
+      outputH * state.shape.ow + outputW;
+  mlir::AffineMap sequenceMap = mlir::AffineMap::get(
+      /*dimCount=*/4, /*symbolCount=*/0, {position, channel},
+      builder.getContext());
+  mlir::AffineMap outputMap = builder.getMultiDimIdentityMap(4);
+  llvm::SmallVector<mlir::AffineMap> indexingMaps{sequenceMap};
+  llvm::SmallVector<mlir::Value> inputs{sequenceResult};
+  if (bias) {
+    indexingMaps.push_back(mlir::AffineMap::get(
+        /*dimCount=*/4, /*symbolCount=*/0, {channel}, builder.getContext()));
+    inputs.push_back(bias);
+  }
+  indexingMaps.push_back(outputMap);
+  llvm::SmallVector<mlir::utils::IteratorType> iterators(
+      4, mlir::utils::IteratorType::parallel);
+  auto output = builder.create<mlir::linalg::GenericOp>(
+      state.loc, state.outputTy, inputs, mlir::ValueRange{init}, indexingMaps,
+      iterators,
+      [&](mlir::OpBuilder &bodyBuilder, mlir::Location bodyLoc,
+          mlir::ValueRange arguments) {
+        mlir::Value value = arguments.front();
+        if (bias)
+          value = bodyBuilder.create<mlir::arith::AddFOp>(
+              bodyLoc, value, arguments[1]);
+        bodyBuilder.create<mlir::linalg::YieldOp>(bodyLoc, value);
+      });
+  builder.setInsertionPointAfter(output);
+  scope.annotate();
+  return output.getResult(0);
+}
 
-  return assembleOutputTensor(rewriter, state, positionResults);
+static mlir::Value emitLoopedGroupedConvolution(
+    mlir::RewriterBase &rewriter, const Conv2DGroupedMatch &match,
+    const PreparedGroupedFilter &preparedFilter,
+    PreparedGroupedBias &preparedBias,
+    const Conv2DGroupedLoweringState &state) {
+  rewriter.setInsertionPointAfter(match.rootOp);
+  mlir::Value patches =
+      buildGroupedPatchPreparationStage(rewriter, match, state);
+  mlir::Value sequence = buildGroupedMVMSequenceStage(
+      rewriter, preparedFilter, state, patches);
+  return buildGroupedOutputAssemblyStage(rewriter, preparedBias, state,
+                                         sequence);
 }
 
 static void eraseUnusedGroupedConv2DOps(Conv2DGroupedMatch &match,
@@ -568,18 +622,15 @@ lowerGroupedConv2DOp(NNGroupedConv2DOp layerOp,
   PreparedGroupedFilter preparedFilter = prepareGroupedFilter(*match);
   PreparedGroupedBias preparedBias =
       prepareGroupedBias(*match, state, rewriter);
-  auto rewrittenOutput = emitUnrolledGroupedOutputPositions(
+  mlir::Value rewrittenOutput = emitLoopedGroupedConvolution(
       rewriter, *match, preparedFilter, preparedBias, state);
-  if (failed(rewrittenOutput))
-    return mlir::failure();
-
-  match->result.replaceAllUsesWith(*rewrittenOutput);
+  match->result.replaceAllUsesWith(rewrittenOutput);
   eraseUnusedGroupedConv2DOps(*match, rewriter);
   return mlir::success();
 }
 
-// Converts extracted sculptor.nn.grouped_conv2d layer bodies into per-position
-// sculptor.mvm execution.
+// Converts extracted sculptor.nn.grouped_conv2d layer bodies into looped
+// sculptor.mvm execution without statically unrolling output positions.
 class Conv2DGroupedConverter : public mlir::sculptor::LayerToMVMConverter {
 public:
   mlir::StringRef getName() const override { return "conv2d_grouped"; }
@@ -609,10 +660,12 @@ LogicalResult decomposeInlineGroupedConv2DLayers(func::FuncOp func) {
   func.walk(
       [&](NNGroupedConv2DOp layerOp) { layerOps.push_back(layerOp); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNGroupedConv2DOp layerOp : layerOps) {
     if (!layerOp || !layerOp->getBlock())
       continue;
+    SemanticLayerRewriteScope layerScope(layerListener, layerOp);
     if (failed(lowerGroupedConv2DOp(layerOp, rewriter))) {
       layerOp.emitOpError("failed to decompose inline grouped Conv2D layer");
       return failure();

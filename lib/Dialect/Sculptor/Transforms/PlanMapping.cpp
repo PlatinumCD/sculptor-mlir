@@ -14,6 +14,7 @@
 #include "mlir/Pass/PassRegistry.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
@@ -87,8 +88,9 @@ FailureOr<SmallVector<std::string>> parseStrategyPipeline(StringRef value,
   SmallVector<StringRef> pieces;
   value.split(pieces, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
 
-  SmallVector<std::string> names;
+  SmallVector<std::string> names{"setup-first"};
   llvm::StringSet<> seen;
+  seen.insert("setup-first");
   for (StringRef piece : pieces) {
     StringRef name = piece.trim();
     if (name.empty()) {
@@ -96,6 +98,10 @@ FailureOr<SmallVector<std::string>> parseStrategyPipeline(StringRef value,
           "mapping strategy pipeline contains an empty strategy name");
       return failure();
     }
+    // Setup-first is a compiler invariant. Accept it in legacy/user pipelines,
+    // but normalize it to the one mandatory first stage.
+    if (name == "setup-first")
+      continue;
     if (!seen.insert(name).second) {
       anchor->emitError("mapping strategy pipeline contains duplicate '")
           << name << "'";
@@ -103,11 +109,62 @@ FailureOr<SmallVector<std::string>> parseStrategyPipeline(StringRef value,
     }
     names.push_back(name.str());
   }
-  if (names.empty()) {
-    anchor->emitError("mapping strategy pipeline must not be empty");
+  return names;
+}
+
+LogicalResult verifyGlobalSetupFrontier(
+    const mapping::ResourceAllocationTree &tree,
+    const mapping::ComputeGraph &graph, Operation *anchor) {
+  llvm::DenseSet<int64_t> expectedSetups;
+  llvm::DenseSet<int64_t> expectedCompute;
+  for (const mapping::ComputeOperation &operation : graph.operations) {
+    if (operation.kind == mapping::ComputeOperationKind::MatrixSetup)
+      expectedSetups.insert(operation.id);
+    else
+      expectedCompute.insert(operation.id);
+  }
+  // A setup frontier is meaningful only when both phases exist. Setup-first is
+  // still run for setup-free functions, where it is an intentional no-op.
+  if (expectedSetups.empty() || expectedCompute.empty())
+    return success();
+
+  llvm::DenseMap<int64_t, const mapping::StructuralRATreeNode *> nodes;
+  for (const mapping::StructuralRATreeNode &node : tree.nodes)
+    nodes[node.id] = &node;
+  const mapping::StructuralRATreeNode *root = nodes.lookup(tree.rootId);
+  if (!root || root->kind != RATreeNodeKind::TemporalCut ||
+      root->childIds.size() != 2) {
+    anchor->emitError("mapping strategy destroyed the mandatory global "
+                      "setup-first temporal frontier");
     return failure();
   }
-  return names;
+
+  auto collectOperations = [&](int64_t rootId,
+                               llvm::DenseSet<int64_t> &operations) {
+    SmallVector<int64_t> pending{rootId};
+    while (!pending.empty()) {
+      int64_t nodeId = pending.pop_back_val();
+      const mapping::StructuralRATreeNode *node = nodes.lookup(nodeId);
+      if (!node)
+        continue;
+      if (node->kind == RATreeNodeKind::Leaf) {
+        operations.insert(node->operationId);
+        continue;
+      }
+      pending.append(node->childIds.begin(), node->childIds.end());
+    }
+  };
+
+  llvm::DenseSet<int64_t> setupPhase;
+  llvm::DenseSet<int64_t> computePhase;
+  collectOperations(root->childIds.front(), setupPhase);
+  collectOperations(root->childIds.back(), computePhase);
+  if (setupPhase != expectedSetups || computePhase != expectedCompute) {
+    anchor->emitError("mapping strategy moved work across the mandatory "
+                      "S(all matrix setups) -> compute phase boundary");
+    return failure();
+  }
+  return success();
 }
 
 } // namespace
@@ -160,6 +217,62 @@ void PlanMappingPass::runOnOperation() {
     return;
   }
 
+  StringRef requestedDigitalPolicy = digitalSchedulingPolicy;
+  if (requestedDigitalPolicy.empty())
+    requestedDigitalPolicy =
+        balanceDigitalWork ? StringRef("balanced") : StringRef("affinity");
+  else if (balanceDigitalWork && requestedDigitalPolicy != "balanced") {
+    module.emitError("balance-digital-work conflicts with explicit digital "
+                     "scheduling policy '")
+        << requestedDigitalPolicy << "'";
+    signalPassFailure();
+    return;
+  }
+  FailureOr<mapping::DigitalSchedulingPolicy> parsedDigitalPolicy =
+      mapping::parseDigitalSchedulingPolicy(requestedDigitalPolicy, module);
+  if (failed(parsedDigitalPolicy)) {
+    signalPassFailure();
+    return;
+  }
+  FailureOr<int64_t> logicalCoreCount = hardware->getCoreCount(module);
+  if (failed(logicalCoreCount)) {
+    signalPassFailure();
+    return;
+  }
+  if (*parsedDigitalPolicy ==
+      mapping::DigitalSchedulingPolicy::SlidingWindow) {
+    if (digitalWindowSize <= 0 || digitalWindowSize > *logicalCoreCount) {
+      module.emitError("sliding-window scheduling requires "
+                       "digital-window-size in [1, ")
+          << *logicalCoreCount << "]";
+      signalPassFailure();
+      return;
+    }
+  } else if (digitalWindowSize != 0) {
+    module.emitError("digital-window-size requires "
+                     "digital-scheduling-policy=sliding-window");
+    signalPassFailure();
+    return;
+  }
+  if (*parsedMVMBodyPolicy == mapping::MVMBodyPolicy::FirstUseWindow &&
+      *parsedDigitalPolicy !=
+          mapping::DigitalSchedulingPolicy::SlidingWindow) {
+    module.emitError("mvm-body-policy=first-use-window requires "
+                     "digital-scheduling-policy=sliding-window so both "
+                     "policies share one logical-tile window");
+    signalPassFailure();
+    return;
+  }
+  if (*parsedMVMBodyPolicy == mapping::MVMBodyPolicy::FirstUseAdaptive &&
+      *parsedDigitalPolicy !=
+          mapping::DigitalSchedulingPolicy::SlidingWindow) {
+    module.emitError("mvm-body-policy=first-use-adaptive requires "
+                     "digital-scheduling-policy=sliding-window so matrix "
+                     "locality and digital flow share one window");
+    signalPassFailure();
+    return;
+  }
+
   mapping::ReferenceMappingEvaluator evaluator;
   bool plannedFunction = false;
   for (func::FuncOp func : module.getOps<func::FuncOp>()) {
@@ -178,7 +291,14 @@ void PlanMappingPass::runOnOperation() {
       signalPassFailure();
       return;
     }
-    mapping::ResourceAllocationTree currentTree = std::move(*baseline);
+    FailureOr<mapping::ResourceAllocationTree> plannerBaseline =
+        mapping::stripLayerRegionNodes(*baseline, func);
+    if (failed(plannerBaseline)) {
+      signalPassFailure();
+      return;
+    }
+    mapping::ResourceAllocationTree currentTree =
+        std::move(*plannerBaseline);
     std::optional<mapping::MappingPlan> lastStagePlan;
     for (auto [plannerIndex, planner] : llvm::enumerate(planners)) {
       bool isFinalPlanner = plannerIndex + 1 == planners.size();
@@ -190,7 +310,8 @@ void PlanMappingPass::runOnOperation() {
                                       *parsedObjective,
                                       *parsedMVMBodyPolicy,
                                       *parsedSetupBindingPolicy,
-                                      balanceDigitalWork,
+                                      *parsedDigitalPolicy,
+                                      digitalWindowSize,
                                       isFinalPlanner,
                                       func};
       FailureOr<mapping::MappingPlan> stagePlan =
@@ -211,23 +332,63 @@ void PlanMappingPass::runOnOperation() {
         signalPassFailure();
         return;
       }
+      if (failed(verifyGlobalSetupFrontier(stagePlan->selectedTree, *graph,
+                                           func))) {
+        signalPassFailure();
+        return;
+      }
       currentTree = stagePlan->selectedTree;
       lastStagePlan = std::move(*stagePlan);
     }
 
     assert(lastStagePlan &&
            "a non-empty strategy pipeline must produce a plan");
+    FailureOr<mapping::ResourceAllocationTree> layeredTree =
+        mapping::materializeLayerRegionNodes(currentTree, *graph, func);
+    if (failed(layeredTree)) {
+      signalPassFailure();
+      return;
+    }
+    currentTree = std::move(*layeredTree);
+    mapping::MappingProblem finalProblem{*graph,
+                                         currentTree,
+                                         *hardware,
+                                         *resolvedCostProfile,
+                                         *logicalTileShape,
+                                         *parsedObjective,
+                                         *parsedMVMBodyPolicy,
+                                         *parsedSetupBindingPolicy,
+                                         *parsedDigitalPolicy,
+                                         digitalWindowSize,
+                                         /*requireRealization=*/true,
+                                         func};
+    FailureOr<mapping::MappingEvaluation> finalEvaluation =
+        evaluator.evaluate(finalProblem, currentTree);
+    if (failed(finalEvaluation) || !finalEvaluation->feasible) {
+      if (succeeded(finalEvaluation))
+        func.emitError("layer-annotated mapping plan is infeasible: ")
+            << finalEvaluation->infeasibilityReason;
+      signalPassFailure();
+      return;
+    }
+
     mapping::MappingPlan plan = std::move(*lastStagePlan);
     plan.plannerName = llvm::join(*strategyNames, ",");
     plan.mvmBodyPolicy = *parsedMVMBodyPolicy;
     plan.setupBindingPolicy = *parsedSetupBindingPolicy;
     plan.costProfileName = resolvedCostProfile->name;
     plan.costProfileHash = resolvedCostProfile->contentHash;
+    plan.evaluation = std::move(*finalEvaluation);
     plan.selectedTree = std::move(currentTree);
     if (strategyNames->size() > 1) {
       plan.candidates.clear();
       plan.candidates.push_back(
           {plan.plannerName, plan.evaluation, /*selected=*/true});
+    } else {
+      for (mapping::MappingCandidateSummary &candidate : plan.candidates) {
+        if (candidate.selected)
+          candidate.evaluation = plan.evaluation;
+      }
     }
     if (verifyPlan && failed(mapping::verifyResourceAllocationTree(
                           plan.selectedTree, *graph, func))) {
@@ -264,6 +425,18 @@ void PlanMappingPass::runOnOperation() {
           signalPassFailure();
           return;
         }
+        auto layerRegionId = member->getAttrOfType<IntegerAttr>(
+            mapping::kLayerRegionIdAttrName);
+        if (layerRegionId && layerRegionId.getInt() != operation.layerRegionId) {
+          member->emitError(
+              "layer-region identity is stale; rebuild the RA tree before "
+              "planning");
+          signalPassFailure();
+          return;
+        }
+        member->setAttr(mapping::kLayerRegionIdAttrName,
+                        IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                         operation.layerRegionId));
         if (failed(verifyOptionalIdentity(
                 member, mapping::kLaneBindingGroupAttrName,
                 operation.laneBindingGroup, "lane-binding")) ||
@@ -327,7 +500,19 @@ void PlanMappingPass::runOnOperation() {
         "sculptor.mapping.setup_binding_policy",
         StringAttr::get(&getContext(), mapping::stringifySetupBindingPolicy(
                                            *parsedSetupBindingPolicy)));
-    if (balanceDigitalWork) {
+    func->setAttr(
+        "sculptor.mapping.digital_scheduling_policy",
+        StringAttr::get(&getContext(), mapping::stringifyDigitalSchedulingPolicy(
+                                           *parsedDigitalPolicy)));
+    if (*parsedDigitalPolicy ==
+        mapping::DigitalSchedulingPolicy::SlidingWindow) {
+      func->setAttr("sculptor.mapping.digital_window_size",
+                    builder.getI64IntegerAttr(digitalWindowSize));
+    } else {
+      func->removeAttr("sculptor.mapping.digital_window_size");
+    }
+    if (*parsedDigitalPolicy ==
+        mapping::DigitalSchedulingPolicy::Balanced) {
       func->setAttr("sculptor.mapping.digital_work_balancing",
                     BoolAttr::get(&getContext(), true));
     } else {
@@ -335,7 +520,6 @@ void PlanMappingPass::runOnOperation() {
     }
     plannedFunction = true;
   }
-
   if (!plannedFunction) {
     module.emitError("expected at least one function with a structural "
                      "Resource Allocation Tree");

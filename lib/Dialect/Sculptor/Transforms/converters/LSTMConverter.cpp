@@ -909,8 +909,10 @@ LogicalResult decomposeInlineLSTMLayers(func::FuncOp func) {
   SmallVector<NNLSTMOp> stacks;
   func.walk([&](NNLSTMOp op) { stacks.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNLSTMOp op : stacks) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(splitLSTMStack(op, rewriter))) {
       op.emitOpError("cannot split supported inline LSTM stack");
       return failure();
@@ -920,6 +922,7 @@ LogicalResult decomposeInlineLSTMLayers(func::FuncOp func) {
   SmallVector<NNLSTMLayerOp> layers;
   func.walk([&](NNLSTMLayerOp op) { layers.push_back(op); });
   for (NNLSTMLayerOp op : layers) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerLSTMLayerOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline LSTM layer");
       return failure();

@@ -488,8 +488,10 @@ LogicalResult decomposeInlineGRUCellLayers(func::FuncOp func) {
   SmallVector<NNGRUCellOp> ops;
   func.walk([&](NNGRUCellOp op) { ops.push_back(op); });
 
-  IRRewriter rewriter(func.getContext());
+  SemanticLayerRewriteListener layerListener;
+  IRRewriter rewriter(func.getContext(), &layerListener);
   for (NNGRUCellOp op : ops) {
+    SemanticLayerRewriteScope layerScope(layerListener, op);
     if (failed(lowerGRUCellOp(op, rewriter))) {
       op.emitOpError("cannot decompose supported inline GRUCell");
       return failure();

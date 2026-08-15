@@ -1,6 +1,7 @@
 set(SCULPTOR_RUNTIME_SOURCES
   src/basic_tile_runtime.cpp
   src/deployment_runtime.cpp
+  src/heap_profile.cpp
   src/ready_queue.cpp
   src/routed_transport.cpp
   src/scratchpad_abi.cpp

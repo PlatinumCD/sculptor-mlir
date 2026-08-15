@@ -19,9 +19,10 @@
 namespace mlir {
 namespace sculptor {
 
-// Backend boundary from sculptor.mvm into Sculptor Golem execution IR. This pass
-// creates logical array setup, vector load, execution, store, and recombination
-// ops, but it does not lower those ops to LLVM shims or ISA intrinsics.
+// Backend boundary from sculptor.mvm into Sculptor Golem execution IR. This
+// pass creates logical array setup, vector load, execution, store, and
+// recombination ops, but it does not lower those ops to LLVM shims or ISA
+// intrinsics.
 struct ExpandMVMToGolemPass
     : public mlir::PassWrapper<ExpandMVMToGolemPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -36,6 +37,27 @@ struct ExpandMVMToGolemPass
       llvm::cl::desc("Number of columns in the analog array"),
       llvm::cl::init(0)};
 
+  Option<int64_t> sequenceShardRows{
+      *this, "sequence-shard-rows",
+      llvm::cl::desc(
+          "Maximum activation rows materialized by one MVM sequence shard; "
+          "zero keeps the full sequence"),
+      llvm::cl::init(0)};
+
+  Option<int64_t> sequenceShardBytes{
+      *this, "sequence-shard-bytes",
+      llvm::cl::desc(
+          "Maximum aggregate partial-result bytes materialized by one MVM "
+          "sequence shard; zero disables byte-based sizing"),
+      llvm::cl::init(0)};
+
+  Option<bool> fusePointwiseEpilogues{
+      *this, "fuse-pointwise-epilogues",
+      llvm::cl::desc(
+          "Fuse legal channel-wise pointwise epilogues into MVM output "
+          "shards before their feature and sequence assembly"),
+      llvm::cl::init(true)};
+
   ExpandMVMToGolemPass() = default;
 
   ExpandMVMToGolemPass(const ExpandMVMToGolemPass &pass)
@@ -45,9 +67,30 @@ struct ExpandMVMToGolemPass
                   llvm::cl::init(0)),
         arrayCols(*this, "array-cols",
                   llvm::cl::desc("Number of columns in the analog array"),
-                  llvm::cl::init(0)) {
+                  llvm::cl::init(0)),
+        sequenceShardRows(
+            *this, "sequence-shard-rows",
+            llvm::cl::desc(
+                "Maximum activation rows materialized by one MVM sequence "
+                "shard; zero keeps the full sequence"),
+            llvm::cl::init(0)),
+        sequenceShardBytes(
+            *this, "sequence-shard-bytes",
+            llvm::cl::desc(
+                "Maximum aggregate partial-result bytes materialized by one "
+                "MVM sequence shard; zero disables byte-based sizing"),
+            llvm::cl::init(0)),
+        fusePointwiseEpilogues(
+            *this, "fuse-pointwise-epilogues",
+            llvm::cl::desc(
+                "Fuse legal channel-wise pointwise epilogues into MVM output "
+                "shards before their feature and sequence assembly"),
+            llvm::cl::init(true)) {
     arrayRows = pass.arrayRows;
     arrayCols = pass.arrayCols;
+    sequenceShardRows = pass.sequenceShardRows;
+    sequenceShardBytes = pass.sequenceShardBytes;
+    fusePointwiseEpilogues = pass.fusePointwiseEpilogues;
   }
 
   mlir::StringRef getArgument() const final {

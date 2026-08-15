@@ -25,6 +25,12 @@ struct ExpandDigitalWorkPass
       llvm::cl::desc("Target number of independent digital work units"),
       llvm::cl::init(4)};
 
+  Option<int64_t> minimumWorkItemsPerUnit{
+      *this, "minimum-work-items-per-unit",
+      llvm::cl::desc("Minimum static iteration work assigned to each digital "
+                     "work unit; reduces workers for small operations"),
+      llvm::cl::init(1)};
+
   Option<bool> requireChange{
       *this, "require-change",
       llvm::cl::desc("Fail when no digital operation can be expanded"),

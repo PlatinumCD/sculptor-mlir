@@ -262,6 +262,7 @@ buildMVMWaveTree(const MappingProblem &problem,
 
   SmallVector<SmallVector<int64_t>> successors(units.size());
   SmallVector<int64_t> indegree(units.size(), 0);
+  DenseSet<std::pair<int64_t, int64_t>> unitEdges;
   for (const ComputeTensor &tensor : problem.graph.tensors) {
     for (int64_t producerId : tensor.producerOperations) {
       if (!includedOperations.contains(producerId))
@@ -272,7 +273,7 @@ buildMVMWaveTree(const MappingProblem &problem,
           continue;
         int64_t consumerUnit = operationToUnit.lookup(consumerId);
         if (producerUnit == consumerUnit ||
-            llvm::is_contained(successors[producerUnit], consumerUnit))
+            !unitEdges.insert({producerUnit, consumerUnit}).second)
           continue;
         successors[producerUnit].push_back(consumerUnit);
         ++indegree[consumerUnit];

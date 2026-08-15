@@ -2,6 +2,7 @@
 #define SCULPTOR_MLIR_DIALECT_SCULPTOR_TRANSFORMS_CONVERTLAYERS_H
 
 #include "sculptor-mlir/Dialect/Sculptor/IR/SculptorDialect.h"
+#include "sculptor-mlir/Dialect/Sculptor/Transforms/Support/IR/SemanticLayerIdentity.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
